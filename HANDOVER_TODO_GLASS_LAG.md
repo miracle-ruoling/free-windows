@@ -688,6 +688,51 @@ shrink: 800x114 -> 794x92 ...
 
 ---
 
+## 4.16 【2026-11-15 01:25】新功能：长按图标拖动 = 调整图标顺序
+
+### 交互
+
+- 左键按在**图标**上拖 → 那个图标在条内**实时换位**（走过谁就和谁换），松手保存。
+- 左键按在**空处 / 雪佛龙**上拖 → 仍然移动整条（原来的行为）。
+- 这是用户明确接受的设计取舍：条被图标填满时就没有"空处"可抓了。
+  **注意**：完全透明档（`glassOpacity=0 && tintStrength=0`）里空白像素 alpha=0、收不到鼠标事件
+  （见 4.15.2），所以那时只能靠**雪佛龙**（`item=-1` 的格子）或把条变宽一点来移动条。
+
+### 实现
+
+- `order=` 写进 ini：`;` 分隔的键，键 = 小写 exe 路径（没有 exe 时用 `t:`+标题）。
+  pin 和它自己的窗口**共用一个键**，靠 `std::stable_sort` 保证它们仍然挨在一起；
+  列表里没提到的条目排在其后、保持原有构建顺序。`BuildItems()` 末尾应用。
+- 拖动中每次换位都 `SyncOrder()` 更新 `g_cfg.order`（否则 1.2 秒一次的周期重建
+  `BuildItems()` 会把顺序改回去），松手才 `WritePrivateProfileStringW` 落盘。
+- 状态机：新增 `g_reordering` / `g_reorderItem` / `g_pressItem`。
+  **两个坑**（第一版就是踩了这两个）：
+  1. `WM_MOUSEMOVE` 里"按下→开始"的判定必须加 `!g_reordering`，否则每移动一次就重新
+     "开始拖动"并把 `g_reorderItem` 重置成最初的按下项（表现为顺序错乱 + 日志刷屏）；
+  2. `WM_LBUTTONUP` 里"算点击"的分支也要加 `!g_reordering`，否则松手会被当成点击（会启动 App）。
+- 重排期间 `UpdateHoverFromCursor()` 直接返回：不然 1.34× 的悬浮放大让图标在光标下抖。
+
+### 验证
+
+```
+reorder start item=0 title=Clash Verge
+reorder: item 0 -> 1
+reorder: item 1 -> 2
+reorder: item 2 -> 3
+reorder done: echomusic.exe;explorer.exe;msedge.exe;clash-verge.exe;...
+order: applied 12 key(s) to 12 item(s)      <- 重启后
+[3] ... clash-verge.exe title=Clash Verge   <- 重启后仍是第 4 位
+```
+空处拖动/图标拖动互不影响：空白处按下日志 `slot=-1` → `drag start` → 窗口 x 101→157 ✓
+
+### 现场
+
+- 条已恢复 `x=101 y=343 1570x121`，`glassOpacity=0 / tintStrength=0`（用户偏好的完全透明档），
+  `order=` 已删除（回到自然顺序）。
+- git：`c9c3e03`。
+
+---
+
 ## 5. 调试工具（都在 `dock/dev/`，可直接跑）
 
 | 脚本 | 用途 |

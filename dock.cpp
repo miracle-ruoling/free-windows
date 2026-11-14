@@ -100,7 +100,8 @@ static DWORD g_focusGraceUntil = 0;     // ignore foreground churn right after o
 static HWND g_menuWatch;                // the app's menu window we are watching (menu code below)
 static DWORD g_menuItemPressAt = 0;     // when the user last pressed *on* the menu itself
 static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb);
-static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh);
+static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh,
+                        int clipL = INT_MIN, int clipR = INT_MAX);
 
 // ---------------------------------------------------------------- settings
 struct Config {
@@ -1924,22 +1925,9 @@ static void Paint(int w, int h) {
         FillRound(g_memDC, RECT{left, top, left + sz, top + sz}, RadiusFor(sz, sz) / 2 + 2,
                   ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
         if (!it.px.empty() && it.cachedPx > 0) {
-            const uint32_t* sp = it.px.data();
-            const int sdim = it.cachedPx;
-            for (int y = 0; y < sz; y++) {
-                int dy = top + y;
-                if (dy < 0 || dy >= h) continue;
-                int sy = (int)((y + 0.5f) * sdim / sz);
-                if (sy >= sdim) sy = sdim - 1;
-                for (int x = 0; x < sz; x++) {
-                    int dx = left + x;
-                    if (dx < clipL || dx >= clipR) continue;
-                    int sx = (int)((x + 0.5f) * sdim / sz);
-                    if (sx >= sdim) sx = sdim - 1;
-                    uint32_t c = sp[(size_t)sy * sdim + sx];
-                    if (c >> 24) SetPixelPremul(dx, dy, c);
-                }
-            }
+            // bilinear, like the normal hover zoom: point sampling at 1.34x turned a round
+            // icon into a faceted polygon with jagged edges
+            BlendScaled(left, top, sz, sz, it.px.data(), it.cachedPx, it.cachedPx, clipL, clipR);
         }
     }
     if (g_cfg.debugBeacon) {
@@ -3189,7 +3177,8 @@ static int TextWidthPx(const std::wstring& s, int px) {
 
 // bilinear, premultiplied source -> premultiplied destination (same maths as
 // BlendPremul, so it composes correctly on top of the panel)
-static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh) {
+static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh,
+                        int clipL, int clipR) {
     if (!src || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
     for (int y = 0; y < dh; y++) {
         double fy = (y + 0.5) * sh / dh - 0.5;
@@ -3219,6 +3208,7 @@ static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int
             if (!a) continue;
             int dx = x0 + x, dy = y0 + y;
             if (dx < 0 || dy < 0 || dx >= g_dibW || dy >= g_dibH) continue;
+            if (dx < clipL || dx >= clipR) continue;      // horizontal clip for the drag icon
             BYTE* dst = (BYTE*)g_bits + ((size_t)dy * g_dibW + dx) * 4;
             dst[0] = (BYTE)(ch(0) + dst[0] * (255 - a) / 255);
             dst[1] = (BYTE)(ch(8) + dst[1] * (255 - a) / 255);

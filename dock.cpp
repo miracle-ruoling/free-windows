@@ -1714,8 +1714,7 @@ static void Paint(int w, int h) {
     } else if (noGlass) {
         // nothing to draw here: the icons below are the whole strip
     } else {
-    if (g_cfg.material == 1 && g_bakeBits && g_bakeW == w + 2 * g_bakeMarginUsed &&
-        g_bakeH == h + 2 * g_bakeMarginUsed) {
+    if (g_cfg.material == 1 && g_bakeBits && g_bakeW >= w && g_bakeH >= h) {
         // baked blur + configurable tint, with a sub-pixel coverage edge so the
         // corners are smooth (no 1-bit region mask)
         double cx = w / 2.0, cy = h / 2.0;
@@ -4896,6 +4895,8 @@ static void CaptureBackdrop() {
     int cw = rc.right, ch = rc.bottom;
     if (cw <= 0 || ch <= 0) return;
     // wide margin while dragging, tight otherwise (see g_bakeMarginUsed)
+    // A resize grows the window, so the bake has to be big enough that the next few
+    // hundred pixels of growth are already inside it - otherwise every frame re-grabs.
     const int M = (g_dragging || g_resizeEdge) ? g_bakeMargin
                                               : (g_cfg.blurRadius > 0 ? 64 : 0);
     g_bakeMarginUsed = M;
@@ -6020,9 +6021,12 @@ static void RenderTick() {
             // reads the same blurred picture at the new offset. The backdrop then
             // stays anchored to the desktop instead of sliding with the strip.
             int ox = curR.left - g_bakeOrigin.x, oy = curR.top - g_bakeOrigin.y;
-            bool covered = g_bakeBits && g_bakeW == cr.right + 2 * M &&
-                           g_bakeH == cr.bottom + 2 * M && ox >= 0 && oy >= 0 &&
-                           ox + cr.right <= g_bakeW && oy + cr.bottom <= g_bakeH;
+            // Containment, not equality: as long as the window (any size) sits inside the
+            // snapshot with its top-left at (ox, oy), the existing picture can be re-cropped
+            // and nothing needs grabbing. An equality test re-grabbed on every resize frame.
+            bool covered = g_bakeBits && g_bakeW >= cr.right && g_bakeH >= cr.bottom &&
+                           ox >= 0 && oy >= 0 && ox + cr.right <= g_bakeW &&
+                           oy + cr.bottom <= g_bakeH;
             bool captureDue = false;
             // Dragging is a no-capture zone (see below): a real mouse twitches a few
             // pixels when it is clicked, so "hold the strip without moving" counts as a

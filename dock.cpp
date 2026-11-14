@@ -6185,6 +6185,10 @@ static void RenderTick() {
             UpdateSnap();
         }
         if (AnimateReorder()) dirty = true;
+        // The dragged icon follows the cursor, and a mouse move touches no window at all, so
+        // nothing else would mark the frame dirty: without this the icon froze at the last
+        // painted spot and jumped to the cursor only when a swap happened to repaint.
+        if (g_reordering) dirty = true;
         // Edge scroll while reordering: moving an icon past the container edge (left) or past
         // the grid button (right) pulls the hidden icons in from that side, so an icon can be
         // dropped somewhere that is not currently on the strip.

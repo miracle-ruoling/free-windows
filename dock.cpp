@@ -144,7 +144,8 @@ struct Config {
     int w = 0;                   // saved size
     int h = 0;
     int hasSize = 0;
-    std::wstring extraPins;       // ';' separated .lnk/.exe paths
+    std::wstring extraPins;
+    std::wstring order;          // user order of the strip, see ItemKey()       // ';' separated .lnk/.exe paths
 };
 
 static Config g_cfg;
@@ -234,6 +235,13 @@ static void LoadConfig() {
     BYTE ha = 0; ParseColor(buf, &ha); g_cfg.hoverAlpha = ha;
     GetPrivateProfileStringW(L"dock", L"extraPins", L"", buf, 1024, g_iniPath.c_str());
     g_cfg.extraPins = buf;
+    {
+        // the item order can be long: one key per strip item
+        std::vector<wchar_t> ob(8192, 0);
+        GetPrivateProfileStringW(L"dock", L"order", L"", ob.data(), (DWORD)ob.size(),
+                                 g_iniPath.c_str());
+        g_cfg.order = ob.data();
+    }
     g_cfg.thumbWidth = GetInt(L"dock", L"thumbWidth", 220);
     g_cfg.thumbHeight = GetInt(L"dock", L"thumbHeight", 124);
     g_cfg.thumbDelay = GetInt(L"dock", L"thumbDelay", 400);
@@ -776,6 +784,47 @@ static void LogProcessContext() {
 
 static void DLog(const wchar_t* fmt, ...);
 
+static void ComputeButtons();
+static void PaintAndPresent();
+
+// Identity of a strip item for the persisted order. One key for a pin and for the windows
+// it owns, so a pin and its running windows keep travelling together.
+static std::wstring ItemKey(const Item& it) {
+    if (!it.exePath.empty()) return Lower(it.exePath);
+    if (!it.title.empty()) return L"t:" + Lower(it.title);
+    return L"";
+}
+
+// Rewrite g_cfg.order from the current in-memory order. Called live while reordering so the
+// periodic BuildItems() cannot undo it; the ini is only written when the drag ends.
+static void SyncOrder() {
+    std::wstring out;
+    for (size_t i = 0; i < g_items.size(); i++) {
+        std::wstring k = ItemKey(g_items[i]);
+        if (k.empty()) continue;
+        if (!out.empty()) out += L';';
+        out += k;
+    }
+    g_cfg.order = out;
+}
+
+static void MoveItem(int from, int to) {
+    if (from < 0 || to < 0 || from == to) return;
+    if (from >= (int)g_items.size() || to >= (int)g_items.size()) return;
+    Item it = g_items[from];
+    g_items.erase(g_items.begin() + from);
+    g_items.insert(g_items.begin() + to, it);
+}
+
+static void FinishReorder() {
+    SyncOrder();
+    if (!g_cfg.order.empty())
+        WritePrivateProfileStringW(L"dock", L"order", g_cfg.order.c_str(), g_iniPath.c_str());
+    DLog(L"reorder done: %s", g_cfg.order.c_str());
+    ComputeButtons();
+    PaintAndPresent();
+}
+
 static void BuildItems() {
     // Stable ordering: the position of a button is decided the first time its
     // window is seen, so switching between windows never reorders the strip.
@@ -891,6 +940,31 @@ static void BuildItems() {
         // on the strip" apart from "tray only"
         if (it.hwnd && it.exePath.empty()) it.exePath = WindowExe(it.hwnd);
         if (it.iconPath.empty() && it.hwnd) it.iconPath = it.exePath;
+    }
+
+    // The user's own order, if any (drag an icon to a new place). Stable sort: a pin and the
+    // windows of its exe share a key and stay together, and anything the list does not mention
+    // keeps its build order behind the listed entries.
+    if (!g_cfg.order.empty()) {
+        std::vector<std::wstring> keys;
+        size_t s = 0;
+        while (s <= g_cfg.order.size()) {
+            size_t e = g_cfg.order.find(L';', s);
+            std::wstring k = g_cfg.order.substr(s, e == std::wstring::npos ? std::wstring::npos : e - s);
+            Trim(k);
+            if (!k.empty()) keys.push_back(k);
+            if (e == std::wstring::npos) break;
+            s = e + 1;
+        }
+        auto rank = [&](const Item& it) -> size_t {
+            std::wstring k = ItemKey(it);
+            for (size_t i = 0; i < keys.size(); i++)
+                if (keys[i] == k) return i;
+            return keys.size();
+        };
+        std::stable_sort(g_items.begin(), g_items.end(),
+                         [&](const Item& a, const Item& b) { return rank(a) < rank(b); });
+        DLog(L"order: applied %d key(s) to %d item(s)", (int)keys.size(), (int)g_items.size());
     }
 
     // log the strip contents whenever it changes (helps diagnosing clicks)
@@ -1197,6 +1271,9 @@ static int g_iconCachePx = 0;
 static int g_iconPx = 32;
 static int g_capacity = 0;      // how many cells fit
 static int g_scroll = 0;        // first visible item
+static bool g_reordering = false;   // dragging an icon to a new place in the row
+static int g_reorderItem = -1;      // item being dragged
+static int g_pressItem = -1;        // item under the button at press time (-1 = blank)
 static bool g_expanded = false;
 static RECT g_collapsedRect{};
 
@@ -2125,6 +2202,7 @@ static int DistanceToWindow() {
 // while invisible: when it fades back in under a stationary cursor no message
 // arrives. Recompute it from the cursor position on every fade tick.
 static void UpdateHoverFromCursor() {
+    if (g_reordering) return;      // the row is being reordered: no zoom, no preview
     int hover = -1;
     POINT p{};
     if (GetCursorPos(&p)) {
@@ -6340,7 +6418,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g_dragMovePending = true;
                 return 0;
             }
-            if (g_pressActive && !g_dragging) {
+            if (g_pressActive && !g_dragging && !g_reordering) {
                 if (!(GetKeyState(VK_LBUTTON) & 0x8000)) {
                     g_pressActive = false;      // stale press: drop it
                 } else {
@@ -6349,11 +6427,43 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     int dx = cp.x - g_pressScreen.x;
                     int dy = cp.y - g_pressScreen.y;
                     if (dx * dx + dy * dy >= 16) {
-                        g_dragging = true;
-                        g_lastBlankClickAt = 0;     // a drag is not half of a double click
-                        DLog(L"drag start");
+                        if (g_pressItem >= 0) {
+                            // an icon was pressed: drag reorders it instead of moving the strip
+                            g_reordering = true;
+                            g_reorderItem = g_pressItem;
+                            g_hover = -1;                    // no zoom/hover while reordering
+                            KillTimer(h, 3);
+                            ThumbHide();
+                            DLog(L"reorder start item=%d title=%s", g_reorderItem,
+                                 g_items[g_reorderItem].title.c_str());
+                        } else {
+                            g_dragging = true;
+                            g_lastBlankClickAt = 0;     // a drag is not half of a double click
+                            DLog(L"drag start");
+                        }
                     }
                 }
+            }
+            if (g_reordering) {
+                // live reorder: whatever slot is under the cursor swaps with the dragged item
+                POINT cp{};
+                GetCursorPos(&cp);
+                POINT q = cp;
+                ScreenToClient(h, &q);
+                int over = -1;
+                for (size_t i = 0; i < g_slots.size(); i++) {
+                    if (PtInRect(&g_slots[i].rc, q)) { over = (int)i; break; }
+                }
+                if (over >= 0 && g_slots[over].item >= 0 && g_slots[over].item != g_reorderItem) {
+                    int to = g_slots[over].item;
+                    DLog(L"reorder: item %d -> %d", g_reorderItem, to);
+                    MoveItem(g_reorderItem, to);
+                    g_reorderItem = to;
+                    SyncOrder();                 // keep the periodic rebuild in line
+                    ComputeButtons();
+                    PaintAndPresent();
+                }
+                return 0;
             }
             int hover = -1;
             POINT pt{x, y};
@@ -6415,12 +6525,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // remember the press: it becomes a click on release, or a drag once
             // the pointer moves a few pixels (works from an icon too)
             g_pressSlot = hit;
+            g_pressItem = -1;
             g_pressHwnd = nullptr;
             g_pressLnk.clear();
             if (hit >= 0 && hit < (int)g_slots.size() && g_slots[hit].item >= 0 &&
                 g_slots[hit].item < (int)g_items.size()) {
                 g_pressHwnd = g_items[g_slots[hit].item].hwnd;
                 g_pressLnk = g_items[g_slots[hit].item].lnkPath;
+                g_pressItem = g_slots[hit].item;
             }
             g_pressPos = pt;
             g_pressScreen = POINT{x, y};
@@ -6446,7 +6558,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_LBUTTONUP:
-            if (g_pressActive && !g_dragging && !g_resizeEdge) {
+            if (g_pressActive && !g_dragging && !g_resizeEdge && !g_reordering) {
                 g_pressActive = false;
                 ReleaseCapture();
                 DLog(L"click slot=%d hwnd=%p lnk=%s", g_pressSlot, (void*)g_pressHwnd,
@@ -6478,6 +6590,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             g_pressActive = false;
+            if (g_reordering) {
+                g_reordering = false;
+                g_reorderItem = -1;
+                ReleaseCapture();
+                FinishReorder();
+                return 0;
+            }
             if (g_resizeEdge) {
                 g_resizeEdge = 0;
                 ReleaseCapture();

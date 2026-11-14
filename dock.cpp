@@ -4371,6 +4371,7 @@ static LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static HTHUMBNAIL g_thumb = nullptr;
 static HWND g_thumbTarget = nullptr;
 static int g_thumbIndex = -1;
+static int g_thumbItem = -1;    // item behind the preview: slot index != item index when scrolled
 
 static const int kThumbPad = 10;
 static const int kTitleH = 22;
@@ -4383,6 +4384,7 @@ static void ThumbHide() {
     }
     if (g_thumbWnd && IsWindowVisible(g_thumbWnd)) ShowWindow(g_thumbWnd, SW_HIDE);
     g_thumbIndex = -1;
+    g_thumbItem = -1;
 }
 
 static void ThumbPaint(HWND h) {
@@ -4398,8 +4400,9 @@ static void ThumbPaint(HWND h) {
     SetTextColor(dc, RGB(235, 235, 235));
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     HGDIOBJ old = SelectObject(dc, font);
-    std::wstring title = (g_thumbIndex >= 0 && g_thumbIndex < (int)g_items.size())
-                             ? g_items[g_thumbIndex].title
+    // g_thumbItem, not g_thumbIndex: the slot index only equals the item index at scroll 0
+    std::wstring title = (g_thumbItem >= 0 && g_thumbItem < (int)g_items.size())
+                             ? g_items[g_thumbItem].title
                              : L"";
     RECT tr{kThumbPad, 3, rc.right - kThumbPad, kTitleH};
     DrawTextW(dc, title.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_LEFT);
@@ -4497,6 +4500,7 @@ static void ThumbShow(int index) {
         DwmUpdateThumbnailProperties(g_thumb, &props);
     }
     g_thumbIndex = index;
+    g_thumbItem = itemIndex;
     InvalidateRect(g_thumbWnd, nullptr, TRUE);
 }
 
@@ -4527,10 +4531,86 @@ static POINT g_resizeOrigin{};
 //  * the painted rounded outline itself - needed at radius=100, where the
 //    visible "corner" is a round cap far away from the window corner (those
 //    rect corners are transparent, so no mouse input ever arrives there)
-static int EdgeAt(POINT p, const RECT& rc) {
+static void PaintAndPresent();      // defined further down
+static bool FullyTransparent();     // defined further down
+
+// A fully transparent strip draws nothing over its padding, so a window wider than the
+// icons leaves the resize band on an invisible edge. Snap the window back to the box the
+// icons actually occupy (+pad) once a resize finishes: the edge band then sits on the ring
+// just outside the icons and the corner zones on the end icons' corners, and because the box
+// is derived from the icons, neither their size nor their count changes.
+static void ShrinkToIcons() {
+    if (!g_hwnd) return;
+    if (!FullyTransparent()) return;                    // only when invisible
+    RECT wr{};
+    if (!GetWindowRect(g_hwnd, &wr)) return;
+    ComputeButtons();
+    int cells = (int)g_slots.size();
+    if (cells < 1) return;
+    const int pad = g_cfg.pad, gap = g_cfg.gap;
+    int span = cells * (g_iconPx + gap) - gap;
+    int tw, th;
+    if (g_cfg.vertical) { th = span + pad * 2; tw = g_iconPx + pad * 2; }
+    else { tw = span + pad * 2; th = g_iconPx + pad * 2; }
+    int oldW = wr.right - wr.left, oldH = wr.bottom - wr.top;
+    if (tw == oldW && th == oldH) return;
+    if (tw <= 0 || th <= 0) return;
+    // keep the centre where it was, so the strip settles instead of jumping to one side
+    int x = wr.left + (oldW - tw) / 2;
+    int y = wr.top + (oldH - th) / 2;
+    DLog(L"shrink: %dx%d -> %dx%d at %d,%d (transparent strip hugs its icons)",
+         oldW, oldH, tw, th, x, y);
+    g_cfg.x = x;
+    g_cfg.y = y;
+    g_cfg.w = tw;
+    g_cfg.h = th;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, tw, th, SWP_NOACTIVATE);
+    ComputeButtons();
+    g_bakeDirty = true;
+    SavePosition();
+    SaveSize();
+    PaintAndPresent();
+}
+
+// Union of the icon cells, in client coordinates. With no glass the padding is alpha 0, and a
+// layered window gets no mouse input on transparent pixels - so the resize zones have to sit
+// on the icons themselves, not on the invisible margin. Using the icons' own box puts the
+// 10 px band over the icons' outer edge (top/bottom) and the corner squares on the end icons'
+// corners, which is exactly where the user can see something to grab.
+static RECT IconBox() {
+    RECT r{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+    for (size_t i = 0; i < g_slots.size(); i++) {
+        const RECT& s = g_slots[i].rc;
+        if (s.left < r.left) r.left = s.left;
+        if (s.top < r.top) r.top = s.top;
+        if (s.right > r.right) r.right = s.right;
+        if (s.bottom > r.bottom) r.bottom = s.bottom;
+    }
+    return r;
+}
+
+static bool FullyTransparent() {
+    return g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0;
+}
+
+static int EdgeAt(POINT p, const RECT& rcIn) {
     if (!g_cfg.allowResize) return 0;
+    RECT rc = rcIn;
+    if (FullyTransparent()) {
+        // Deflate by the padding instead of using the slot bounding box: a hovered icon is
+        // drawn 1.34x and would drag the box around under the cursor, while the padding ring
+        // is exactly the part of the window that has no icons in it. After ShrinkToIcons()
+        // the window is icons+pad, so this is precisely the icon box.
+        rc.left += g_cfg.pad;
+        rc.top += g_cfg.pad;
+        rc.right -= g_cfg.pad;
+        rc.bottom -= g_cfg.pad;
+        if (rc.right - rc.left < 24 || rc.bottom - rc.top < 24) rc = rcIn;
+    }
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return 0;
+    p.x -= rc.left;
+    p.y -= rc.top;
 
     const int cz = 24;                     // corner square
     bool cx = (p.x < cz) || (p.x >= w - cz);
@@ -6404,6 +6484,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SavePosition();
                 SaveSize();
                 PaintAndPresent();
+                ShrinkToIcons();     // transparent strip only: snap back to the icon box
                 return 0;
             }
             if (g_dragging) {

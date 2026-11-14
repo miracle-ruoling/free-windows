@@ -1,0 +1,39 @@
+# ---- build output ----
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ---- run time ----
+*.log
+*.ini.bak
+
+# ---- screenshots / frame dumps ----
+# every *.png here is a screenshot taken while debugging; dev/ has hundreds of them
+*.png
+*.bmp
+*.jpg
+*.jpeg
+*.npy
+*.npy.gz
+
+# ---- probe dumps (a directory here is always a frame dump from a measurement) ----
+dev/*/
+__pycache__/
+*.pyc
+
+# ---- data dumps from one-off probes ----
+dev/*.txt
+dev/*.out
+*.bak
+*.bak[0-9]*
+cur.txt
+out*.txt
+
+# ---- editor / os ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -408,7 +408,13 @@ struct Item {
     std::wstring lnkPath;   // pins
     std::wstring exePath;   // for matching running windows (lowercase)
     bool hasWindow = false;
+    // reorder animation: displayed x (client) easing towards the slot's x
+    float animX = -1e9f;
+    int targetX = 0;
 };
+
+static const int kReorderInset = 6;      // px of hysteresis at a cell boundary
+static const float kReorderZoom = 1.34f; // the dragged icon stays at the hover size
 
 static std::vector<Item> g_items;
 static int g_hover = -1;
@@ -1718,6 +1724,11 @@ static void ComputeButtons() {
     for (int i = 0; i < visible; i++) {
         int item = g_scroll + i;
         if (item >= n) break;
+        if (g_reordering && item == g_reorderItem) {
+            // the pressed icon follows the cursor: reserve its cell (the hole) but no slot
+            pos += sizes[i] + gap;
+            continue;
+        }
         Slot s;
         s.item = item;
         s.size = sizes[i];
@@ -1725,6 +1736,10 @@ static void ComputeButtons() {
         if (vertical) s.rc = {cross, pos, cross + s.size, pos + s.size};
         else s.rc = {pos, cross, pos + s.size, cross + s.size};
         g_slots.push_back(s);
+        if (g_reordering) {
+            g_items[item].targetX = vertical ? s.rc.top : s.rc.left;
+            if (g_items[item].animX < -1e8f) g_items[item].animX = (float)g_items[item].targetX;
+        }
         pos += s.size + gap;
     }
     if (needExpand) {
@@ -1875,7 +1890,9 @@ static void Paint(int w, int h) {
         }
         Item& it = g_items[s.item];
         int sz = s.size > 0 ? s.size : g_iconPx;
-        int icx = (s.rc.left + s.rc.right) / 2 - sz / 2;
+        int cellLeft = s.rc.left;
+        if (g_reordering && it.animX > -1e8f) cellLeft = (int)lroundf(it.animX);
+        int icx = cellLeft + (s.rc.right - s.rc.left) / 2 - sz / 2;
         int icy = (s.rc.top + s.rc.bottom) / 2 - sz / 2;
         if (!it.px.empty() && it.cachedPx > 0) {
             if (it.cachedPx == sz) BlendPremul(icx, icy, sz, sz, it.px.data());
@@ -1887,6 +1904,42 @@ static void Paint(int w, int h) {
             RECT d{s.rc.right - sz / 5, s.rc.bottom - sz / 5, s.rc.right - sz / 12,
                    s.rc.bottom - sz / 12};
             FillRound(g_memDC, d, 3, 0x60FFFFFF);
+        }
+    }
+    if (g_reordering && g_reorderItem >= 0 && g_reorderItem < (int)g_items.size()) {
+        // The pressed icon: 1.34x, follows the cursor along the strip only, drawn above the
+        // others. Clipped to [0, chevron.left): the container edge on the left and the grid
+        // button on the right, which is the boundary the user defined.
+        Item& it = g_items[g_reorderItem];
+        int sz = (int)(g_iconPx * kReorderZoom + 0.5f);
+        POINT cp{};
+        GetCursorPos(&cp);
+        ScreenToClient(g_hwnd, &cp);
+        int left = cp.x - sz / 2;
+        int top = (h - sz) / 2;
+        int clipL = 0, clipR = w;
+        for (size_t i = 0; i < g_slots.size(); i++)
+            if (g_slots[i].item < 0) { clipR = g_slots[i].rc.left; break; }   // the grid button
+        // a soft lift so it reads as "picked up"
+        FillRound(g_memDC, RECT{left, top, left + sz, top + sz}, RadiusFor(sz, sz) / 2 + 2,
+                  ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
+        if (!it.px.empty() && it.cachedPx > 0) {
+            const uint32_t* sp = it.px.data();
+            const int sdim = it.cachedPx;
+            for (int y = 0; y < sz; y++) {
+                int dy = top + y;
+                if (dy < 0 || dy >= h) continue;
+                int sy = (int)((y + 0.5f) * sdim / sz);
+                if (sy >= sdim) sy = sdim - 1;
+                for (int x = 0; x < sz; x++) {
+                    int dx = left + x;
+                    if (dx < clipL || dx >= clipR) continue;
+                    int sx = (int)((x + 0.5f) * sdim / sz);
+                    if (sx >= sdim) sx = sdim - 1;
+                    uint32_t c = sp[(size_t)sy * sdim + sx];
+                    if (c >> 24) SetPixelPremul(dx, dy, c);
+                }
+            }
         }
     }
     if (g_cfg.debugBeacon) {
@@ -6063,6 +6116,28 @@ static void StopFrameClock() {
 // Everything that has to happen once per frame. Driven by the high-resolution timer
 // thread (WM_APP+1); the old 30ms WM_TIMER stays as a fallback if that thread could not
 // start.
+// One easing step for the reorder animation. Returns true while anything still moves, so the
+// caller can keep the frame loop awake.
+static bool AnimateReorder() {
+    if (!g_reordering) return false;
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    float dt = last ? (float)(now - last) : 16.0f;
+    last = now;
+    if (dt > 120.0f) dt = 120.0f;
+    float k = 1.0f - expf(-dt / 45.0f);      // same feel as the hover zoom
+    bool moving = false;
+    for (size_t i = 0; i < g_items.size(); i++) {
+        Item& it = g_items[i];
+        if (it.animX < -1e8f) continue;
+        float d = (float)it.targetX - it.animX;
+        if (d > -0.6f && d < 0.6f) { it.animX = (float)it.targetX; continue; }
+        it.animX += d * k;
+        moving = true;
+    }
+    return moving;
+}
+
 static void RenderTick() {
         DWORD now = GetTickCount();
         bool dirty = false;
@@ -6109,6 +6184,53 @@ static void RenderTick() {
         } else if (uiChanged) {
             UpdateSnap();
         }
+        if (AnimateReorder()) dirty = true;
+        // Edge scroll while reordering: moving an icon past the container edge (left) or past
+        // the grid button (right) pulls the hidden icons in from that side, so an icon can be
+        // dropped somewhere that is not currently on the strip.
+        if (g_reordering) {
+            static DWORD lastEdge = 0;
+            static bool wasOver = false;
+            int sz = (int)(g_iconPx * kReorderZoom + 0.5f);
+            POINT cp{};
+            GetCursorPos(&cp);
+            ScreenToClient(g_hwnd, &cp);
+            int left = cp.x - sz / 2;
+            RECT crc{};
+            GetClientRect(g_hwnd, &crc);
+            int clipR = crc.right;
+            for (size_t i = 0; i < g_slots.size(); i++)
+                if (g_slots[i].item < 0) { clipR = g_slots[i].rc.left; break; }   // grid button
+            const int thr = sz / 3;
+            int overL = -left;                     // how much hangs off the container edge
+            int overR = (left + sz) - clipR;       // how much hangs under the grid button
+            int per = g_capacity > 1 ? g_capacity - 1 : 1;
+            int n = (int)g_items.size();
+            bool canL = overL > thr && g_scroll > 0;
+            bool canR = overR > thr && g_scroll + per < n;
+            bool over = canL || canR;
+            if (over && (!wasOver || now - lastEdge >= 220)) {
+                lastEdge = now;
+                if (canL) {
+                    g_scroll--;
+                    if (g_scroll < 0) g_scroll = 0;
+                    MoveItem(g_reorderItem, g_scroll);
+                    g_reorderItem = g_scroll;
+                } else {
+                    g_scroll++;
+                    int last = g_scroll + per - 1;
+                    if (last > n - 1) last = n - 1;
+                    MoveItem(g_reorderItem, last);
+                    g_reorderItem = last;
+                }
+                SyncOrder();
+                ComputeButtons();
+                DLog(L"reorder: edge scroll %s -> scroll=%d item=%d (overL=%d overR=%d)",
+                     canL ? L"left" : L"right", g_scroll, g_reorderItem, overL, overR);
+                dirty = true;
+            }
+            wasOver = over;
+        }
         FlipTick();          // backup for timer 4: positions come from the clock
         if (AnimateCorners() && !g_flip.active) {
             g_glassCacheValid = false;      // the rounded outline moved
@@ -6119,7 +6241,7 @@ static void RenderTick() {
         static DWORD lastWatch = 0;
         if (now - lastWatch >= 16) {
             lastWatch = now;
-            if (g_alpha > 0) {
+            if (g_alpha > 0 && !g_reordering) {
                 if (cursorMoved || movedNow) UpdateHoverFromCursor();
             } else if (g_gridVisible && !g_menuOpen) {
                 GridHide(L"strip faded");
@@ -6431,6 +6553,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                             // an icon was pressed: drag reorders it instead of moving the strip
                             g_reordering = true;
                             g_reorderItem = g_pressItem;
+                            for (auto& it : g_items) it.animX = -1e9f;   // snap on first layout
                             g_hover = -1;                    // no zoom/hover while reordering
                             KillTimer(h, 3);
                             ThumbHide();
@@ -6450,9 +6573,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 GetCursorPos(&cp);
                 POINT q = cp;
                 ScreenToClient(h, &q);
+                // The dragged icon lives at the row's centre line, so only x matters here;
+                // the inset keeps a cursor parked on a cell boundary from flip-flopping.
+                q.y = (g_slots.empty() ? q.y : (g_slots[0].rc.top + g_slots[0].rc.bottom) / 2);
                 int over = -1;
                 for (size_t i = 0; i < g_slots.size(); i++) {
-                    if (PtInRect(&g_slots[i].rc, q)) { over = (int)i; break; }
+                    const RECT& r = g_slots[i].rc;
+                    if (q.x >= r.left + kReorderInset && q.x < r.right - kReorderInset &&
+                        q.y >= r.top && q.y < r.bottom) {
+                        over = (int)i;
+                        break;
+                    }
                 }
                 if (over >= 0 && g_slots[over].item >= 0 && g_slots[over].item != g_reorderItem) {
                     int to = g_slots[over].item;

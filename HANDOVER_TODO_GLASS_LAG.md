@@ -644,6 +644,50 @@ median sx/delta = +0.00  <- -1 才是"内容粘在条上"，实测是 0
 
 ---
 
+## 4.15 【2026-11-15 01:15】两个交互问题（缩略图标题 / 透明条拉伸热区）
+
+### 4.15.1 缩略图标题不跟随滚动（真 bug）
+
+`ThumbPaint()` 里写的是 `g_items[g_thumbIndex].title`，而 `g_thumbIndex` 是**槽位序号**。
+槽位 → 条目要经过 `g_scroll`，所以一滚动标题就还停在"原来住在这个格子里的那个 app"。
+预览**画面**一直是对的（`DwmRegisterThumbnail` 用的是条目自己的 hwnd），只有标题错——正是用户描述的不对称。
+
+- 修法：新增 `g_thumbItem`，`ThumbShow()` 里一起记下 `itemIndex`，`ThumbPaint()` 用它。
+- 验证（截图 `dev/thumb_before_title.png` / `dev/thumb_after_title.png`）：滚动前 `slot=1 item=1` 标题
+  **EchoMusic**；滚 3 格后 `slot=1 item=4` 标题 **QQ**。
+
+### 4.15.2 完全透明的条：拉伸热区摸不到（不只是"看不见"）
+
+完全透明（`glassOpacity=0 && tintStrength=0`）时 `Paint()` 只画图标，窗口其余像素 alpha=0。
+**layered 窗口的命中测试是按 alpha 做的**，所以那片区域**根本不接收鼠标事件**——比"看不见"更彻底：
+用户说的"实际上存在"只在图标边缘几像素上成立。白边又不能加回来（用户喜欢没有白边）。
+
+按用户的方案实现：
+
+1. `ShrinkToIcons()`：拉伸结束（`WM_LBUTTONUP` 的 resize 分支）后，把窗口收缩成
+   "图标紧贴框 + pad"（`x/y/w/h` 一起更新并存盘）。图标大小、显示个数都不变
+   （框是从 `g_iconPx` 和格子数算出来的）：日志 `shrink: 800x114 -> 794x92`。
+2. `EdgeAt()` 在完全透明时按 **pad 内缩**的框做判定（角 24×24、边 10px 带），
+   于是：四个角＝两端图标的四个角、上下带＝中间图标的上下两方——都落在**不透明像素**上。
+   用 pad 内缩而不是槽位包围盒，是因为**悬浮放大 1.34×** 会把包围盒带偏（实测过一次）。
+3. 拖动条仍然靠"按住图标 + 移动超过 4px"完成（透明模式下本来就没有空白可抓）。
+
+验证日志：
+```
+edgeat: pt=18,18  icons=0,0-664,79  transparent=1 edge=5    -> resize start edge=5  (左上角)
+edgeat: pt=200,72 icons=0,0-685,75  transparent=1 edge=8    -> resize start edge=8  (下边带)
+resize start edge=4  (上边带，改内缩框之前)
+shrink: 800x114 -> 794x92 ...
+```
+
+### 4.15.3 现场
+
+- 构建已部署；条恢复成 `x=101 y=343 1570x121`，`glassOpacity=1 / tintStrength=0`（用户原配置）。
+  想看收缩效果需要把 `glassOpacity` 和 `tintStrength` 都设成 0。
+- git：`b17d91f`。
+
+---
+
 ## 5. 调试工具（都在 `dock/dev/`，可直接跑）
 
 | 脚本 | 用途 |

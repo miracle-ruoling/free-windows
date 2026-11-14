@@ -73,8 +73,10 @@ def main():
             continue
         img_raw = np.asarray(frames[k])
         bk = beacon(img_raw, gx, gy)
-        if bk is None:
+        if bk is None and b0 is not None:
             continue
+        if b0 is None:
+            bk = 0.0
         img = gray(img_raw)
         best = (-9.0, 0)
         for sx in range(-wide, wide + 1):
@@ -90,9 +92,9 @@ def main():
         if prev is not None and times[k] > times[prev]:
             v = (rect[0] - rects[prev][0]) / (times[k] - times[prev])
         prev = k
-        rows.append((k, rect[0] - r0[0], v, bk - b0, best[1], best[0]))
+        rows.append((k, rect[0] - r0[0], v, (bk - b0) if b0 is not None else float('nan'), best[1], best[0]))
         print('%4d %6d %8.0f %8.0f  %+7d %7.3f'
-              % (k, rows[-1][1], v, bk - b0, best[1], best[0]))
+              % (k, rows[-1][1], v, (bk - b0) if b0 is not None else 0.0, best[1], best[0]))
 
     if rows:
         A = np.array([[r[2], r[4], r[5]] for r in rows], dtype=np.float64)

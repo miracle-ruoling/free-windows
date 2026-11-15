@@ -1,21 +1,21 @@
 # 交接：下一轮从这里开始
 
-> 写于 2026-11-15 23:40（本轮做完：Win+X 锚定、**附属窗口 + 托盘三合一（R1）**、
-> 快速设置面板锚定与测量；**遗留一个 bug：托盘小窗自身拖动掉帧**）。
+> 写于 2026-11-15 23:40，2026-11-16 00:1x 更新（本轮做完：Win+X 锚定、**附属窗口 + 托盘三合一（R1）**、
+> 快速设置面板锚定与测量；**并修掉了上一版留的 bug：拖条时托盘小窗掉帧**）。
 > 上一轮（图标拖动重排 + 动效 + 边界滚入）的过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，
 > **别重读历史排查**，看本文即可。
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
-> **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（本轮做的，含遗留 bug 与排查方法）** →
-> §4（改代码前必须知道的 9 件事）→ `PLAN_COMPANION.md` 的 R1 现状与 R2/R3 计划。
-> 然后直接处理 §3.7 末尾的"下一步"。
+> **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（含修复记录与测量脚本）** →
+> §4（改代码前必须知道的 10 件事）→ `PLAN_COMPANION.md` 的 R1 现状与 R2/R3 计划。
+> 然后从 `PLAN_COMPANION.md` 的 R2（组框）开始。
 
 ---
 
 ## 0. 三分钟版本
 
-- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~8000 行。
+- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~8500 行。
 - 玻璃背景"位移/抖动"的根因是 `UpdateLayeredWindow` 的矩形和像素没落在同一次合成里，
   修法是 `presentSync=2`（ULW **之前** `DwmFlush()`）。**这一条别动**。
 - **已经能用的**（本轮及之前）：
@@ -23,11 +23,12 @@
   - **开始菜单 / Win+X / 快速设置** 三个 shell 弹窗都能**跟着条上的按钮**摆位置（§3.2、§3.4、§3.7）；
   - **附属窗口框架 + 托盘三合一**（网络/音量/电量）：独立小窗、真实状态、悬停 tooltip、
     点击弹快速设置、可拖动/拉伸、跟随条位移、鼠标上条淡入（§3.7、`PLAN_COMPANION.md`）。
-- **遗留 bug（下一轮第一件事）**：**拖动托盘小窗本身时帧率低**。条已经修好
-  （每帧日志是元凶，拖动 10 秒只占 10.5% 单核）；小窗的原因还没找到，§3.7 末尾写了
-  "已排除项 + 该用什么方法测"，**别重复排除**。
-- **下一步待办**：①修小窗拖动的帧率；②组框（R2）；③组缩放（R3）；④图标精细度（R4）。
-  详见 `PLAN_COMPANION.md`。用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
+- **本轮修掉**（2026-11-16 00:0x）：**拖条时托盘小窗像 30fps** 的遗留 bug。
+  根因是"跟随"跑在 16 ms 的清理节流门里（实测小窗 40.7 次/秒 vs 条 111.4 次/秒），
+  修法是把跟随搬进 `Present()`（每帧、和条的位移同一次合成）。修完 105.7 vs 105.7、偏移漂移 0 px。
+  见 §3.7 末尾的"修复记录"。
+- **下一步待办**：①组框（R2）；②组缩放（R3）；③图标精细度（R4）。详见 `PLAN_COMPANION.md`。
+  用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
 
 ---
 
@@ -47,19 +48,20 @@
 
 ---
 
-## 2. 现场（2026-11-15 23:40）
+## 2. 现场（2026-11-16 00:1x）
 
 | | |
 |---|---|
 | 构建 | `dock.cpp` → `build.ps1`（MSVC 18 / SDK 26100）→ 部署到 `%LOCALAPPDATA%\Programs\Dock\` |
 | 重启 | `dev/redeploy.ps1`。**先杀 dock 再 build**，否则 `build.ps1` 的复制报"文件被占用"（脚本以错误退出，看起来像编译失败） |
-| 条 | 实测 `x=661 y=60 w=716 h=92`（用户会自己摆，别当固定值） |
-| 托盘小窗 | 实测 `x=1188 y=146 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
+| 条 | 实测 `x=842 y=184 w=716 h=92`（用户会自己摆，别当固定值；`layout:` 行给的是 client 坐标） |
+| 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
+最近提交（倒序）：`（本轮）修拖条时小窗跟随掉帧 + follow 探针` → `8d4dced` 交接文档 →
+`53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
 `b9f6195` 去每帧日志 + mod actionCenter=dock → `ba9848e` R1 附属窗口+托盘三合一 →
 `469ca7b` 计划文档 → `fb00bd1` 竖条修复 → `4f29f0a` 锚点 v2 + Win+X → `2d9941f` 首格 Win 按钮。
 
@@ -308,23 +310,73 @@ mod-status 里 4 个进程的记录全刷新了），所以不用重启 explorer
 - 踩过的崩：`CaptureScreenInto()` 里 `DeleteObject(bmp)` 之后才 `assign(bits…)` → 读已释放内存 → dock 崩。
   已修（先拷再删）。
 
-**遗留 bug（下一轮第一件事）：拖动托盘小窗本身掉帧**
+**修复记录（2026-11-16 00:0x）：拖条时托盘小窗像 30fps**
 
-- 条已经修好：拖动 10 秒 dock 只占 **10.5% 单核**，重绘数 605–669/10s（受注入步进 62 步/秒限制）。
-- 小窗仍然卡。**已排除**：①每帧日志（已删干净）；②附属窗口每帧重传位图/z 序（改成纯移动后只 `SetWindowPos`）；
-  ③每秒一次的 WLAN 查询（已改成只在可见时 + 网络 5 秒一次）；④条本身（A/B：`[traybar] enabled=0` 时条的重绘数几乎不变）。
-- **下一步该怎么测**（别重复瞎猜）：在 `CompanionProc` 的 `WM_MOUSEMOVE` 与 `CompanionSetRect` 里加
-  **计数 + 每 10 秒一条**统计（`SetWindowPos` 次数、tick 数、每次耗时），跑 `dev/t_traybar_drag.ps1 -Dx 60 -Dy 30`
-  或让用户真手拖 10 秒，看是"消息来得就少"还是"每次花了十几毫秒"。
-  怀疑点（按可能性）：①`sethost`/`SetCapture` 下每次 `SetWindowPos` 触发 `WM_SETCURSOR`→`EdgeAt` 反复算；
-  ②目标窗口是 layered + topmost，移动时 DWM 合成更贵；③`CompanionTick` 每 16ms 还在 `GetWindowRect` 条窗口。
-- 相关脚本：`dev/t_traybar_probe.ps1`（窗口 rect/可见性）、`dev/t_traybar_hit.ps1`（命中测试）、
-  `dev/t_traybar_drag.ps1`（真鼠标拖动并打印前后 rect）、`dev/t_qs_watch.ps1`（点小窗 + 观察前台）、
-  `dev/loggrep.ps1`（**正经 grep 日志**，`logtail.ps1` 只给 25 行且不认 `-Lines`）、`dev/anchordump.ps1`（锚点表）。
+用户把现象收窄成一句关键信息：**只拖小窗时是正常的，只有"拖条、条带着小窗走"时才掉帧**。
+这一句直接排掉了"小窗自己的拖动路径"，把范围压到"跟随"上，答案就在 `RenderTick()` 里：
+
+```cpp
+if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 16ms 清理门后面
+```
+
+`now` 是 `GetTickCount()`（1 ms 步进），而 `lastWatch = now` 只在过门时更新 → 实际间隔退化成
+**21/28 ms 一跳**；条自己的位移走 `Present()`（每帧，139 Hz）。所以"条在顺滑地走、小窗在一格一格追"。
+
+实测（`dev/t_followfps.ps1`，同一个注入拖动同时采样两个窗口的 rect，采样 28 万次/秒）：
+
+| | 位移更新 | 中位间隔 | 最大间隔 |
+|---|---|---|---|
+| 修前 条 | 111.4 次/秒 | 7.0 ms | 18.7 ms |
+| 修前 小窗 | **40.7 次/秒** | **28.4 ms** | 37.9 ms |
+| 修后 条 | 105.7 次/秒 | 7.3 ms | 15.0 ms |
+| 修后 小窗 | **105.7 次/秒** | **7.4 ms** | 14.8 ms |
+
+修法（三处，都是同一个语义"条位移 → 跟随窗口同帧位移"）：
+
+1. 抽出 `CompanionFollowTo(stripX, stripY)`：按"条的最新原点 - 上次原点"的 delta 位移跟随窗口，
+   记账放在同一个静态变量里，**所以一帧之内被调用两次也不会位移两次**。
+2. `Present()` 里、`presentSync==2` 的 `DwmFlush()` **之后**、条自己的 `UpdateLayeredWindow` **之前**
+   调它 → 条的新矩形和小窗的新矩形落在**同一次合成**里（不是"小窗晚一帧"）。
+3. `FlipTick()`（双击空白处闪避动画，走的是裸 `SetWindowPos`）和条的**拉伸**分支（per-message）
+   各补一次调用 —— 这两条路都不经过 `Present()`，否则同样会晚 1–2 帧。
+4. `CompanionTick()` 里原来那段 delta 逻辑改成调同一个函数（作为"不经过 Present 的位移"的兜底），
+   `cadence:` 10 秒统计行加了 `companion moves` 字段，以后再退化能直接看出来。
+
+验收数据：偏移漂移 **0,0 px**（`offset at start 521,80 -> at end 521,80`），全程"相对静止偏移"
+平均 **0.00 px / 最大 4 px**；拖动 10 秒 CPU **13–16% 单核**（改前同条件 13.3%，空闲 0.5%）——
+每帧多一次 `SetWindowPos`，量级和文档里的 10.5% 一档，没有回到"风扇起飞"。
+**手感仍需用户确认**（这是他历来只能自己判断的部分）。
+
+**这条给以后的教训**：`RenderTick()` 里那个 16 ms 门只适合"便宜但不必精确"的清理
+（状态轮询、菜单/焦点看门狗）。任何**和条的几何绑在一起**的东西都不能放进去 —— 它的实际节拍
+不是 16 ms，而是 16 ms 加上 `GetTickCount()` 的量化，会到 21–28 ms。
+
+**本轮新增的测量/操作脚本**（都在 `dev/`，别重复造）
+- `t_followfps.ps1` —— **本轮的主力证据**：拖条，同时采样条与小窗的 rect，输出两者更新率、
+  中位/最大间隔、相对偏移漂移；结束时**自动把条拖回原位**。（小窗只在鼠标上条时出现，
+  所以脚本先把光标停到条上等淡入。）
+- `t_dragfps.ps1` —— 只量一个窗口的位移更新率（`-Target traybar|strip`），用于"拖动本身是不是被节流"。
+- `t_walk.ps1 -Class … -X … -Y …` —— 用真拖动把某个窗口挪到指定坐标（`SetWindowPos` 会被 ini 覆盖，
+  只有走拖动路径才持久化）。抓取点默认取条的 `layout:` 里的 chevron，**但见下面的坑**。
+- `t_hit_at.ps1 x y …` —— 一堆屏幕点的 `WindowFromPoint`，透明档里判断"这个像素能不能点"最快的办法。
+- `tray_drag_shots.py` —— 拖某窗口边抓帧边记录的探针（模板相关性定位），留给"看屏幕到底怎么动"的场合。
+
+**新踩的两个坑**
+- **透明档里雪佛龙字形的中心是"洞"**：`^` 只有细笔画，格子中心是 alpha=0 的像素 → 注入的按下会
+  **穿透**到后面的窗口（实测 `WindowFromPoint` 返回 `Chrome_RenderWidgetHostHWND`）。抓条要用
+  **Win 按钮的四块白方块**（client 46,46）或先让它 hover 出底色，别按字形中心。
+- **注入脚本失败时一定要把左键抬起来**：我第一版在"按下没落到目标窗口"时直接 return，
+  左键就一直处于按下状态，后续几次注入全部失效（表现很像"dock 卡死了"，其实只是鼠标状态脏了）。
+- 旧的排查线索（已排除项：每帧日志、每帧重传位图/z 序、WLAN 每秒查询）都还是有效的历史记录，
+  只是**根因不在那里**，不用再回去查。
+
+**相关脚本**：`dev/t_traybar_probe.ps1`（窗口 rect/可见性）、`dev/t_traybar_hit.ps1`（命中测试）、
+`dev/t_traybar_drag.ps1`（真鼠标拖动并打印前后 rect）、`dev/t_qs_watch.ps1`（点小窗 + 观察前台）、
+`dev/loggrep.ps1`（**正经 grep 日志**，`logtail.ps1` 只给 25 行且不认 `-Lines`）、`dev/anchordump.ps1`（锚点表）。
 
 ---
 
-## 4. 改代码前必须知道的 9 件事
+## 4. 改代码前必须知道的 10 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
    合成器"下一帧才应用新矩形、但 layered 位图立刻生效"→ 每次移动后的 5–7 ms 是
@@ -351,6 +403,11 @@ mod-status 里 4 个进程的记录全刷新了），所以不用重启 explorer
 9. **槽位里的 `item` 有两个负值了**：`kSlotChevron(-1)` 和 `kSlotWin(-3)`。任何"`item < 0` 就是宫格按钮"
    的老写法都会把首格当成 `^`（宫格锚点、拖动裁剪、边界滚动），要按哨兵判。
    另外 `g_capacity` 现在是**格子数**（含首格和 `^`），翻页量用 `g_pageItems`。
+10. **"和条的几何绑在一起"的东西不能放在 16 ms 的清理门后面**（本轮 bug 的根因，见 §3.7 修复记录）。
+    `RenderTick()` 里 `if (now - lastWatch >= 16)` 那一段的实际节拍是 **21–28 ms**（`GetTickCount()`
+    量化 + 过门才更新 `lastWatch`），只适合状态轮询/菜单看门狗这类"便宜但不必精确"的活。
+    条的位移走 `Present()`（139 Hz）；附属窗口的跟随必须**跟着 `Present()` 同帧**走
+    （`CompanionFollowTo()`），否则旁边一个"一格格追"的小窗会让整条看起来掉帧。
 
 ---
 
@@ -364,6 +421,11 @@ mod-status 里 4 个进程的记录全刷新了），所以不用重启 explorer
 | `content_anchor.py <dir> cx0 cx1 [search]` | 量"玻璃内容 vs 世界"的位移（需要静态纹理的窄带；条几乎全是图标，测试时要把条拉宽） |
 | `hand_capture.py <sec> <frames> <dir>` + `hand_scan2.py` | **用户自己拖**、录帧；相邻帧两两对比判断"内容锚定 / 粘窗口" |
 | `draglong.ps1 -Seconds N` | 真实按住拖动 N 秒，把 10 秒统计窗口填满 |
+| **`t_followfps.ps1 -Dx -Dy -Ms -StepsPerSec`** | 【本轮主力证据】拖条，同时采样条与托盘小窗的 rect：两者更新率/中位间隔/最大间隔、相对偏移漂移（应恒 0）；**结束时自动把条拖回原位** |
+| **`t_dragfps.ps1 -Target traybar\|strip`** | 【本轮】只量一个窗口自己的位移更新率，判断"拖动本身有没有被节流" |
+| **`t_walk.ps1 -Class -X -Y [-GrabX -GrabY]`** | 【本轮】用真拖动把窗口挪到指定坐标（`SetWindowPos` 会被 ini 覆盖，只有拖动路径才持久化）。抓取点默认 `layout:` 的 chevron 中心，**但透明档里那里是字形的洞**，按不动就用 `-GrabX 46 -GrabY 46`（Win 按钮）。注意两者的抓取偏移记录时机不同（条在 `LBUTTONDOWN`、小窗在越过阈值那一下），脚本里按类偏 6 px —— 记错就会正好差 6 px |
+| **`t_hit_at.ps1 x y …`** | 【本轮】一堆屏幕点的 `WindowFromPoint`：透明档里判断"这个像素能不能点"最快的办法 |
+| **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |
 | **`t_wingrid.ps1 [-KeepOpen]`** | 【本轮】按 `layout:` 的 `chevron=` 点开宫格并报告落点（旧的 `t_gridplace.ps1` 按老公式算位置，已不准） |

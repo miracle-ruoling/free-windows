@@ -55,6 +55,7 @@
 
 static HWND g_hwnd;
 static void CompanionSaveAllPositions();      // defined with the companions
+static void CompanionFollowTo(int stripX, int stripY);   // ditto; called from Present()
 static void* g_paintBits;
 static HWND g_setWnd;
 static int g_paintW, g_paintH;
@@ -2066,6 +2067,12 @@ static void Present() {
     // Only worth it when the position is about to change: a stationary repaint (fade, icon
     // zoom) has no geometry to pair the pixels with, and flushing there would just block.
     if (g_cfg.presentSync == 2 && pdst) DwmFlush();
+    // The strip is about to land at `dst`: move the windows that follow it in this very step.
+    // Doing it here (after the composition wait, before our own update) puts the strip and its
+    // companions into the *same* composition. Following from the 16 ms housekeeping gate left
+    // the companion stepping at ~40 Hz next to a ~139 Hz strip, which is exactly the "the tray
+    // bar drags at 30 fps" report (measured: dev/t_followfps.ps1, 40.7 vs 111.4 moves/s).
+    if (pdst) CompanionFollowTo(dst.x, dst.y);
     LARGE_INTEGER p0{}, p1{};
     QueryPerformanceCounter(&p0);
     if (pdst && g_cfg.presentOrder == 1) {
@@ -3391,33 +3398,53 @@ static void CompanionVisibilityTick(DWORD now) {
 }
 
 // ---------------------------------------------------------------- per-frame tick
+// The strip's origin as the companions last saw it. Shared by both callers of
+// CompanionFollowTo() so one frame can never shift a companion twice.
+static int g_companionLastStripX = INT_MIN;
+static int g_companionLastStripY = INT_MIN;
+static int g_companionFollowMoves = 0;      // diagnostics: see the 10 s cadence line
+
+// The strip moved to (stripX, stripY): shift every following companion by the same delta.
+// Two callers, same bookkeeping:
+//   * Present() - the drag/dodge path, i.e. ~139 Hz, in the same composition as the strip;
+//   * CompanionTick() - once per housekeeping tick, as the catch-all for moves that never go
+//     through Present() (resize, snap, restore, settings).
+// A hidden companion only needs its stored rect moved: nothing is on screen, and it syncs to
+// that rect the moment it becomes visible again.
+static void CompanionFollowTo(int stripX, int stripY) {
+    if (g_companionLastStripX == INT_MIN) {
+        g_companionLastStripX = stripX;
+        g_companionLastStripY = stripY;
+        return;
+    }
+    int dx = stripX - g_companionLastStripX;
+    int dy = stripY - g_companionLastStripY;
+    g_companionLastStripX = stripX;
+    g_companionLastStripY = stripY;
+    if (!dx && !dy) return;
+    if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return;
+    if (g_trayBar.dragging || g_trayBar.resizing) return;    // the pointer owns it right now
+    if (g_trayBar.alpha > 0) {
+        CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
+                         g_trayBar.rc.right - g_trayBar.rc.left,
+                         g_trayBar.rc.bottom - g_trayBar.rc.top, false);
+        g_companionFollowMoves++;
+    } else {
+        g_trayBar.rc.left += dx;
+        g_trayBar.rc.right += dx;
+        g_trayBar.rc.top += dy;
+        g_trayBar.rc.bottom += dy;
+    }
+}
+
 static void CompanionTick(DWORD now) {
     if (!g_trayBar.hwnd) return;
 
-    // 1. follow the strip: whatever moved it (drag, dodge, snap), move with the same delta
-    static int lastStripX = INT_MIN, lastStripY = INT_MIN;
+    // 1. follow the strip - per frame from Present() while it is dragged; this tick only
+    //    catches geometry that changed without a present (resize, snap, restore)
     RECT sr{};
     GetWindowRect(g_hwnd, &sr);
-    if (lastStripX != INT_MIN && g_trayBar.follow && !g_trayBar.dragging && !g_trayBar.resizing) {
-        int dx = sr.left - lastStripX;
-        int dy = sr.top - lastStripY;
-        if (dx || dy) {
-            // A hidden companion only needs its bookkeeping moved: nothing is on screen, and
-            // it is synced to its stored rect the moment it becomes visible again.
-            if (g_trayBar.alpha > 0) {
-                CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
-                                 g_trayBar.rc.right - g_trayBar.rc.left,
-                                 g_trayBar.rc.bottom - g_trayBar.rc.top, false);
-            } else {
-                g_trayBar.rc.left += dx;
-                g_trayBar.rc.right += dx;
-                g_trayBar.rc.top += dy;
-                g_trayBar.rc.bottom += dy;
-            }
-        }
-    }
-    lastStripX = sr.left;
-    lastStripY = sr.top;
+    CompanionFollowTo(sr.left, sr.top);
 
     // 2. state + fade
     TrayStateRefresh(now);
@@ -7438,6 +7465,9 @@ static void FlipTick() {
     // SetWindowPos alone is the whole frame. Re-painting would cost more than the tick
     // and the bake belongs to the old spot anyway (re-baked once in FlipEnd).
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    // The dodge animation is the same class of move as a drag: the attached windows have to
+    // step with the strip, or they visibly arrive late (see CompanionFollowTo).
+    CompanionFollowTo(x, y);
 }
 
 static void StartFlip() {
@@ -7829,8 +7859,10 @@ static void RenderTick() {
             if (now - logAt >= 10000) {
                 DWORD span = now - logAt;
                 logAt = now;
-                DLog(L"cadence: %d ticks / %d repaints / %d captures in %lu ms", ticks,
-                     paints, g_captureCount, (unsigned long)span);
+                DLog(L"cadence: %d ticks / %d repaints / %d captures / %d companion moves in"
+                     L" %lu ms",
+                     ticks, paints, g_captureCount, g_companionFollowMoves,
+                     (unsigned long)span);
                 // per-frame cost, measured with QPC
                 if (g_statPaints > 0) {
                     DLog(L"frame: n=%d paint=%.2fms (glass %.2f + icons %.2f) present=%.2fms"
@@ -7843,6 +7875,7 @@ static void RenderTick() {
                 g_statGlass = g_statIcons = g_statPresent = g_statBake = 0;
                 g_statPaints = g_statPresents = g_statBakes = 0;
                 g_captureCount = 0;
+                g_companionFollowMoves = 0;
                 ticks = 0;
                 paints = 0;
             }
@@ -7977,6 +8010,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                              SWP_NOACTIVATE);
                 g_cfg.x = r.left;
                 g_cfg.y = r.top;
+                // Resizing arrives per mouse message (not inside the frame tick), so the
+                // follow has to be nudged here too - the 16 ms housekeeping gate would leave
+                // the attached windows 1-2 frames behind the strip's new origin.
+                CompanionFollowTo(r.left, r.top);
                 UpdateSnap();
                 return 0;
             }

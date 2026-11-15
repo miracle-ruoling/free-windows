@@ -2620,9 +2620,9 @@ static void AnchorPublish(unsigned kind, const RECT* screenRect, int gapPx, bool
     e.armedAtMs = empty ? 0 : armedAt;
     if (!empty && (unsigned)(kind) >= g_anchorShm->count) g_anchorShm->count = kind;
     g_anchorShm->updatedMs = GetTickCount();
-    if (!empty)
-        DLog(L"anchor: published kind=%u rect=%d,%d-%d,%d gap=%d%s", kind, l, t, r, b, gapPx,
-             armed ? L" (armed)" : L"");
+    // No logging here on purpose: this runs on every drag frame (the anchor follows the
+    // button), and DLog opens/closes the log file per line - measured, that alone dropped
+    // the drag rate and spun the fan up. Use dev/anchordump.ps1 to inspect the block.
 }
 
 // Screen rect of a slot (client rect -> screen), or false when the slot is not on screen.
@@ -3134,16 +3134,24 @@ static bool CursorInCompanionGroup() {    if (!g_trayBar.hwnd || !g_trayBar.enab
 }
 
 // Move the window without moving the pixels twice: geometry and content in one go.
-static void CompanionSetRect(Companion& c, int x, int y, int w, int h, bool repaint) {
+// `repaint` = the content changed, `publishAnchor` = the shell may need this rect right away
+// (opening the flyout, end of a user drag). A plain follow move does neither: it just shifts
+// the window, and the layered bitmap travels with it - re-presenting every frame for a pure
+// move was wasted work.
+static void CompanionSetRect(Companion& c, int x, int y, int w, int h, bool repaint,
+                             bool publishAnchor = false) {
+    bool sizeChanged = (w != c.rc.right - c.rc.left) || (h != c.rc.bottom - c.rc.top);
     c.rc = RECT{x, y, x + w, y + h};
-    CompanionEnsureDib(c, w, h);
+    if (repaint || sizeChanged) CompanionEnsureDib(c, w, h);
     if (repaint) TrayRepaint(c);
     if (IsWindow(c.hwnd)) {
-        SetWindowPos(c.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-        CompanionPresent(c);
+        // SWP_NOZORDER: a pure move must not re-insert the window into the topmost band
+        // every frame - that churns the compositor while the strip is being dragged.
+        SetWindowPos(c.hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (repaint || sizeChanged) CompanionPresent(c);
     }
-    // The quick settings panel anchors on this rect; republish as it moves.
-    AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
+    // The quick settings panel anchors on this rect.
+    if (publishAnchor) AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
 }
 
 static void CompanionSave(Companion& c) {
@@ -3348,6 +3356,12 @@ static void CompanionVisibilityTick(DWORD now) {
     bool wasVisible = g_trayBar.visible;
     g_trayBar.visible = wantShown;
     if (wantShown && !wasVisible && g_trayBar.hwnd) {
+        // While hidden we only moved the stored rect, so put the window where it belongs now,
+        // and publish the anchor once (the flyout may be opened before the next move).
+        SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, g_trayBar.rc.left, g_trayBar.rc.top,
+                     g_trayBar.rc.right - g_trayBar.rc.left,
+                     g_trayBar.rc.bottom - g_trayBar.rc.top, SWP_NOACTIVATE);
+        AnchorPublish(kAnchorQuickSettings, &g_trayBar.rc, 8);
         // keep the strip above us: the group is drawn "from under the strip"
         SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -3373,11 +3387,18 @@ static void CompanionTick(DWORD now) {
         int dx = sr.left - lastStripX;
         int dy = sr.top - lastStripY;
         if (dx || dy) {
-            DLog(L"tray bar: follow dx=%d dy=%d (strip %ld,%ld, bar %ld,%ld)", dx, dy,
-                 (long)sr.left, (long)sr.top, (long)g_trayBar.rc.left, (long)g_trayBar.rc.top);
-            CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
-                             g_trayBar.rc.right - g_trayBar.rc.left,
-                             g_trayBar.rc.bottom - g_trayBar.rc.top, false);
+            // A hidden companion only needs its bookkeeping moved: nothing is on screen, and
+            // it is synced to its stored rect the moment it becomes visible again.
+            if (g_trayBar.alpha > 0) {
+                CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
+                                 g_trayBar.rc.right - g_trayBar.rc.left,
+                                 g_trayBar.rc.bottom - g_trayBar.rc.top, false);
+            } else {
+                g_trayBar.rc.left += dx;
+                g_trayBar.rc.right += dx;
+                g_trayBar.rc.top += dy;
+                g_trayBar.rc.bottom += dy;
+            }
         }
     }
     lastStripX = sr.left;
@@ -3508,12 +3529,14 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (c.resizing) {
                 c.resizing = false;
                 ReleaseCapture();
+                AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
                 CompanionSave(c);
                 return 0;
             }
             if (c.dragging) {
                 c.dragging = false;
                 ReleaseCapture();
+                AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
                 CompanionSave(c);
                 return 0;
             }

@@ -104,19 +104,32 @@
   仍然留了保险：`WM_TIMER 6` 在 650ms 后向任务栏的 `kTrayTimerHide`（`WM_TIMER` id=2）补一条 post，
   在就收、不在就什么都不做。
 
-**结论：原生弹窗搬不动位置（这轮最重要的发现，别再重复试）**
-- **开始菜单**窗口：`Windows.UI.Core.CoreWindow`，`1000x938`（800 宽的菜单 + 右侧 200 宽的手机互联卡）。
-  `SetWindowPos` 返回 `ok=1`、`GetWindowRect` 也变成新坐标，但**画面一个像素都不动**：
-  前后两次整屏截图 `changed = 0 of 2073600`（逐字节相同）。
-- **Win+X 菜单**：`Xaml_WindowedPopupClass`（explorer 的 XAML 弹窗，`222x761`）。`SetWindowPos` 直接不生效，
-  矩形原地不动。
-- 这两类窗口都**不在 `EnumWindows` 的结果里**（但 `GetForegroundWindow` / `GetWindowRect` 正常）。
-  任务栏窗口在"展开状态"时也枚举不到（收起状态 `y=1078` 时能枚举到）→ 所以 dock 现在启动时
-  `RememberTaskbars()` 记住 handle，需要时按记住的 handle `PostMessage`。
-- 试过并失败的三条歪路（别再试）：① 把隐藏的任务栏窗口挪到条附近再开开始菜单——开始菜单不跟
-  "任务栏窗口矩形"走（它认 appbar 的注册边）；② 挪它的父窗口/owner——没有父窗口、没有 owner；
-  ③ 把窗口改成 100x100——画面照旧。想真的搬位置，只能 hook shell 的布局函数（Windhawk mod，
-  成本高、跟版本走、还要用户在 UI 里手动编译）。用户 2026-11-15 决定：**先按原生位置弹**。
+**结论：位置搬不动/搬得动，取决于**找对窗口**（2026-11-15 18:5x 修正过一版，别再重复踩）**
+
+- ❗**先纠正上一版记录的错误**：当时我挪的是 `SearchHost.exe` 的 `1000x938` 窗口，那个是**搜索浮窗**，
+  挪它当然"画面纹丝不动"。真正的开始菜单在 **`StartMenuExperienceHost.exe`** 的一个
+  **`Windows.UI.Core.CoreWindow`，`1920x1020`（= 整个工作区，标题"开始"）**里，面板是画在这块
+  XAML 画布上的一个 frame（默认画在 `419,82`，尺寸 `800x938`）。
+  - 判据：`WindowFromPoint(600,300)` → 根窗口 = 那个 SMEH 窗口；把它 `SetWindowPos` 移动 `+120,+90`，
+    面板左/右边从 `419/1221` 精确变成 `539/1341`（`dev/t_smeh_root_move.ps1`）。
+  - 关掉再开会**保留**这个偏移（shell 不会重置）→ 所以"外部挪窗口"这条路必须自己负责复原。
+- **Win+X 菜单**：`Xaml_WindowedPopupClass`（explorer 的 XAML 弹窗，`222x761`）。`SetWindowPos` 连矩形都不变
+  （`SWP_NOSENDCHANGING` 也一样），会被弹窗放置逻辑改回去。
+- 这两类窗口都**不在 `EnumWindows` 的结果里**（`WindowFromPoint` / `GetWindowRect` / `PostMessage` 正常）。
+  任务栏窗口"展开状态"时也枚举不到（收起 `y=1078` 时能枚举到）→ dock 启动时 `RememberTaskbars()` 记 handle。
+- **能搬到什么程度（几何事实）**：面板 `640x750` DIP，工作区 `1536x864` DIP → 纵向总余量只有
+  **114 DIP**。所以"贴着条放"在纵向**放不下**（条在顶部时，面板下方/上方都塞不进 750），
+  只能"横向跟随首格 + 纵向夹紧到工作区"。横向余量很大（面板宽 640，工作区 1536）。
+- 参考实现：Windhawk 官方 mod **`shell-flyout-positions`**（m417z，GPLv3，v1.3 / 2026-06）已经做了
+  一模一样的事——**不是 hook `SetWindowPos`**，而是
+  ① hook `DwmSetWindowAttribute(DWMWA_CLOAK, FALSE)`（浮窗"要显示"的那一刻）拿窗口；
+  ② 在**承载 XAML 的进程里**改布局属性：Win10 老开始菜单改 `StartDocked.StartSizingFrame` 的
+     `Canvas.Left/Top`，Win11 新开始菜单改 `FrameRoot` 的 `HorizontalAlignment` + `Margin`
+     （`horizontalAlignment=startButtonLeft/Center/Right` 就是用 UIA 取任务栏开始按钮的 rect 再 clamp 到工作区）。
+  → 也就是说"以某个按钮为参考点"的形态已经是现成的，**只要把参考点从"任务栏开始按钮"换成"我们条的首格"**。
+  源码已下到 `dev/shell-flyout-positions.wh.cpp`（2195 行，`StartMenuUI` 段是重点）。
+- 仍未做：Win+X 菜单的放置逻辑在 explorer 的 XAML 弹窗引擎里，**没有参考实现**，纯逆向。
+  用户 2026-11-15 决定：**先按原生位置弹**，位置的事另做（见 §3.4 的计划）。
 
 **验证（脚本 + 截图都在 `dock/dev/`）**
 - 左键：`winclick_left_after.png`（开始菜单开着、任务栏没露头）；日志 `win button: left click -> start menu (ctrl+esc)`。
@@ -155,6 +168,21 @@
 ②任何新按钮都要进 `ComputeButtons()` 的槽位体系，否则 `g_slots`/点击/缩略图全不对；
 ③透明档（`glassOpacity=0 && tintStrength=0`）里**空白像素收不到鼠标事件**（见 §4.3），
 新加的东西必须是"不透明像素"才点得到。
+
+### 3.4 候选（未开工，等用户拍板）：把开始菜单锚到首格
+
+结论见 §3.2 末尾：面板在 `StartMenuExperienceHost.exe` 的 XAML 画布里，**XAML 层能精确挪**，
+外部 `SetWindowPos` 只能算野路子。三条路，代价差很多：
+
+| 方案 | 做法 | 代价 / 风险 |
+|---|---|---|
+| **A. fork `shell-flyout-positions`** | 复制 `dev/shell-flyout-positions.wh.cpp` 成 `windhawk/start-anchor-dock.wh.cpp`；把 `GetStartButtonBoundsForMonitor()` 的锚点换成"dock 首格的 rect"（用 `Local\DockFlyoutAnchor_v1` 共享内存传：dock 写 `{magic,ver,winRect,barRect,workRect}`，mod 读；现有 `TrayBridge*` 是同一套写法）。其余 clamp / 卸载复原 / 多显示器逻辑原样复用 | 改动约 100–150 行；**每次迭代要用户在 Windhawk UI 点"编译"**（无 CLI）；Windows 更新可能失效；GPLv3 + 保留作者署名 |
+| **B. 野路子 demo（零 mod）** | dock 检测到开始菜单（`WindowFromPoint` 撞到 SMEH 那个 `1920x1020` 窗口）就 `SetWindowPos` 挪它，关掉时复原 | 已验证能精确跟手（`+120,+90` → 面板 `419→539`），但：①面板出画布就被裁（阴影也裁）②画布不再铺满屏幕，点空白可能收不起菜单③shell 不重置位置，dock 崩了会留偏移。**只适合让你看"这样放好不好看"** |
+| **C. 不动** | 保持原生位置 | 0 |
+
+还没解决的：**Win+X 菜单**（explorer 的 XAML 弹窗，没有参考实现，纯逆向）。真要做，最省的路是
+"从 `%LOCALAPPDATA%\Microsoft\Windows\WinX\Group1..3` 读快捷方式、自己 `TrackPopupMenu`"——
+但那是"自己做窗口"，用户明确不要。
 
 ---
 

@@ -1672,6 +1672,7 @@ static void RenderIconCache(int px) {
 
 // Publishes the flyout anchor rects to the Windhawk mod (defined further down).
 static void PublishAnchors();
+static void ArmWinXAnchor();      // marks "the Win+X popup about to appear is ours"
 
 static void ComputeButtons() {
     g_slots.clear();
@@ -2388,6 +2389,9 @@ static void RememberTaskbars() {
 
 static void OpenPowerUserMenu() {
     const BYTE chord[] = {VK_LWIN, 'X'};
+    // Arm the anchor first: the menu window is created shortly after the keystroke and the
+    // mod uses this timestamp to tell it apart from every other XAML popup.
+    ArmWinXAnchor();
     DLog(L"win button: right click -> win+x menu");
     SendChord(chord, 2);
     if (g_hwnd) SetTimer(g_hwnd, 6, 650, nullptr);
@@ -2524,14 +2528,17 @@ enum : unsigned {
     kAnchorStartMenu = 1,      // left click on the Windows button
     kAnchorQuickSettings = 2,  // reserved: a future volume/network button (Win+A)
     kAnchorNotifications = 3,  // reserved: notification centre
+    kAnchorWinXMenu = 4,       // right click on the Windows button (Win+X)
     kAnchorKindMax = 16,
 };
 struct DockAnchorEntry {
     unsigned int kind;         // 0 = unused
-    unsigned int flags;        // 0 = automatic (the mod picks the side with room)
+    unsigned int flags;        // bit0 = "armed": the flyout was just requested
     int left, top, right, bottom;   // the anchor button, screen coordinates, physical px
     int gapPx;                 // space to keep between the button and the flyout
-    int pad[4];
+    unsigned int armedAtMs;    // GetTickCount of the last request (same base in every
+                               // process, so the mod can tell "this one is mine")
+    int pad[3];
 };
 struct DockAnchorShm {
     unsigned int magic;        // 'DANK'
@@ -2564,13 +2571,15 @@ static void AnchorEnsureExists() {
     if (!g_anchorShm) return;
     memset(g_anchorShm, 0, sizeof(DockAnchorShm));
     g_anchorShm->magic = 0x4B4E4144;      // 'DANK'
-    g_anchorShm->version = 1;
+    g_anchorShm->version = 2;             // 2 = entries carry armedAtMs
 }
 
 // Publish (or clear, with a null rect) one anchor. Called for every flyout button we own,
 // so the mod always sees the current geometry; the block dies with the dock, which is why
-// a stale entry can never survive us.
-static void AnchorPublish(unsigned kind, const RECT* screenRect, int gapPx) {
+// a stale entry can never survive us. `armed` marks "the flyout is being opened right now",
+// which is how the mod recognises a popup that belongs to us (XAML popups all share one
+// window class, there is nothing else to go by).
+static void AnchorPublish(unsigned kind, const RECT* screenRect, int gapPx, bool armed = false) {
     AnchorEnsureExists();
     if (!g_anchorShm || kind == 0 || kind > kAnchorKindMax) return;
     DockAnchorEntry& e = g_anchorShm->entries[kind - 1];
@@ -2579,21 +2588,29 @@ static void AnchorPublish(unsigned kind, const RECT* screenRect, int gapPx) {
     int t = empty ? 0 : screenRect->top;
     int r = empty ? 0 : screenRect->right;
     int b = empty ? 0 : screenRect->bottom;
+    unsigned flags = empty ? 0 : (armed ? 1u : 0u);
+    unsigned armedAt = armed ? GetTickCount() : e.armedAtMs;
+    // A plain republish (layout change while the menu is opening) must not disarm us: keep
+    // the arm for its whole validity window, the mod uses the same 3 s.
+    if (!armed && !empty && e.flags && armedAt && (GetTickCount() - armedAt) < 3000) flags = e.flags;
     if (!empty && e.kind == kind && e.left == l && e.top == t && e.right == r && e.bottom == b &&
-        e.gapPx == gapPx)
+        e.gapPx == gapPx && e.flags == flags && (!armed || e.armedAtMs == armedAt))
         return;      // unchanged
     if (empty && e.kind == 0) return;
     memset(&e, 0, sizeof(e));
     e.kind = empty ? 0 : kind;
+    e.flags = flags;
     e.left = l;
     e.top = t;
     e.right = r;
     e.bottom = b;
     e.gapPx = empty ? 0 : gapPx;
+    e.armedAtMs = empty ? 0 : armedAt;
     if (!empty && (unsigned)(kind) >= g_anchorShm->count) g_anchorShm->count = kind;
     g_anchorShm->updatedMs = GetTickCount();
     if (!empty)
-        DLog(L"anchor: published kind=%u rect=%d,%d-%d,%d gap=%d", kind, l, t, r, b, gapPx);
+        DLog(L"anchor: published kind=%u rect=%d,%d-%d,%d gap=%d%s", kind, l, t, r, b, gapPx,
+             armed ? L" (armed)" : L"");
 }
 
 // Screen rect of a slot (client rect -> screen), or false when the slot is not on screen.
@@ -2634,6 +2651,15 @@ static void PublishAnchors() {
     RECT win = AnchorRectForItem(kSlotWin);
     bool haveWin = win.right > win.left;
     AnchorPublish(kAnchorStartMenu, haveWin ? &win : nullptr, gap);
+    // The same button also anchors the Win+X popup; it is only *armed* for a moment after a
+    // right click, because that popup's window class is shared with every other XAML popup.
+    AnchorPublish(kAnchorWinXMenu, haveWin ? &win : nullptr, gap);
+}
+
+static void ArmWinXAnchor() {
+    PublishAnchors();      // fresh rect first, then the arm flag
+    RECT win = AnchorRectForItem(kSlotWin);
+    if (win.right > win.left) AnchorPublish(kAnchorWinXMenu, &win, 8, true);
 }
 
 // ---------------------------------------------------------------- tray icons

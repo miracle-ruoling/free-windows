@@ -2737,6 +2737,8 @@ static Companion g_trayBar;
 // forward declarations (the state poller repaints, and the painting code is further down)
 static void TrayRepaint(Companion& c);
 static void CompanionPresent(Companion& c);
+// quick settings placement (defined after the companions: it needs the capture helpers)
+static void QuickSettingsBeginPlacement(const RECT& button);
 
 static int CompanionIconPx(const Companion& c) {
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
@@ -3559,6 +3561,7 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // Anywhere in the tray bar opens the same panel (user, 2026-11-15)
                 RECT r = c.rc;
                 AnchorPublish(kAnchorQuickSettings, &r, 8);
+                QuickSettingsBeginPlacement(r);       // remember the screen before it opens
                 const BYTE chord[] = {VK_LWIN, 'A'};
                 DLog(L"tray bar: click -> quick settings (win+a)");
                 SendChord(chord, 2);
@@ -3632,6 +3635,145 @@ static void CompanionCreate() {
     AnchorPublish(kAnchorQuickSettings, &r, 8);
     DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
          (int)c.follow);
+}
+
+// ---------------------------------------------------------------- quick settings placement
+// The quick settings flyout is a full-height side sheet (480x1020 here) whose *visible*
+// content sits at the bottom of that window, so the mod can only shift it horizontally -
+// moving the window vertically is possible, but the content's offset inside the window is
+// what decides where it lands, and that offset changes (a media card appears above the
+// panel whenever something is playing). So: measure the content, then move the window.
+//   * capture the screen before the panel opens
+//   * wait for the flyout, capture again, diff -> the content rectangle
+//   * put the content's top just below the tray bar (flip above it if there is no room)
+// Everything happens in the dock, so no round trip through the mod (which keeps doing the
+// horizontal part and the initial position).
+struct QuickSettingsPlace {
+    bool pending = false;
+    DWORD armedAt = 0;
+    RECT button{};
+    std::vector<uint32_t> before;
+    int w = 0, h = 0;
+};
+static QuickSettingsPlace g_qs;
+
+static bool CaptureScreenInto(std::vector<uint32_t>& out, int* pw, int* ph) {
+    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    if (w <= 0 || h <= 0) return false;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { ReleaseDC(nullptr, screen); return false; }
+    HDC dc = CreateCompatibleDC(screen);
+    HGDIOBJ old = SelectObject(dc, bmp);
+    BOOL ok = BitBlt(dc, 0, 0, w, h, screen, 0, 0, SRCCOPY);
+    if (ok) {
+        // copy *before* the bitmap goes away: `bits` points into the DIB, so reading it
+        // after DeleteObject reads freed memory (that crashed the dock once already)
+        out.assign((uint32_t*)bits, (uint32_t*)bits + (size_t)w * h);
+        *pw = w;
+        *ph = h;
+    }
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return ok != FALSE;
+}
+
+static void QuickSettingsBeginPlacement(const RECT& button) {
+    g_qs.button = button;
+    g_qs.armedAt = GetTickCount();
+    g_qs.pending = CaptureScreenInto(g_qs.before, &g_qs.w, &g_qs.h);
+}
+
+// Called from the tick: wait for the flyout, measure its content, put it next to the button.
+static void QuickSettingsTick(DWORD now) {
+    if (!g_qs.pending) return;
+    if ((DWORD)(now - g_qs.armedAt) < 420) return;      // let the open animation finish
+
+    HWND panel = GetForegroundWindow();
+    wchar_t cls[64]{};
+    if (!panel || !GetClassNameW(panel, cls, 64) || _wcsicmp(cls, L"ControlCenterWindow") != 0) {
+        if ((DWORD)(now - g_qs.armedAt) > 1500) g_qs.pending = false;   // never showed up
+        return;
+    }
+    g_qs.pending = false;
+
+    RECT wr{};
+    if (!GetWindowRect(panel, &wr)) return;
+
+    std::vector<uint32_t> after;
+    int aw = 0, ah = 0;
+    if (!CaptureScreenInto(after, &aw, &ah) || aw != g_qs.w || ah != g_qs.h) return;
+
+    // bbox of everything that changed *inside the panel window* -> its visible content.
+    // Restricting to the window matters: a full-screen diff also catches whatever the app
+    // behind us is doing (the first version measured "1837x1029", i.e. noise).
+    const int thr = 24;
+    int x0 = wr.left < 0 ? 0 : wr.left;
+    int y0 = wr.top < 0 ? 0 : wr.top;
+    int x1 = wr.right > aw ? aw : wr.right;
+    int y1 = wr.bottom > ah ? ah : wr.bottom;
+    int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN, changed = 0;
+    for (int y = y0; y < y1; y++) {
+        const uint32_t* a = &g_qs.before[(size_t)y * aw];
+        const uint32_t* b = &after[(size_t)y * aw];
+        for (int x = x0; x < x1; x++) {
+            uint32_t p = a[x], q = b[x];
+            int dr = abs((int)((p >> 16) & 0xFF) - (int)((q >> 16) & 0xFF));
+            int dg = abs((int)((p >> 8) & 0xFF) - (int)((q >> 8) & 0xFF));
+            int db = abs((int)(p & 0xFF) - (int)(q & 0xFF));
+            if (dr + dg + db <= thr) continue;
+            changed++;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+        }
+    }
+    if (changed < 4000 || right <= left || bottom <= top) {
+        DLog(L"qs: content not measurable (changed=%d) - panel stays where it is", changed);
+        return;
+    }
+
+    int contentTop = top, contentBottom = bottom + 1;
+    int contentH = contentBottom - contentTop;
+
+    RECT work{};
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) work = mi.rcWork;
+    else work = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+
+    const int gap = 8;
+    int targetTop = g_qs.button.bottom + gap;                 // preferred: right under the button
+    if (targetTop + contentH > work.bottom) {
+        int above = (int)g_qs.button.top - gap - contentH;    // no room: flip above
+        if (above >= work.top) targetTop = above;
+    }
+    if (targetTop + contentH > work.bottom) targetTop = work.bottom - contentH;
+    if (targetTop < work.top) targetTop = work.top;
+
+    int dy = targetTop - contentTop;
+    if (dy == 0) {
+        DLog(L"qs: content %dx%d already at %d (button %ld..%ld)", right - left + 1, contentH,
+             contentTop, (long)g_qs.button.top, (long)g_qs.button.bottom);
+        return;
+    }
+    SetWindowPos(panel, nullptr, wr.left, wr.top + dy, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+    DLog(L"qs: content %dx%d at y=%d -> moved the panel by %d (button %ld..%ld, work %ld..%ld)",
+         right - left + 1, contentH, contentTop, dy, (long)g_qs.button.top,
+         (long)g_qs.button.bottom, (long)work.top, (long)work.bottom);
 }
 
 // ---------------------------------------------------------------- tray icons
@@ -7565,6 +7707,7 @@ static void RenderTick() {
             LaunchWatchTick();
             FlushPendingUp(now);
             CompanionTick(now);      // attached windows: follow, fade, tray state
+            QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();
             FocusWatchTick();
             if (g_trayRetryAt && (LONG)(now - g_trayRetryAt) >= 0) {

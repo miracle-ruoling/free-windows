@@ -218,7 +218,7 @@
 
 一个 C++ Windows 桌面图标条（`dock.exe`）+ 两个 Windhawk mod（托盘桥 / 任务栏隐藏）。
 
-- **能用的**：玻璃模糊、`^` 宫格（**贴着 `^` 弹、不压条、不出屏**）、悬停放大、滚轮翻页、开机自启、任务栏只在按 Win 时出现、完整交互状态机（`STATE_MACHINE.md`）、右键不动光标 + 菜单自动移进屏幕、托盘右键菜单转发、**宫格左键纯转发**、**条上图标右键菜单**（App 名 / App tasks / 关闭窗口）、**「重新扫描托盘」**自愈入口、贴边/越界不限制拖动、**双击条空白处快速闪避**、**贴边去圆角（逐角 120ms 缓动）**。
+- **能用的**：玻璃模糊、**首格固定 Windows 按钮（左键开始菜单 / 右键 Win+X）**、`^` 宫格（**贴着 `^` 弹、不压条、不出屏**）、悬停放大、滚轮翻页、开机自启、任务栏只在按 Win 时出现、完整交互状态机（`STATE_MACHINE.md`）、右键不动光标 + 菜单自动移进屏幕、托盘右键菜单转发、**宫格左键纯转发**、**条上图标右键菜单**（App 名 / App tasks / 关闭窗口）、**「重新扫描托盘」**自愈入口、贴边/越界不限制拖动、**双击条空白处快速闪避**、**贴边去圆角（逐角 120ms 缓动）**。
 - **不稳的 / 外部限制**：托盘数据完整依赖"mod 是否注入那个进程"（32 位 App 需要 x86 mod，已装）；NVIDIA 的图标会整段消失且不理 `TaskbarCreated`（坑 41）；联想电脑管家不被 Windhawk 注入（用户决定不管）；提权 App（Legion Zone）的菜单关不掉（坑 18）。
 - **当前机器状态**：dock build 2026-11-12 11:14 在跑；桥表 15 条；Windhawk 两个 mod（64 位 + 32 位）均已启用。
 
@@ -239,19 +239,19 @@
 
 | 项目 | 路径 |
 |---|---|
-| 源码 | `C:\Users\20979\RP_Projects\common_workspace\dock\dock.cpp`（单文件 ~5000 行） |
+| 源码 | `C:\Users\20979\RP_Projects\fly_bar\dock\dock.cpp`（单文件 ~7100 行） |
 | 构建 | 同目录 `build.ps1`（cl.exe 直调 + 部署到安装目录 + 哈希校验） |
 | 安装 / 运行 | `%LOCALAPPDATA%\Programs\Dock\dock.exe`（配置 `dock.ini`，日志 `dock.log`） |
 | 日志 | **跨重启追加**，超过 4MB 轮转为 `dock.old.log` |
 | 开机自启 | `%APPDATA%\...\Startup\Dock.lnk`（右键菜单可开关） |
-| mod 源码 | `common_workspace\windhawk\tray-icons-bridge.wh.cpp`、`taskbar-hidden-until-win.wh.cpp`（另有 `tray-icons-bridge-x86.wh.cpp`） |
+| mod 源码 | `fly_bar\windhawk\tray-icons-bridge.wh.cpp`、`taskbar-hidden-until-win.wh.cpp`（另有 `tray-icons-bridge-x86.wh.cpp`） |
 | mod 安装位 | `C:\ProgramData\Windhawk\ModsSource\local@<id>.wh.cpp`（Windhawk 从这里编译） |
 | mod 产物 | `C:\ProgramData\Windhawk\Engine\Mods\64\local@<id>_<ver>_<hash>.dll` |
 | 工具链 | MSVC `...\VC\Tools\MSVC\14.51.36231`；SDK `D:\Windows Kits\10`（10.0.26100.0） |
 
 **构建 / 部署顺序不能错**：
 ```powershell
-cd C:\Users\20979\RP_Projects\common_workspace\dock
+cd C:\Users\20979\RP_Projects\fly_bar\dock
 Get-Process dock -ErrorAction SilentlyContinue | Stop-Process -Force
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 Start-Process "$env:LOCALAPPDATA\Programs\Dock\dock.exe"
@@ -264,6 +264,7 @@ Start-Process "$env:LOCALAPPDATA\Programs\Dock\dock.exe"
 ## 3. 关键实现
 
 ### 3.1 图标条（对标任务栏）
+- **第一格固定是 Windows 按钮**（2026-11-15）：手绘四方块 logo，不参与滚动、抓不走重排、别的图标插不到它前面；左键 = 开始菜单（发 `Ctrl+Esc`，不惊动隐藏的任务栏）、右键 = Win+X。弹窗是 shell 自己的窗口，**位置由 shell 决定**（外部搬不动，见坑 49）。
 - **固定项来源**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband\Favorites`（REG_BINARY）。**不能**直接用 `User Pinned\TaskBar\*.lnk` 文件夹（里面留着用户早已取消固定的残留，例如 `网易UU远程.lnk`）。详见坑 8。
 - **窗口项**：`IsCandidate()` 用 shell 规则 `visible && !cloaked && (WS_EX_APPWINDOW || (!WS_EX_TOOLWINDOW && 无 owner))`；无标题窗口用 `WindowLabel()` 取 exe 名。
 - 布局 `ComputeButtons()`：`icon = min(H-2*pad, maxIcon)`，`cap = (W-2*pad+gap)/cell`，`^` 永远占最后一格，`show = cap-1`；滚轮改 `g_scroll`。
@@ -445,7 +446,10 @@ dumpBake=0
 45. **PowerShell 5.1 读 UTF-8 无 BOM 的中文脚本会解析失败**（报"字符串缺少终止符"）。含中文的 `.ps1` 必须带 BOM。
 46. **python 直接往 Windows 控制台打中文会 GBK 报错**：写成 UTF-8 文件，再用 `ops_read_files` 读；`ops_bash` 的 `tail`/`grep` 也不认 UTF-16。
 47. **`FindWindow("#32768")` 不一定有**：菜单关掉后就没有这个窗口，测试脚本别假设它一直在；而且用户/App 的菜单也可能同类名（先看它是不是我们进程的）。
-48. **条上 `g_scroll` 会滚动**：图标多于容量时按"左+pad+i*cell"算出来的是可见位置，不是 item 序号；要么读 `hover -> N` 闭环，要么先读日志里的 `items=` 与滚动状态。
+48. **条上 `g_scroll` 会滚动**：图标多于容量时按"左+pad+i*cell"算出来的是可见位置，不是 item 序号；要么读 `hover -> N` 闭环，要么先读日志里的 `items=` 与滚动状态。**2026-11-15 起**最省事的办法是读 `layout:` 日志（它直接给出首格/`^` 的客户区矩形）。
+49. **开始菜单 / Win+X 菜单搬不动**：两个都是 shell 的 XAML 窗口（`Windows.UI.Core.CoreWindow` / `Xaml_WindowedPopupClass`），`SetWindowPos` 要么被驳回（矩形不变），要么矩形变了但**画面一像素不动**（整屏截图逐字节相同）。想让它们出现在指定位置只能 hook shell 的布局函数。详见 `HANDOVER_NEXT.md` §3.2。
+50. **`EnumWindows` 看不见"正在显示"的那批 shell 窗口**：Start/Search 面板、展开状态的任务栏都枚举不到（`GetForegroundWindow`、`GetWindowRect`、`PostMessage` 却都正常）。所以：①判断"任务栏在不在屏上"要用**记下来的 handle** + `GetWindowRect`（`y≈1020` = 展开、`y≈1078` = 收起），不要靠枚举；②`FindWindow("Shell_TrayWnd")` 在这两种状态下都可能返回 0。
+51. **`dev/logtail.ps1` 只输出最后 25 行且不认 `-Lines`**：想确认"某条日志出现没出现"必须用 `dev/loggrep.ps1 -Pattern <正则>`，否则会得出"日志里没有"的错误结论（本轮踩过）。
 
 ## 6. 代码地图（`dock.cpp`）
 
@@ -454,7 +458,8 @@ dumpBake=0
 | `LoadConfig()` / `StripIniBom()` | ini 读取 |
 | `BuildItems()` / `PinnedLnkListed()` / `IsCandidate()` / `WindowLabel()` | 条的内容：固定项（注册表）+ 窗口 |
 | `BuildTray()` / `BuildTrayFromBridge()` / `TrayBridgeOpen()` / `TrayBridgeEnsureExists()` | 托盘数据（桥 → 兜底） |
-| `ComputeButtons()` / `ComputeLayout()` | 条布局、翻页 |
+| `ComputeButtons()` / `ComputeLayout()` | 条布局、翻页。**第一格固定是 Windows 按钮（`kSlotWin=-3`）、最后一格是 `^`（`kSlotChevron=-1`）**；`g_capacity`=格子数、`g_pageItems`=可见图标数；几何变化时打 `layout:` 一条 |
+| `PaintWinButton()` / `OpenStartMenu()` / `OpenPowerUserMenu()` / `HideNativeTaskbar()` | 【2026-11-15】首格 Windows 按钮：手绘四方块 logo；左键 Ctrl+Esc 开开始菜单、右键 Win+X；600ms 后把被带出来的原生任务栏收回去（`RememberTaskbars()` 记 handle，因为任务栏展开后 `EnumWindows` 看不到它） |
 | `Paint()` / `Present()` / `RenderIconCache()` | 绘制、图层输出 |
 | `CaptureBackdrop()` / `GrabScreenUnderUs()` / `WindowUnderUs()` | 玻璃背景 |
 | `GridShow` / `GridLayout` / `GridPaint` / `GridProc` / `GridClick` | 宫格（`GridTick` 已删除，收起由 `PressWatchTick`/`FocusWatchTick` 决定） |

@@ -1,6 +1,6 @@
 import io, re
 
-p = r"C:\Users\20979\RP_Projects\common_workspace\dock\dock.cpp"
+p = r"C:\Users\20979\RP_Projects\fly_bar\dock\dock.cpp"
 s = io.open(p, encoding="utf-8").read()
 
 start = s.index("// Glass background without the GPU cost")

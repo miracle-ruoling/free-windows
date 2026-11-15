@@ -1258,9 +1258,14 @@ static bool AnimateCorners() {
 
 struct Slot {
     RECT rc;
-    int item;    // index into g_items, -1 = the "expand" button
+    int item;    // index into g_items; negative = one of the fixed buttons below
     int size = 0;    // drawn icon size (grows under the cursor)
 };
+// Fixed buttons that sit in the same row but outside the scrolling range. They are
+// never grabbed by the reorder state machine and nothing can be dropped in front of
+// them; their inner edge is a hard boundary for the icons (see Paint/WM_MOUSEMOVE).
+static const int kSlotChevron = -1;   // "^": opens / closes the tray grid
+static const int kSlotWin = -3;       // the Windows button: Start menu / Win+X menu
 static std::vector<Slot> g_slots;
 // per-slot hover magnification, 0 = normal, 1 = fully grown
 // One grow/shrink animation per slot. The *duration* is fixed (hoverMs), so the number
@@ -1277,6 +1282,8 @@ static int g_iconCachePx = 0;
 
 static int g_iconPx = 32;
 static int g_capacity = 0;      // how many cells fit
+static int g_pageItems = 1;     // how many items are visible at once (cells minus the
+                                // two fixed buttons); used for wheel / edge scrolling
 static int g_scroll = 0;        // first visible item
 static bool g_reordering = false;   // dragging an icon to a new place in the row
 static int g_reorderItem = -1;      // item being dragged
@@ -1682,16 +1689,19 @@ static void ComputeButtons() {
     if (cap < 1) cap = 1;
 
     int n = (int)g_items.size();
-    // the chevron is always there: it opens the grid, which also carries the
-    // tray icons, so it is not only an "everything else" button
-    bool needExpand = cap > 1;
-    int show = needExpand ? cap - 1 : cap;
+    // Two cells are always taken by fixed buttons: the Windows button in the first
+    // cell and the chevron in the last one. Neither scrolls, so the items only get
+    // whatever is left - that is why the visible item count is cap-2, not cap-1.
+    bool needExpand = cap >= 2;
+    int show = cap - 1 - (needExpand ? 1 : 0);
+    if (show < 0) show = 0;
 
     if (g_scroll > n - show) g_scroll = n - show;
     if (g_scroll < 0) g_scroll = 0;
 
     g_iconPx = icon;
     g_capacity = cap;
+    g_pageItems = show > 0 ? show : 1;
 
     g_iconBucket = 256;        // always cache from the 256px artwork
     // cache a little larger than the drawn size: the hover zoom then scales real
@@ -1704,17 +1714,20 @@ static void ComputeButtons() {
     int visible = n - g_scroll;
     if (visible > show) visible = show;
     if (visible < 0) visible = 0;
-    int cellCount = visible + (needExpand ? 1 : 0);
+    int cellCount = 1 + visible + (needExpand ? 1 : 0);
     if ((int)g_slotHover.size() != cellCount) g_slotHover.assign(cellCount, SlotAnim{});
 
+    auto animK = [](int i) {
+        if (i < 0 || i >= (int)g_slotHover.size()) return 0.0f;
+        float k = g_slotHover[i].v;
+        return k < 0 ? 0.0f : (k > 1 ? 1.0f : k);
+    };
     // sizes first, then positions: the row stays centred while one icon grows
-    int total = 0;
+    const int winSize = (int)(icon * (1.0 + 0.34 * animK(0)) + 0.5);
+    int total = winSize + gap;
     std::vector<int> sizes(visible, icon);
     for (int i = 0; i < visible; i++) {
-        float k = g_slotHover[i].v;
-        if (k < 0) k = 0;
-        if (k > 1) k = 1;
-        sizes[i] = (int)(icon * (1.0 + 0.34 * k) + 0.5);
+        sizes[i] = (int)(icon * (1.0 + 0.34 * animK(1 + i)) + 0.5);
         total += sizes[i] + gap;
     }
     if (needExpand) total += icon + gap;
@@ -1722,6 +1735,17 @@ static void ComputeButtons() {
     if (total < 0) total = 0;
     int start = pad + (longSide - pad * 2 - total) / 2;
     int pos = start;
+    {
+        // the Windows button: permanently the first cell of the row, never scrolled
+        Slot s;
+        s.item = kSlotWin;
+        s.size = winSize;
+        int cross = pad + (shortSide - pad * 2 - winSize) / 2;
+        if (vertical) s.rc = {cross, pos, cross + winSize, pos + winSize};
+        else s.rc = {pos, cross, pos + winSize, cross + winSize};
+        g_slots.push_back(s);
+        pos += winSize + gap;
+    }
     for (int i = 0; i < visible; i++) {
         int item = g_scroll + i;
         if (item >= n) break;
@@ -1745,13 +1769,61 @@ static void ComputeButtons() {
     }
     if (needExpand) {
         Slot s;
-        s.item = -1;
+        s.item = kSlotChevron;
         s.size = icon;
         int cross = pad + (shortSide - pad * 2 - s.size) / 2;
         if (vertical) s.rc = {cross, pos, cross + s.size, pos + s.size};
         else s.rc = {pos, cross, pos + s.size, cross + s.size};
         g_slots.push_back(s);
     }
+    // One line whenever the geometry changes: which cells exist and where the two fixed
+    // buttons are. Probing a slot from a script needs this instead of re-deriving the
+    // centred row (and the hover zoom moves it all the time anyway).
+    {
+        static int lastCap = -1, lastShow = -1, lastCells = -1, lastScroll = -1;
+        if (cap != lastCap || show != lastShow || cellCount != lastCells ||
+            g_scroll != lastScroll) {
+            lastCap = cap;
+            lastShow = show;
+            lastCells = cellCount;
+            lastScroll = g_scroll;
+            const Slot& w0 = g_slots.front();
+            RECT ch{};
+            for (const Slot& s : g_slots)
+                if (s.item == kSlotChevron) ch = s.rc;
+            DLog(L"layout: cap=%d show=%d cells=%d scroll=%d items=%d win=%d,%d-%d,%d "
+                 L"chevron=%d,%d-%d,%d icon=%d",
+                 cap, show, cellCount, g_scroll, n, (int)w0.rc.left, (int)w0.rc.top,
+                 (int)w0.rc.right, (int)w0.rc.bottom, (int)ch.left, (int)ch.top,
+                 (int)ch.right, (int)ch.bottom, icon);
+        }
+    }
+}
+
+// The Windows logo for the fixed first button: four rounded squares, drawn by hand.
+// Windows 11 paints its Start glyph with XAML inside the taskbar, so there is no icon
+// resource to load; rasterising it here keeps it crisp at any hover zoom and needs no
+// asset next to the exe. Colour matches the "^" chevron (white), so both fixed buttons
+// read the same against any wallpaper.
+static void PaintWinButton(const RECT& rc, int size) {
+    if (size < 10) return;
+    // the glyph spans ~92% of the button, split 2x2 with a ~9% gap (Fluent logo metrics);
+    // corners are only slightly rounded - too much radius melts the four squares into one
+    int span = (int)(size * 0.92f + 0.5f);
+    int gap = (int)(span * 0.09f + 0.5f);
+    int sq = (span - gap) / 2;
+    if (sq < 4) return;
+    int x0 = (rc.left + rc.right) / 2 - span / 2;
+    int y0 = (rc.top + rc.bottom) / 2 - span / 2;
+    int rad = sq / 7;
+    if (rad < 1) rad = 1;
+    const DWORD col = 0xF0FFFFFF;
+    for (int iy = 0; iy < 2; iy++)
+        for (int ix = 0; ix < 2; ix++) {
+            int x = x0 + ix * (sq + gap);
+            int y = y0 + iy * (sq + gap);
+            FillRound(g_memDC, RECT{x, y, x + sq, y + sq}, rad, col);
+        }
 }
 
 static void Paint(int w, int h) {
@@ -1880,13 +1952,17 @@ static void Paint(int w, int h) {
                       RadiusFor(s.rc.right - s.rc.left, s.rc.bottom - s.rc.top) / 2 + 2,
                       ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
         }
-        if (s.item < 0) {
+        if (s.item == kSlotChevron) {
             // "^" chevron, drawn by hand (GDI would write alpha 0 into the DIB)
             int cx = (s.rc.left + s.rc.right) / 2;
             int cy = (s.rc.top + s.rc.bottom) / 2;
             int r = g_iconPx / 4;
             DrawLine(cx - r, cy + r / 2, cx, cy - r / 2, 2, 0xF0FFFFFF);
             DrawLine(cx, cy - r / 2, cx + r, cy + r / 2, 2, 0xF0FFFFFF);
+            continue;
+        }
+        if (s.item == kSlotWin) {
+            PaintWinButton(s.rc, s.size > 0 ? s.size : g_iconPx);
             continue;
         }
         Item& it = g_items[s.item];
@@ -1909,8 +1985,8 @@ static void Paint(int w, int h) {
     }
     if (g_reordering && g_reorderItem >= 0 && g_reorderItem < (int)g_items.size()) {
         // The pressed icon: 1.34x, follows the cursor along the strip only, drawn above the
-        // others. Clipped to [0, chevron.left): the container edge on the left and the grid
-        // button on the right, which is the boundary the user defined.
+        // others. Clipped to [win.right, chevron.left): the Windows button and the grid
+        // button are the two boundaries of the icon area, which is what the user defined.
         Item& it = g_items[g_reorderItem];
         int sz = (int)(g_iconPx * kReorderZoom + 0.5f);
         POINT cp{};
@@ -1919,8 +1995,10 @@ static void Paint(int w, int h) {
         int left = cp.x - sz / 2;
         int top = (h - sz) / 2;
         int clipL = 0, clipR = w;
-        for (size_t i = 0; i < g_slots.size(); i++)
-            if (g_slots[i].item < 0) { clipR = g_slots[i].rc.left; break; }   // the grid button
+        for (size_t i = 0; i < g_slots.size(); i++) {
+            if (g_slots[i].item == kSlotWin) clipL = g_slots[i].rc.right;
+            else if (g_slots[i].item == kSlotChevron) { clipR = g_slots[i].rc.left; break; }
+        }
         // a soft lift so it reads as "picked up"
         FillRound(g_memDC, RECT{left, top, left + sz, top + sz}, RadiusFor(sz, sz) / 2 + 2,
                   ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
@@ -2205,6 +2283,100 @@ static void ClickItem(int index) {
     } else {
         DLog(L"click item %d had no hwnd and was not a pin", index);
     }
+}
+
+// ---------------------------------------------------------------- Windows button
+// The two popups behind the fixed first button are the shell's own windows. We never
+// draw them: we only send the same keystroke the keyboard would, and Windows opens its
+// own menu. Measured on this machine (Win11 25H2, 26200.7623): both the Start panel
+// (Windows.UI.Core.CoreWindow, 1000x938) and the Win+X menu (Xaml_WindowedPopupClass,
+// 222x761, owned by explorer) are XAML/composition surfaces whose screen position is
+// owned by the shell - SetWindowPos changes the window rect but not one visible pixel
+// (screenshots before/after are byte-identical), so they cannot be moved next to the
+// strip from out here. Documented in HANDOVER_NEXT.md §3.3.
+//
+// Left click uses Ctrl+Esc instead of Win: the shell opens the same Start menu, but the
+// taskbar-hidden-until-win mod only reacts to the Win key, so the hidden taskbar stays
+// hidden (verified: the taskbar window stays at y=1078 the whole time).
+static void SendChord(const BYTE* vks, int count) {
+    for (int i = 0; i < count; i++) keybd_event(vks[i], 0, 0, 0);
+    for (int i = count - 1; i >= 0; i--) keybd_event(vks[i], 0, KEYEVENTF_KEYUP, 0);
+}
+
+static void OpenStartMenu() {
+    const BYTE chord[] = {VK_CONTROL, VK_ESCAPE};
+    DLog(L"win button: left click -> start menu (ctrl+esc)");
+    SendChord(chord, 2);
+}
+
+// Win+X does have to press Win, which is exactly the signal the taskbar mod turns into
+// "show the taskbar". The menu is anchored to the (auto-hidden) taskbar, so it opens
+// where the shell wants it, and the taskbar may slide up on the way; a moment later we
+// put it back down ourselves with TrayUI's own hide timer (the same message the mod
+// uses). Waiting ~650 ms first lets the mod's 500 ms watchdog see the taskbar on screen
+// and revoke its expansion permission, so hovering the bottom edge cannot bring it back
+// afterwards.
+// The taskbar's window is only enumerable while it sits off-screen: once the shell
+// expands it (or opens Start, which brings it up on this build) EnumWindows no longer
+// returns it, even though the handle is still alive and GetWindowRect still reports
+// y=1020. So keep the handles we saw and post the hide to those as well - measured:
+// posting to a remembered handle while Start is open is accepted (PostMessage -> 1) but
+// the shell keeps the bar up until Start closes, which it then does by itself.
+static HWND g_barSeen[8] = {};
+static int g_barSeenCount = 0;
+
+static void RememberBar(HWND h) {
+    for (int i = 0; i < g_barSeenCount; i++)
+        if (g_barSeen[i] == h) return;
+    if (g_barSeenCount < 8) g_barSeen[g_barSeenCount++] = h;
+}
+
+static BOOL CALLBACK HideTaskbarProc(HWND h, LPARAM lp) {
+    wchar_t cls[64]{};
+    if (!GetClassNameW(h, cls, 64)) return TRUE;
+    if (_wcsicmp(cls, L"Shell_TrayWnd") != 0 && _wcsicmp(cls, L"Shell_SecondaryTrayWnd") != 0)
+        return TRUE;
+    RememberBar(h);
+    *(int*)lp += 1;
+    PostMessageW(h, WM_TIMER, 2, 0);          // TrayUI's kTrayTimerHide
+    DLog(L"win button: hid the native taskbar again (%p)", (void*)h);
+    return TRUE;
+}
+
+static void HideNativeTaskbar() {
+    int found = 0;
+    EnumWindows(HideTaskbarProc, (LPARAM)&found);
+    if (found) return;
+    for (int i = 0; i < g_barSeenCount; i++) {
+        if (!IsWindow(g_barSeen[i])) continue;
+        PostMessageW(g_barSeen[i], WM_TIMER, 2, 0);
+        DLog(L"win button: hid the native taskbar again via a remembered handle (%p)",
+             (void*)g_barSeen[i]);
+    }
+}
+
+static BOOL CALLBACK RememberBarProc(HWND h, LPARAM) {
+    wchar_t cls[64]{};
+    if (!GetClassNameW(h, cls, 64)) return TRUE;
+    if (_wcsicmp(cls, L"Shell_TrayWnd") == 0 || _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0)
+        RememberBar(h);
+    return TRUE;
+}
+
+// Seed the handle cache while the taskbar is still in its off-screen state (see above).
+static void RememberTaskbars() {
+    if (g_barSeenCount) return;
+    EnumWindows(RememberBarProc, 0);
+    if (g_barSeenCount)
+        DLog(L"win button: remembered %d native taskbar window(s), e.g. %p", g_barSeenCount,
+             (void*)g_barSeen[0]);
+}
+
+static void OpenPowerUserMenu() {
+    const BYTE chord[] = {VK_LWIN, 'X'};
+    DLog(L"win button: right click -> win+x menu");
+    SendChord(chord, 2);
+    if (g_hwnd) SetTimer(g_hwnd, 6, 650, nullptr);
 }
 
 // ---------------------------------------------------------------- fade
@@ -3988,7 +4160,7 @@ static void GridPlacement(const RECT& dr, int* outX, int* outY) {
     POINT org{0, 0};
     ClientToScreen(g_hwnd, &org);
     for (const Slot& s : g_slots) {
-        if (s.item < 0) {
+        if (s.item == kSlotChevron) {
             chev = RECT{org.x + s.rc.left, org.y + s.rc.top, org.x + s.rc.right,
                         org.y + s.rc.bottom};
             break;
@@ -4627,7 +4799,8 @@ static void ThumbShow(int index) {
 
 // Default size for a fresh install: one row/column sized by the configured icon.
 static void ComputeLayout(int* pw, int* ph) {
-    int n = (int)g_items.size();
+    // +1: the Windows button always owns a cell, even with no items at all
+    int n = (int)g_items.size() + 1;
     if (n < 1) n = 1;
     int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
     int cell = icon + g_cfg.gap;
@@ -6193,12 +6366,15 @@ static void RenderTick() {
             RECT crc{};
             GetClientRect(g_hwnd, &crc);
             int clipR = crc.right;
-            for (size_t i = 0; i < g_slots.size(); i++)
-                if (g_slots[i].item < 0) { clipR = g_slots[i].rc.left; break; }   // grid button
+            int clipL = 0;
+            for (size_t i = 0; i < g_slots.size(); i++) {
+                if (g_slots[i].item == kSlotWin) clipL = g_slots[i].rc.right;
+                else if (g_slots[i].item == kSlotChevron) { clipR = g_slots[i].rc.left; break; }
+            }
             const int thr = sz / 3;
-            int overL = -left;                     // how much hangs off the container edge
+            int overL = clipL - left;              // how much hangs under the Windows button
             int overR = (left + sz) - clipR;       // how much hangs under the grid button
-            int per = g_capacity > 1 ? g_capacity - 1 : 1;
+            int per = g_pageItems;
             int n = (int)g_items.size();
             bool canL = overL > thr && g_scroll > 0;
             bool canR = overR > thr && g_scroll + per < n;
@@ -6418,6 +6594,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                             GetModuleHandleW(nullptr), 0);
             DLog(L"mouse hook = %p (err=%lu)", (void*)g_mouseHook,
                  (unsigned long)(g_mouseHook ? 0 : GetLastError()));
+            RememberTaskbars();
             return 0;
 
         case WM_MOUSEACTIVATE:
@@ -6467,8 +6644,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_hover >= 0 && !g_popupOpen) ThumbShow(g_hover);
             } else if (wp == 4) {
                 FlipTick();          // the dodge animation runs on its own faster timer
-            } else if (wp == 5) {
-                static DWORD zoomT0 = 0;
+            } else if (wp == 6) {
+                KillTimer(h, 6);
+                HideNativeTaskbar();     // see OpenPowerUserMenu
+            } else if (wp == 5) {                static DWORD zoomT0 = 0;
                 static int zoomSteps = 0;
                 if (!zoomT0) {
                     zoomT0 = GetTickCount();
@@ -6698,7 +6877,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     g_lastBlankClickAt = 0;
                 }
                 if (g_pressSlot >= 0 && g_pressSlot < (int)g_slots.size() &&
-                    g_slots[g_pressSlot].item < 0) {
+                    g_slots[g_pressSlot].item == kSlotWin) {
+                    // the native taskbar closes its overflow when Start opens; do the same
+                    if (g_menuOpen) CloseMenuNow(L"win button opened the start menu");
+                    if (g_gridVisible) GridHide(L"win button opened the start menu");
+                    OpenStartMenu();     // the Windows button opens the shell's Start menu
+                } else if (g_pressSlot >= 0 && g_pressSlot < (int)g_slots.size() &&
+                           g_slots[g_pressSlot].item == kSlotChevron) {
                     GridShow();          // the chevron toggles the grid panel
                 } else if (g_pressHwnd && IsWindow(g_pressHwnd)) {
                     // we are about to give this app the foreground: that is not "focus
@@ -6757,6 +6942,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             for (size_t i = 0; i < g_slots.size(); i++)
                 if (PtInRect(&g_slots[i].rc, pt)) { hit = (int)i; break; }
             int hitItem = (hit >= 0) ? g_slots[hit].item : -1;
+            if (hit >= 0 && hitItem == kSlotWin) {
+                OpenPowerUserMenu();      // same menu as right-clicking the Start button
+                return 0;
+            }
             if (hit >= 0 && hitItem >= 0) {
                 // on an icon: the app's own menu (open / tasks / close window)
                 ShowAppMenuForSlot(hit);
@@ -6808,7 +6997,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
             int n = (int)g_items.size();
-            int per = g_capacity > 1 ? g_capacity - 1 : 1;
+            int per = g_pageItems;
             if (n > per) {
                 g_scroll -= (delta / WHEEL_DELTA) * g_cfg.scrollStep;
                 if (g_scroll < 0) g_scroll = 0;

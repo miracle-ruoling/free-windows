@@ -60,7 +60,7 @@
 
 | 项目 | 路径 |
 |---|---|
-| 源码 | `C:\Users\20979\RP_Projects\common_workspace\dock\dock.cpp`（单文件，约 4400 行） |
+| 源码 | `C:\Users\20979\RP_Projects\fly_bar\dock\dock.cpp`（单文件，约 4400 行） |
 | 构建 | 同目录 `build.ps1`（cl.exe 直调 + 自动部署 + 哈希校验） |
 | 安装 / 运行位置 | `C:\Users\20979\AppData\Local\Programs\Dock\dock.exe` |
 | 运行配置 / 日志 | 同目录 `dock.ini` / `dock.log` |
@@ -74,7 +74,7 @@
 
 构建 / 部署流程（**顺序不能错**）：
 ```powershell
-cd C:\Users\20979\RP_Projects\common_workspace\dock
+cd C:\Users\20979\RP_Projects\fly_bar\dock
 Get-Process dock -ErrorAction SilentlyContinue | Stop-Process -Force   # 必须先杀
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 Start-Process "$env:LOCALAPPDATA\Programs\Dock\dock.exe"

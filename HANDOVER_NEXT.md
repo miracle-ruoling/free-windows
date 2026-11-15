@@ -1,20 +1,28 @@
 # 交接：下一轮从这里开始
 
-> 写于 2026-11-15 02:50（上一轮把"图标拖动重排 + 动效 + 边界滚入"做完并验收）。
-> 上一轮的详细过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，**别重读历史排查**，看本文即可。
+> 写于 2026-11-15 18:20（本轮把"固定 Windows 按钮（开始菜单 / Win+X）"做完并自测通过）。
+> 上一轮（图标拖动重排 + 动效 + 边界滚入）的过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，
+> **别重读历史排查**，看本文即可。
+> 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
+> 文档里的旧路径已全部改过来。
 
 ---
 
 ## 0. 三分钟版本
 
-- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~6800 行。
+- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~7100 行。
 - 本轮之前的**大坑已经全部收尾**：玻璃背景"位移/抖动"的根因是
   "`UpdateLayeredWindow` 的矩形和像素没落在同一次合成里"，修法是 `presentSync=2`
   （ULW **之前** `DwmFlush()`）。**这一条别动**。
 - 现在条的性能：静止 16–20 次抓图/秒（每帧合成 0.37 ms）、拖动 115–119 次重绘/秒、
-  每帧 `paint≈1.3 ms`、`present≈0.2 ms`。
-- 本轮新增：图标长按拖动**重排**（带动效、带边界滚入）、透明档拉伸热区、缩略图标题跟随滚动。
-- **下一步待办见 §3**：①（已修，仅留记录）被拖图标锯齿；②把任务栏更多东西搬到条上（形式待定）。
+  每帧 `paint≈1.3 ms`、`present≈0.2 ms`。本轮加的四方块 logo 相当于多画一个图标，量级不变。
+- 本轮新增：**第一格固定 Windows 按钮**——左键开始菜单、右键 Win+X；和 `^` 一套槽位规则
+  （不滚动、抓不走、不能插到它前面）。见 **§3.2**。
+- **这轮最重要的结论**：开始菜单 / Win+X 都是 shell 的 XAML 窗口，**外部进程搬不动位置**
+  （`SetWindowPos` 成功但画面一像素不动）。所以"把弹窗迁到条附近"没做成，
+  用户 2026-11-15 选的是"先按原生位置弹"。细节与证据见 §3.2 末尾。
+- **下一步待办见 §3**：①（已修，仅留记录）被拖图标锯齿；
+  ②把任务栏更多东西搬到条上（形式待定，**先和用户对齐**）。
 
 ---
 
@@ -32,18 +40,18 @@
 
 ---
 
-## 2. 现场（2026-11-15 02:50）
+## 2. 现场（2026-11-15 18:20）
 
 | | |
 |---|---|
 | 构建 | `dock.cpp` → `build.ps1`（MSVC 18 / SDK 26100）→ 部署到 `%LOCALAPPDATA%\Programs\Dock\` |
-| 重启 | `dev/redeploy.ps1`：关掉 dock → 复制 exe → **通过 explorer.exe 拉起**（必须，低完整性会自愈但会闪一下） |
-| 条 | `x=285 y=379 w=1570 h=121`（用户自己摆过，位置会变，别当成固定值） |
-| ini | `material=1 / glassOpacity=0 / tintStrength=0 / lightMode=1 / tint=#A6101010 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / presentOrder=0 / debugBeacon=0 / radius=77 / pad=10 / maxIcon=72` |
-| git | 仓库在 `dock/`，`.gitignore` 已覆盖产物/截图/帧转储 → **`git add -A` 就够**。工作区干净 |
+| 重启 | `dev/redeploy.ps1`：关掉 dock → 复制 exe → **通过 explorer.exe 拉起**（必须，低完整性会自愈但会闪一下）。**先杀 dock 再 build**，否则 `build.ps1` 的复制会报"文件被占用"（`cl.exe` 已经产出新 exe，但脚本以错误退出） |
+| 条 | 本轮实测 `x=872 y=40 w=665 h=121`（用户会自己摆/改宽度，别当成固定值） |
+| ini | `material=1 / glassOpacity=1 / tintStrength=0 / lightMode=1 / tint=#A6101010 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / presentOrder=0 / debugBeacon=0 / radius=77 / pad=10 / maxIcon=72` |
+| git | 仓库在 `dock/`，`.gitignore` 已覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`1bee953` 重排不跟手的修复 → `1761d5f` 重排动效+边界滚入 → `c9c3e03` 重排本身 →
-`66d849c` 混色搬进抓图 → `c8fcaf1` 拉伸闪烁 → `15badf9` 存档点。
+最近提交（倒序）：`（本轮）` 固定 Windows 按钮 → `1bee953` 重排不跟手的修复 → `1761d5f` 重排动效+边界滚入 →
+`c9c3e03` 重排本身 → `66d849c` 混色搬进抓图 → `c8fcaf1` 拉伸闪烁 → `15badf9` 存档点。
 
 ---
 
@@ -63,7 +71,67 @@
 验证：`dev/drag_icon_full.png` / `dev/drag_icon_zoom.png`（放大后边缘平滑，无锯齿）。
 **如果用户仍说不清楚，先确认他看的是"被拖的那个"而不是邻居。**
 
-### 3.2 把任务栏更多东西搬到条上（形式待定，**下一轮先和用户对齐**）
+### 3.2 Windows 按钮（第一格固定 / 左键开始菜单 / 右键 Win+X）—— ✅ 本轮完成
+
+**语义（用户 2026-11-15 拍板）**
+- 位置：条的**第一格**，和 `^` 完全同一套槽位规则——**不参与滚动、不能被长按抓走重排、别的图标
+  不能插到它前面**；它的**右边界**和 `^` 的**左边界**一样，是图标区的硬边界（拖动重排时超出就裁掉）。
+- 左键 = 开始菜单；右键 = Win+X（电源用户菜单）。**两个弹窗都是 shell 自己的窗口**，我们只发命令，
+  不自绘窗口（用户明确要求）。
+- 图标：Win11 的四方块 logo 系统资源里没有（是 XAML 画的），所以自己画（见下）。
+
+**实现落点（`dock.cpp`）**
+- 槽位哨兵：`kSlotChevron = -1`、`kSlotWin = -3`。**注意**：以前所有 `item < 0` 都当成"宫格按钮"，
+  现在必须按哨兵判（`GridPlacement()`、拖动裁剪、边界滚动这三处都改过，漏一处宫格会锚到首格）。
+- `ComputeButtons()`：`show = cap - 1 - (needExpand ? 1 : 0)`（Win 占一格、`^` 占一格），
+  `g_pageItems = show`（滚轮翻页/边界滚动的步长，原来写的是 `g_capacity - 1`）；
+  首格尺寸也吃 hover 放大（`g_slotHover[0]`），所以它和普通图标一样会长大、邻居让位。
+- `Paint()`：`kSlotWin` → `PaintWinButton()`（四个圆角方块，白 `0xF0FFFFFF`，和雪佛龙同色；
+  跨度 92%、间隙 9%、圆角 `sq/7`——按 Fluent logo 的比例，圆角再大就会糊成一块）；
+  拖动重排的裁剪范围改成 `[win.right, chevron.left)`。
+- 点击：`WM_LBUTTONUP` 命中首格 → 先 `GridHide`（和原生"点开始收起托盘面板"一致）再 `OpenStartMenu()`；
+  `WM_RBUTTONUP` 命中首格 → `OpenPowerUserMenu()`（不进 dock 自己的菜单）。
+- 排版日志（**新**，脚本靠它定位，别再按公式推）：`layout: cap=8 show=6 cells=8 scroll=0 items=11
+  win=23,24-95,96 chevron=569,24-641,96 icon=72`，只在几何变化时打一条。
+
+**两个命令的细节与实测**
+- 左键用 **Ctrl+Esc** 而不是 Win：同一个开始菜单，但不会惊动 `taskbar-hidden-until-win` 这个 mod
+  （它只看 Win 键）。实测 3 次：任务栏窗口全程停在 `y=1078`（屏幕外），开始菜单正常弹出。
+- 右键必须真的按 Win（`keybd_event`：Win down → X down/up → Win up）。实测 3 次：菜单都出来
+  （`Xaml_WindowedPopupClass 222x761 @531,325`），任务栏**也没跟着滑出来**。
+  仍然留了保险：`WM_TIMER 6` 在 650ms 后向任务栏的 `kTrayTimerHide`（`WM_TIMER` id=2）补一条 post，
+  在就收、不在就什么都不做。
+
+**结论：原生弹窗搬不动位置（这轮最重要的发现，别再重复试）**
+- **开始菜单**窗口：`Windows.UI.Core.CoreWindow`，`1000x938`（800 宽的菜单 + 右侧 200 宽的手机互联卡）。
+  `SetWindowPos` 返回 `ok=1`、`GetWindowRect` 也变成新坐标，但**画面一个像素都不动**：
+  前后两次整屏截图 `changed = 0 of 2073600`（逐字节相同）。
+- **Win+X 菜单**：`Xaml_WindowedPopupClass`（explorer 的 XAML 弹窗，`222x761`）。`SetWindowPos` 直接不生效，
+  矩形原地不动。
+- 这两类窗口都**不在 `EnumWindows` 的结果里**（但 `GetForegroundWindow` / `GetWindowRect` 正常）。
+  任务栏窗口在"展开状态"时也枚举不到（收起状态 `y=1078` 时能枚举到）→ 所以 dock 现在启动时
+  `RememberTaskbars()` 记住 handle，需要时按记住的 handle `PostMessage`。
+- 试过并失败的三条歪路（别再试）：① 把隐藏的任务栏窗口挪到条附近再开开始菜单——开始菜单不跟
+  "任务栏窗口矩形"走（它认 appbar 的注册边）；② 挪它的父窗口/owner——没有父窗口、没有 owner；
+  ③ 把窗口改成 100x100——画面照旧。想真的搬位置，只能 hook shell 的布局函数（Windhawk mod，
+  成本高、跟版本走、还要用户在 UI 里手动编译）。用户 2026-11-15 决定：**先按原生位置弹**。
+
+**验证（脚本 + 截图都在 `dock/dev/`）**
+- 左键：`winclick_left_after.png`（开始菜单开着、任务栏没露头）；日志 `win button: left click -> start menu (ctrl+esc)`。
+- 右键：`winclick_right_after.png`（原生 Win+X 菜单：已安装的应用/电源选项/终端/设置/关机…）；
+  日志 `win button: right click -> win+x menu` + `win button: hid the native taskbar again (...)`。
+- 首格不掉位：滚轮 3 格后 `layout: ... scroll=3 ... win=23,24-95,96`（和 scroll=0 时同一条矩形），
+  截图 `scroll_view.png`（图标已经翻过去、四方块还在最左）。
+- 宫格仍锚在 `^`：`t_wingrid.ps1` → `grid 1227,169 286x296`、`inside work area=True`、`overlaps strip=False`。
+- 宫格开着时点首格：日志 `grid: hide (from win button opened the start menu)` → 再开开始菜单。
+
+**未由人手复核**
+- 手感：首格 hover 放大时邻居让位是否自然；四方块的大小/间隙像不像 Win（要改就动
+  `PaintWinButton()` 里那三个比例）。
+- 在首格上**按住拖动 = 拖整条**（和 `^`/空白处一样），不是"拖不动"。想改成只响应点击，说一声。
+- logo 恒白（和雪佛龙一致）。若以后换成浅色壁纸看不清，可以按 `lightMode` 换成深色，或加个 ini 开关。
+
+### 3.3 把任务栏更多东西搬到条上（形式待定，**下一轮先和用户对齐**）
 
 用户原话："将任务栏更多东西移植到我们的条上，形式暂时未定"。
 **这里不要自己拍板**（用户习惯：有歧义先问）。可候选的方向，供和他讨论时列出来：
@@ -85,7 +153,7 @@
 
 ---
 
-## 4. 改代码前必须知道的 8 件事
+## 4. 改代码前必须知道的 9 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
    合成器"下一帧才应用新矩形、但 layered 位图立刻生效"→ 每次移动后的 5–7 ms 是
@@ -99,7 +167,7 @@
 4. **透明档的命中测试**：layered 窗口按 **alpha** 判定命中，`Paint()` 在 `noGlass` 下只画图标，
    其余像素 alpha=0 → **空白区域收不到鼠标**。所以：拉伸结束后 `ShrinkToIcons()` 把窗口收成
    "图标+pad"，热区按 pad 内缩（角=两端图标四角、上下带=中间图标上下两方）。
-   同理：透明档里移动条只能抓**雪佛龙**或留出可见余量。
+   同理：透明档里移动条只能抓**雪佛龙**、**Windows 按钮**或留出可见余量。
 5. **`WDA_EXCLUDEFROMCAPTURE` 是全局副作用**：抓图那 ~8 ms 里别的程序（截图/录屏/共享）看不到条。
    实测用户截图**偶发缺条**。写测量脚本时必须当心：`dev/motion_probe.py` 会等参考帧里真的有条。
 6. **重排状态机**（`g_reordering`/`g_reorderItem`/`g_pressItem`）三个坑：
@@ -109,20 +177,31 @@
 7. **图标的绘制必须走 `BlendPremul`/`BlendScaled`**（GDI 写 32bpp DIB 会把 alpha 写 0）；
    新写的"手绘"都要用 `SetPixelPremul` 或 `BlendScaled`（后者是双线性，放大别用最近邻）。
 8. **ini 的 BOM 必须保留**（`StripIniBom()`）；`WritePrivateProfileStringW` 用来写 `x/y/w/h/order/extraPins`。
+9. **槽位里的 `item` 有两个负值了**：`kSlotChevron(-1)` 和 `kSlotWin(-3)`。任何"`item < 0` 就是宫格按钮"
+   的老写法都会把首格当成 `^`（宫格锚点、拖动裁剪、边界滚动），要按哨兵判。
+   另外 `g_capacity` 现在是**格子数**（含首格和 `^`），翻页量用 `g_pageItems`。
 
 ---
 
-## 5. 工具（`dock/dev/`，都是这轮新加/改的）
+## 5. 工具（`dock/dev/`）
 
 | 脚本 | 用途 |
 |---|---|
-| `redeploy.ps1` | 关 dock → 复制 exe → 通过 explorer 拉起。改完代码必跑 |
+| `redeploy.ps1` | 关 dock → 复制 exe → 通过 explorer 拉起。改完代码必跑（**先杀 dock 再 build**） |
 | `abtest.py <label> k=v …` | 改 ini → 重启 → 拖动扫一遍 → 直接出结论（A/B 实验用） |
 | `motion_probe.py <dir> [span] [speed] [cx0 cx1] [fast]` | 双线程：一边拖一边抓帧；带 cx0/cx1 时只抓窄带（143 Hz，避免截图撕裂） |
 | `content_anchor.py <dir> cx0 cx1 [search]` | 量"玻璃内容 vs 世界"的位移（需要静态纹理的窄带；条几乎全是图标，测试时要把条拉宽） |
 | `hand_capture.py <sec> <frames> <dir>` + `hand_scan2.py` | **用户自己拖**、录帧；相邻帧两两对比判断"内容锚定 / 粘窗口" |
 | `draglong.ps1 -Seconds N` | 真实按住拖动 N 秒，把 10 秒统计窗口填满 |
-| `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 §3.2 末尾） |
+| `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
+| **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |
+| **`t_wingrid.ps1 [-KeepOpen]`** | 【本轮】按 `layout:` 的 `chevron=` 点开宫格并报告落点（旧的 `t_gridplace.ps1` 按老公式算位置，已不准） |
+| **`loggrep.ps1 -Pattern <正则> -Last N`** | 【本轮】日志正经 grep。`logtail.ps1` 只给最后 25 行、而且**不认 `-Lines`**，别用它判断"有无某条日志" |
+| `t_win_probe5/6.ps1` + `shotdiff.py` | 【本轮】"开始菜单窗口搬不动"的探针：probe5 移动面板窗口并前后截图，`shotdiff.py a.png b.png` 出 `changed=N` 与包围盒（实测 `changed=0 of 2073600`） |
+| `t_winx.ps1 [-Move]` | 【本轮】Win+X 菜单的探针：新出现的窗口类/矩形，以及 `SetWindowPos` 后矩形是否真的变（这台机器：不变） |
+| `t_winscroll.ps1 -Notches N` | 【本轮】给条发滚轮，验证首格不动（配合 `loggrep.ps1 -Pattern "layout:"` 看 `scroll=` 与 `win=` 矩形） |
+| `t_bar_handle.ps1` | 【本轮】"任务栏展开后枚举不到、但记住的 handle 仍有效"的探针（`GetWindowRect` 报 `y=1020` = 展开、`y=1078` = 收起） |
+| `t_ctrlesc_hide.ps1` | 【本轮】Ctrl+Esc 开开始菜单期间任务栏是否露头（结论：不露头），以及"菜单开着时 post 隐藏没用" |
 
 **测量心法**：静态截图看不见"只在运动中"的现象；要把"位置/内容"从**同一张合成帧**里读出来
 （`debugBeacon` 临时画一个 10×10 品红块当作条体标记），或者相邻帧两两对比。

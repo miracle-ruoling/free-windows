@@ -2800,6 +2800,7 @@ static void TrayRepaint(Companion& c);
 static void CompanionPresent(Companion& c);
 // the group frame (R2) is derived geometry: "the strip + every following companion"
 static bool GroupBoxRect(RECT* out);
+static bool GroupScaling();      // R3: true while the frame is being dragged to scale the group
 // quick settings placement (defined after the companions: it needs the capture helpers)
 static void QuickSettingsBeginPlacement(const RECT& button);
 
@@ -3202,6 +3203,10 @@ static void CompanionPresent(Companion& c) {
 static bool CursorInCompanionGroup() {
     if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return false;
     if (g_trayBar.alpha <= 0) return false;      // nothing of ours is on screen
+    // The pointer is driving the group's own resize: it is by definition "in the group" even
+    // when the frame edge trails it. Without this the strip faded out mid-scale (measured:
+    // 71.7% of a fast scale drag had the pointer outside the frame).
+    if (GroupScaling()) return true;
     POINT p{};
     if (!GetCursorPos(&p)) return false;
     // "The group" is the visible frame now (user, 2026-11-16): anywhere inside it - including
@@ -3598,6 +3603,10 @@ struct BoxScale {
 };
 static BoxScale g_boxScale;
 
+// Used by the visibility rule and by the strip's alpha: while the frame is being dragged the
+// pointer is the one doing the dragging, so it is always "in the group".
+static bool GroupScaling() { return g_boxScale.active; }
+
 // Which frame edge(s) is the pointer on? The grab band is the margin ring painted at alpha 4.
 static int GroupBoxEdgeAt(POINT pClient, const RECT& client) {
     int band = GroupBoxGrabBand() + g_groupBox.lineWidth;
@@ -3871,7 +3880,12 @@ static void CompanionVisibilityTick(DWORD now) {
         InflateRect(&group, 6, 6);            // a little hysteresis on the frame line
         bool inGroup = PtInRect(&group, p) != FALSE;
         if (onStrip) shown = true;
-        else if (!inGroup && !g_trayBar.dragging && !g_trayBar.resizing) shown = false;
+        // "the pointer is outside the frame" must not count while the user is *using* the
+        // frame: a fast scale drag outruns the box rect by a message or two, and reading that
+        // as "left the group" faded the companions out in the middle of the gesture (bug
+        // 2026-11-16 00:44, reproduced: 71.7% of the drag with everything hidden).
+        else if (!inGroup && !g_trayBar.dragging && !g_trayBar.resizing && !GroupScaling())
+            shown = false;
         wantShown = shown;
     }
 

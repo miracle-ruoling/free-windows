@@ -2727,6 +2727,7 @@ struct Companion {
     HWND tipWnd = nullptr;
     TOOLINFOW tipInfo{};
     DWORD stateAt = 0;
+    DWORD netAt = 0;              // the WLAN query is expensive: its own, slower cadence
     bool visible = false;
 };
 static Companion g_trayBar;
@@ -2859,13 +2860,23 @@ static void QueryNetwork() {
 }
 
 static void TrayStateRefresh(DWORD now) {
-    if (g_trayBar.stateAt && now - g_trayBar.stateAt < 1000) return;
+    // Two cadences on purpose: volume/power are cheap (a COM getter and a struct), but the
+    // WLAN query is an RPC into the wireless service and can take tens of milliseconds - at
+    // 1 Hz that was a visible hitch every second while the bar was on screen. So: cheap
+    // values every second, network every five, and nothing at all while the bar is hidden.
+    if (g_trayBar.alpha <= 0 && g_trayBar.stateAt) return;
+
+    bool networkDue = !g_trayBar.netAt || (now - g_trayBar.netAt) >= 5000;
+    if (g_trayBar.stateAt && (now - g_trayBar.stateAt) < 1000) return;
     g_trayBar.stateAt = now;
 
     TrayState before = g_trayState;
     QueryVolume();
     QueryPower();
-    QueryNetwork();
+    if (networkDue) {
+        g_trayBar.netAt = now;
+        QueryNetwork();
+    }
     bool changed = memcmp(&before, &g_trayState, sizeof(TrayState)) != 0;
     if (changed && g_trayBar.hwnd) {
         DLog(L"tray bar: net=%d(q=%d '%s') vol=%d mute=%d bat=%d chg=%d",
@@ -3356,6 +3367,8 @@ static void CompanionVisibilityTick(DWORD now) {
     bool wasVisible = g_trayBar.visible;
     g_trayBar.visible = wantShown;
     if (wantShown && !wasVisible && g_trayBar.hwnd) {
+        g_trayBar.stateAt = 0;      // fresh values for the first frame on screen
+        g_trayBar.netAt = 0;
         // While hidden we only moved the stored rect, so put the window where it belongs now,
         // and publish the anchor once (the flyout may be opened before the next move).
         SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, g_trayBar.rc.left, g_trayBar.rc.top,

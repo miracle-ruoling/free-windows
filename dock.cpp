@@ -1947,7 +1947,10 @@ static void Paint(int w, int h) {
     QueryPerformanceCounter(&q1);
     for (size_t i = 0; i < g_slots.size(); i++) {
         const Slot& s = g_slots[i];
-        if ((int)i == g_hover) {
+        // The Windows logo fills its cell, so the usual white hover disc turns the white
+        // squares into one bright blob. It still grows under the cursor, which is the
+        // feedback; the disc is only drawn where there is something to sit behind.
+        if ((int)i == g_hover && s.item != kSlotWin) {
             FillRound(g_memDC, s.rc,
                       RadiusFor(s.rc.right - s.rc.left, s.rc.bottom - s.rc.top) / 2 + 2,
                       ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);

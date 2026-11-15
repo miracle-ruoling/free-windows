@@ -8,8 +8,8 @@
 > 文档里的旧路径已全部改过来。
 
 > **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（小窗跟随修复 + 测量脚本）** →
-> **§3.8（R2 组框）** → §4（改代码前必须知道的 10 件事）→ `PLAN_COMPANION.md` 的 R1/R2 现状与 R3 计划。
-> 然后从 `PLAN_COMPANION.md` 的 R3（组缩放）开始。
+> **§3.8（R2 组框）** → **§3.9（R3 组缩放）** → §4（改代码前必须知道的 11 件事）→ `PLAN_COMPANION.md`。
+> 然后从 `PLAN_COMPANION.md` 的 R4（图标精细度 / 设置 UI）开始。
 
 ---
 
@@ -23,13 +23,15 @@
   - **开始菜单 / Win+X / 快速设置** 三个 shell 弹窗都能**跟着条上的按钮**摆位置（§3.2、§3.4、§3.7）；
   - **附属窗口框架 + 托盘三合一**（网络/音量/电量）：独立小窗、真实状态、悬停 tooltip、
     点击弹快速设置、可拖动/拉伸、跟随条位移、鼠标上条淡入（§3.7、`PLAN_COMPANION.md`）。
-- **本轮修掉/做完**（2026-11-16 00:0x–00:2x）：
+- **本轮修掉/做完**（2026-11-16 00:0x–00:4x）：
   1. **拖条时托盘小窗像 30fps** 的遗留 bug。根因是"跟随"跑在 16 ms 的清理节流门里
      （实测小窗 40.7 次/秒 vs 条 111.4 次/秒），修法是把跟随搬进 `Present()`（每帧、和条的位移同一次合成）。
      修完 105.7 vs 105.7、偏移漂移 0 px。见 §3.7 末尾的"修复记录"。
   2. **R2 组框**：条 + 所有跟随窗口的外接矩形（+margin）画一圈 1px 圆角框，内部完全穿透，
      框内空白算"在组里"（鼠标从条走去小窗不会让小窗消失），拖小窗时框实时重算。见 §3.8。
-- **下一步待办**：①R3 组缩放（拖框边按比例缩放成员 + 条加入组）；②R4 图标精细度/设置 UI。
+  3. **R3 组缩放**：框的 margin 环就是把手（看不见但能抓），拖边/拖角把**每个成员的窗口矩形**按比例改
+     —— 条的外框直接变，图标格数会跳（用户已同意）；对边固定；缩到成员最小值就停。见 §3.9。
+- **下一步待办**：R4（图标精细度：wifi 格数/有线切换/静音/电量档位、文案、每窗口 ini 覆盖项、右键设置 UI）。
   详见 `PLAN_COMPANION.md`。用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
 
 ---
@@ -59,11 +61,11 @@
 | 条 | 实测 `x=842 y=184 w=716 h=92`（用户会自己摆，别当固定值；`layout:` 行给的是 client 坐标） |
 | 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
-| ini `[group]` | `enabled=1 / margin=8 / lineAlpha=64 / lineWidth=1 / radius=12`（R2 组框；**改完要重启 dock**） |
+| ini `[group]` | `enabled=1 / margin=8 / lineAlpha=64 / lineWidth=1 / radius=12`（R2 组框 + R3 缩放把手；**margin 同时是抓取环宽度**，调成 0 = 关掉组缩放；**改完要重启 dock**） |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`（R2）组框` → `9d9be89` 修拖条时小窗掉帧 + follow 探针 → `8d4dced` 交接文档 →
+最近提交（倒序）：`（R3）组缩放` → `f96388f` R2 组框 → `9d9be89` 修拖条时小窗掉帧 + follow 探针 → `8d4dced` 交接文档 →
 `53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
 `b9f6195` 去每帧日志 + mod actionCenter=dock → `ba9848e` R1 附属窗口+托盘三合一 →
 `469ca7b` 计划文档 → `fb00bd1` 竖条修复 → `4f29f0a` 锚点 v2 + Win+X → `2d9941f` 首格 Win 按钮。
@@ -413,15 +415,62 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
   框的窗口在隐藏时**零成本**（只在 `CompanionTick` 里被 `GetWindowRect` 顺手看一下尺寸）。
 
 **这轮踩到/要注意的**
-- 框窗口**必须** `WS_EX_TRANSPARENT`（本轮）：否则 1px 边框线会吃掉点在那条线上的点击
+- 框窗口**必须** `WS_EX_TRANSPARENT`（R2 时的做法）：否则 1px 边框线会吃掉点在那条线上的点击
   （`WindowFromPoint` 会返回框自己；实测加了之后返回的是底下窗口）。
+  → **R3 推翻**：框是缩放把手了，`WS_EX_TRANSPARENT` 已去掉，改成"只有 margin 环有 alpha"。见 §3.9。
 - `FillRoundRing` 千万别写成整块遍历：框可以到 900×300，成员一拖动就是**每条消息**一次重绘。
 - 框的几何**不能**用"当前 GetWindowRect(条)"在 `Present()` 里算：那一刻条的矩形还是旧的（ULW 还没跑），
   只能用 delta 平移（`GroupBoxTranslate`）。重算只在"事件"里做（显示、成员拖动/拉伸、条的尺寸变化）。
 
 ---
 
-## 4. 改代码前必须知道的 10 件事
+### 3.9 组缩放 R3（2026-11-16 00:3x–00:4x）
+
+**语义（用户 2026-11-16 原话 + 3 个拍板）**
+- 原话："组缩放时将组在长、宽上的变化比例也应用给条的外框……目前是全透明的，条外框也透明，
+  且调整完会 shrink，所以会只感觉到图标变多/少的抖动，但是实际上非完全透明的时候条外框不会 shrink，
+  能看到条外框连续正常变化，所以**图标抖动无所谓，允许它抖动**。"
+  → 做法就是**直接按比例改每个成员的窗口矩形**，不去算"图标该多大"。
+- 拍板：①拖边 = **对边固定**；②缩到最小时**停在最小值**（拒绝继续缩）；③（R2 已定的）框内空白算"在组里"。
+
+**实现落点（`dock.cpp` 的 `// ---- group scaling (R3)` 段）**
+
+| 项 | 关键点 |
+|---|---|
+| 抓取环 | `GroupBoxGrabBand()` = `min(margin, 10)`，**画在 margin 里**（所以永远盖不到成员）；像素 alpha **4**（≈1.6% 白，看不见）——layered 窗口按 alpha 命中，**"看不见但能抓"必须有非零 alpha** |
+| 命中 | 去掉 `WS_EX_TRANSPARENT`；`WM_NCHITTEST` 只在环上返回 `HTCLIENT`，其余 `HTTRANSPARENT`；`WM_SETCURSOR` 给四个 size 光标 |
+| 状态机 | `BoxScale`：`box0/strip0/comp0/origin/edges`（bit 1/2/4/8 = 左/右/上/下，和条自己的 `EdgeAt` 同编码） |
+| 缩放数学 | 比例取自**成员外接框**（框矩形减去 margin），所以 margin 不参与失真；`ScaleMemberRect()` 把每个成员的原矩形映射到新外接框；对边固定 = 只改被拖那一侧 |
+| 成员 | 条：`g_cfg.x/y/w/h` + `SetWindowPos`，它的 `WM_SIZE → PaintAndPresent → ComputeButtons` 自己重排（图标尺寸/格数随之变，就是"抖动"）；小窗：`CompanionSetRect(…, repaint=true)` |
+| 最小值 | 每个成员的 `minIcon + 2*pad`（条和小窗自己的边拖也是这个），取最严的一侧当 `sxMin/syMin`，不够就把比例抬回去 |
+| 跟随让路 | `g_boxScale.active` 时 `CompanionFollowTo()` 直接 return（否则条的位移会被再施加一次）；缩放期间由缩放代码独占所有矩形 |
+| DIB | `GroupBoxEnsureDib()` 改成**只增不减 + 64px 对齐**：缩放时每条约消息都会改尺寸，重分配 800×250 的 DIB 是要命的 |
+
+**证据（`dev/t_groupscale.ps1 -Edge right|left|bottom|corner -Dx -Dy`）**
+- 右边缘 +200：`frame 773→973`，`strip ×1.264`、`companion ×1.262`，左边不动，`frame == members + margin: True`。
+- 左边缘 +120：`frame 745→625`，右边缘固定在 1579 不动，`×0.835 / ×0.837`。
+- 下边缘 +60：`frame 高 171→231`，条高 `92→128`、小窗高 `60→83`（`×1.391 / ×1.383`）。
+- 角 +80/+40：两个轴同时缩放，几何仍 `exact`。
+- 收缩 `-900`：`frame 宽 1053→159`，小窗宽正好停在 **38 = minIcon(18) + 2*pad(10)**，再拖不动 → "停在最小尺寸"。
+- 条的 `layout:` 日志同步变化：`cap 9 → 10 → 11`（icon 已经顶到 `maxIcon=72`，多出来的宽度变成格子）。
+- 缩放结束 `SavePosition()+SaveSize()` 落盘：ini 里 `[dock] 962,184 598x92`、`[traybar] 1402,270 169x60`，重启后原样回来。
+- 环与内部的分工：`(900,320)`（框内空白，离边 66px）→ `Chrome`（穿透）；`(1000,330)`（离下边 8px，在环里）→ 框自己。
+
+**这轮踩到的坑**
+- **`WindowFromPoint` 判断不了抓取环**：环的 alpha 只有 4，`WindowFromPoint` 会报"下面的窗口"，
+  但真实按下**能**抓到（用 `t_groupscale.ps1` 里 `ThreadCapture(box) == box` 验证）。别用 WindowFromPoint
+  判环；判内部穿透仍然有效（那里 alpha=0）。
+- 抓取环宽度 = `margin`（上限 10px）：把 `[group] margin` 调成 0 就等于关掉了组缩放。
+- 组缩放期间**不能**让 follow 路径同时跑，否则小窗位移被施加两次（已在 `CompanionFollowTo` 里置空）。
+- **写文档别用 `Set-Content`**（一次性把我中文全变成乱码，只能 `git checkout` 重做）：用 edit/write 工具，
+  或 Python 显式 `encoding='utf-8'`。
+
+**留给用户确认的**：缩放跟手程度；条的图标格数跳动是否可接受（他说允许）；环本身完全看不见，
+如果希望"鼠标靠近框边时浮出一条更亮的高亮提示"，那是一个额外的小功能（`WM_NCHITTEST` 里已经知道在不在环上）。
+
+---
+
+## 4. 改代码前必须知道的 11 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
    合成器"下一帧才应用新矩形、但 layered 位图立刻生效"→ 每次移动后的 5–7 ms 是
@@ -436,6 +485,9 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
    其余像素 alpha=0 → **空白区域收不到鼠标**。所以：拉伸结束后 `ShrinkToIcons()` 把窗口收成
    "图标+pad"，热区按 pad 内缩（角=两端图标四角、上下带=中间图标上下两方）。
    同理：透明档里移动条只能抓**雪佛龙**、**Windows 按钮**或留出可见余量。
+   同理（R3）：组框的**抓取环**也必须有非零 alpha（现在 4/255 ≈ 1.6% 白，看不见但能抓）；
+   而且 `WindowFromPoint` 对这种极低 alpha **不可靠**（会报下面的窗口），判它要用真实按下
+   （`t_groupscale.ps1` 里的 `ThreadCapture(box) == box`）。
 5. **`WDA_EXCLUDEFROMCAPTURE` 是全局副作用**：抓图那 ~8 ms 里别的程序（截图/录屏/共享）看不到条。
    实测用户截图**偶发缺条**。写测量脚本时必须当心：`dev/motion_probe.py` 会等参考帧里真的有条。
 6. **重排状态机**（`g_reordering`/`g_reorderItem`/`g_pressItem`）三个坑：
@@ -453,6 +505,9 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
     量化 + 过门才更新 `lastWatch`），只适合状态轮询/菜单看门狗这类"便宜但不必精确"的活。
     条的位移走 `Present()`（139 Hz）；附属窗口的跟随必须**跟着 `Present()` 同帧**走
     （`CompanionFollowTo()`），否则旁边一个"一格格追"的小窗会让整条看起来掉帧。
+11. **组缩放（R3）期间由 `g_boxScale` 独占所有矩形**：`CompanionFollowTo()` 会让路（否则条的位移
+    被再施加一次）。同理，任何"由条推导出来的几何"都不能在缩放期间自己再动一遍 ——
+    缩放代码改完条/小窗以后自己 `GroupBoxRecompute()` 就把框摆正了。
 
 ---
 
@@ -472,6 +527,7 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_hit_at.ps1 x y …`** | 【本轮】一堆屏幕点的 `WindowFromPoint`：透明档里判断"这个像素能不能点"最快的办法 |
 | **`t_groupbox.ps1 [-Margin 8]`** | 【R2】组框四连检查：几何 == 成员外接 + margin、内部点击是否穿透、鼠标停在框内空白处是否保持显示、离开框 25px 是否淡出 |
 | **`t_groupbox_live.ps1 [-Dx -Dy]`** | 【R2】拖小窗时框是否**实时**跟随：20 万次/秒采样"框 vs 成员外接 + margin"，报告偏离 >1px 的采样数与段数（松手才重算会是一整段） |
+| **`t_groupscale.ps1 [-Edge right\|left\|bottom\|corner] [-Dx -Dy]`** | 【R3】拖框的边/角缩放整组：打印三个窗口的缩放比例、对边是否固定、`frame == members + margin`；同时验证抓取环吃按下、框内空白仍穿透 |
 | **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |

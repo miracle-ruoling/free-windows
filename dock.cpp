@@ -3411,7 +3411,8 @@ struct GroupBox {
     HDC dc = nullptr;
     HBITMAP bmp = nullptr;
     void* bits = nullptr;
-    int dibW = 0, dibH = 0;
+    int dibW = 0, dibH = 0;      // grow-only allocation (a scale drag changes the frame每帧)
+    int paintedW = 0, paintedH = 0;
 };
 static GroupBox g_groupBox;
 
@@ -3457,9 +3458,14 @@ static bool GroupBoxRect(RECT* out) {
     return true;
 }
 
+// Grow-only: a scale drag changes the frame size on every mouse message, and reallocating a
+// 800x250 DIB 140 times a second is exactly the kind of hidden cost this project keeps tripping
+// over. The bitmap may be larger than the frame; ULW is handed the frame's size.
 static void GroupBoxEnsureDib(int w, int h) {
     if (w <= 0 || h <= 0) return;
-    if (g_groupBox.bits && g_groupBox.dibW == w && g_groupBox.dibH == h) return;
+    if (g_groupBox.bits && g_groupBox.dibW >= w && g_groupBox.dibH >= h) return;
+    int aw = (w + 63) & ~63;
+    int ah = (h + 63) & ~63;
     if (g_groupBox.bmp) {
         if (g_groupBox.dc && DummyBitmap()) SelectObject(g_groupBox.dc, g_dummyBmp);
         DeleteObject(g_groupBox.bmp);
@@ -3469,56 +3475,78 @@ static void GroupBoxEnsureDib(int w, int h) {
     if (!g_groupBox.dc) g_groupBox.dc = CreateCompatibleDC(nullptr);
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biWidth = aw;
+    bi.bmiHeader.biHeight = -ah;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
     g_groupBox.bmp =
         CreateDIBSection(g_groupBox.dc, &bi, DIB_RGB_COLORS, &g_groupBox.bits, nullptr, 0);
     if (g_groupBox.bmp) SelectObject(g_groupBox.dc, g_groupBox.bmp);
-    g_groupBox.dibW = w;
-    g_groupBox.dibH = h;
+    g_groupBox.dibW = aw;
+    g_groupBox.dibH = ah;
 }
 
-static void GroupBoxPaint() {
-    if (!g_groupBox.bits) return;
+// The ring the pointer may grab to scale the group: it lives *inside* the margin, so it can
+// never cover a member. It is painted at alpha 4 - invisible (1.6% white) but hit-testable,
+// because a layered window is hit-tested through its alpha, so "invisible yet clickable" needs
+// a non-zero alpha (same trick as the tray bar's 4% wash).
+static int GroupBoxGrabBand() {
+    int band = g_groupBox.margin;
+    if (band > 10) band = 10;
+    if (band < 0) band = 0;
+    return band;
+}
+
+static void GroupBoxPaint(int w, int h) {
+    if (!g_groupBox.bits || w <= 0 || h <= 0) return;
+    if (w > g_groupBox.dibW || h > g_groupBox.dibH) return;
     void* savePaint = g_paintBits;
     int savePW = g_paintW, savePH = g_paintH;
     g_paintBits = g_groupBox.bits;
     g_paintW = g_groupBox.dibW;
     g_paintH = g_groupBox.dibH;
-    memset(g_groupBox.bits, 0, (size_t)g_groupBox.dibW * g_groupBox.dibH * 4);
-    FillRoundRing(g_groupBox.dibW, g_groupBox.dibH, g_groupBox.radius, g_groupBox.lineWidth,
+    for (int y = 0; y < h; y++)
+        memset((BYTE*)g_groupBox.bits + (size_t)y * g_groupBox.dibW * 4, 0, (size_t)w * 4);
+    int band = GroupBoxGrabBand();
+    if (band > 0)
+        FillRoundRing(w, h, g_groupBox.radius, band + g_groupBox.lineWidth, 0x04FFFFFF);
+    FillRoundRing(w, h, g_groupBox.radius, g_groupBox.lineWidth,
                   ((DWORD)g_groupBox.lineAlpha << 24) | 0x00FFFFFF);
     g_paintBits = savePaint;
     g_paintW = savePW;
     g_paintH = savePH;
+    g_groupBox.paintedW = w;
+    g_groupBox.paintedH = h;
 }
 
 static void GroupBoxPresent() {
     if (!g_groupBox.hwnd || !g_groupBox.bits) return;
+    int w = g_groupBox.rc.right - g_groupBox.rc.left;
+    int h = g_groupBox.rc.bottom - g_groupBox.rc.top;
+    if (w <= 0 || h <= 0) return;
     POINT src{0, 0};
-    SIZE size{g_groupBox.dibW, g_groupBox.dibH};
+    SIZE size{w, h};
     BLENDFUNCTION bf{AC_SRC_OVER, 0, (BYTE)g_groupBox.alpha, AC_SRC_ALPHA};
     POINT dst{g_groupBox.rc.left, g_groupBox.rc.top};
-    // No DwmFlush here on purpose: the frame never changes size and position in the same step
-    // as its pixels (a move is applied with SetWindowPos alone, see GroupBoxTranslate), so
-    // there is no "new content at old geometry" to avoid - only the fade alpha changes.
+    // No DwmFlush here on purpose: a pure move is applied with SetWindowPos alone (see
+    // GroupBoxTranslate), and a scale is driven per mouse message like the strip's own edge
+    // drag, so there is no "new content at old geometry" pair to keep in one composition -
+    // only the fade alpha and the ring change.
     UpdateLayeredWindow(g_groupBox.hwnd, nullptr, &dst, &size, g_groupBox.dc, &src, 0, &bf,
                         ULW_ALPHA);
 }
 
-// Size the DIB / repaint the ring only when the geometry actually changed: a strip drag is a
-// pure translation (no repaint at all), a member drag repaints the band.
+// Repaint only when the frame's size actually changed: a strip drag is a pure translation (no
+// repaint at all), a member drag or a group scale repaints the ring band.
 static void GroupBoxPlace() {
     int w = g_groupBox.rc.right - g_groupBox.rc.left;
     int h = g_groupBox.rc.bottom - g_groupBox.rc.top;
     if (w <= 0 || h <= 0 || !g_groupBox.hwnd) return;
-    bool sizeChanged = (w != g_groupBox.dibW || h != g_groupBox.dibH);
+    bool sizeChanged = (w != g_groupBox.paintedW || h != g_groupBox.paintedH);
     if (sizeChanged) {
         GroupBoxEnsureDib(w, h);
-        GroupBoxPaint();
+        GroupBoxPaint(w, h);
     }
     SetWindowPos(g_groupBox.hwnd, nullptr, g_groupBox.rc.left, g_groupBox.rc.top, w, h,
                  SWP_NOZORDER | SWP_NOACTIVATE);
@@ -3526,7 +3554,7 @@ static void GroupBoxPlace() {
 }
 
 // Re-derive the frame from the current member rectangles (member moved by hand, group show,
-// member resize, ini reload).
+// member resize, group scale, ini reload).
 static void GroupBoxRecompute() {
     RECT want{};
     if (!GroupBoxRect(&want)) {
@@ -3548,15 +3576,221 @@ static void GroupBoxTranslate(int dx, int dy) {
                      SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// ---------------------------------------------------------------- group scaling (R3)
+// The frame IS the group's resize handle (user, 2026-11-16): the scale applied to the frame is
+// applied to every member's rectangle, the strip's included - "组在长、宽上的变化比例也应用给条
+// 的外框". The strip re-derives its icon size and cell count from its window size, so at some
+// sizes it gains or loses a cell ("图标抖动"); the user accepted that explicitly.
+//   * dragging one edge keeps the opposite edge fixed; a corner scales both axes;
+//   * the scale factors come from the members' bounding rect (frame minus margin), so the
+//     margin itself never distorts the mapping;
+//   * the group refuses to shrink past the point where a member would go below its own minimum
+//     (user: "停在最小尺寸");
+//   * while this is active the follow path is bypassed: this code owns every rectangle.
+struct BoxScale {
+    bool active = false;
+    int edges = 0;               // 1 left, 2 right, 4 top, 8 bottom (bits as in EdgeAt)
+    RECT box0{};
+    RECT strip0{};
+    RECT comp0{};
+    POINT origin{};
+    int lastSx1000 = 1000, lastSy1000 = 1000;
+};
+static BoxScale g_boxScale;
+
+// Which frame edge(s) is the pointer on? The grab band is the margin ring painted at alpha 4.
+static int GroupBoxEdgeAt(POINT pClient, const RECT& client) {
+    int band = GroupBoxGrabBand() + g_groupBox.lineWidth;
+    if (band <= 0) return 0;
+    int w = client.right - client.left, h = client.bottom - client.top;
+    int edges = 0;
+    if (pClient.x < band) edges |= 1;
+    else if (pClient.x >= w - band) edges |= 2;
+    if (pClient.y < band) edges |= 4;
+    else if (pClient.y >= h - band) edges |= 8;
+    return edges;
+}
+
+static RECT ScaleMemberRect(const RECT& m0, const RECT& bb0, const RECT& nbb, double sx,
+                            double sy) {
+    RECT r{};
+    r.left = nbb.left + (int)floor((m0.left - bb0.left) * sx + 0.5);
+    r.top = nbb.top + (int)floor((m0.top - bb0.top) * sy + 0.5);
+    int w = (int)floor((m0.right - m0.left) * sx + 0.5);
+    int h = (int)floor((m0.bottom - m0.top) * sy + 0.5);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    r.right = r.left + w;
+    r.bottom = r.top + h;
+    return r;
+}
+
+// Apply the drag: `cur` is the pointer in screen pixels.
+static void GroupBoxScaleTo(POINT cur) {
+    const int margin = g_groupBox.margin;
+    RECT bb0 = g_boxScale.box0;
+    InflateRect(&bb0, -margin, -margin);
+    int bb0w = bb0.right - bb0.left, bb0h = bb0.bottom - bb0.top;
+    if (bb0w < 1 || bb0h < 1) return;
+
+    int dx = cur.x - g_boxScale.origin.x;
+    int dy = cur.y - g_boxScale.origin.y;
+    int wantW = bb0w, wantH = bb0h;
+    if (g_boxScale.edges & 1) wantW -= dx;
+    else if (g_boxScale.edges & 2) wantW += dx;
+    if (g_boxScale.edges & 4) wantH -= dy;
+    else if (g_boxScale.edges & 8) wantH += dy;
+
+    // No member may fall below its own minimum: the strip and the companion both clamp at
+    // minIcon + 2*pad on any side (same rule their own edge drags use).
+    int minSide = g_cfg.minIcon + g_cfg.pad * 2;
+    double sxMin = 0.0, syMin = 0.0;
+    auto account = [&](const RECT& m0) {
+        int w0 = m0.right - m0.left, h0 = m0.bottom - m0.top;
+        if (w0 > 0) {
+            double f = (double)minSide / w0;
+            if (f > sxMin) sxMin = f;
+        }
+        if (h0 > 0) {
+            double f = (double)minSide / h0;
+            if (f > syMin) syMin = f;
+        }
+    };
+    account(g_boxScale.strip0);
+    if (g_trayBar.hwnd && g_trayBar.enabled) account(g_boxScale.comp0);
+
+    double sx = (double)wantW / bb0w;
+    double sy = (double)wantH / bb0h;
+    if (sx < sxMin) sx = sxMin;
+    if (sy < syMin) sy = syMin;
+    if (sx > 8.0) sx = 8.0;              // sanity: never explode
+    if (sy > 8.0) sy = 8.0;
+
+    int nw = (int)floor(bb0w * sx + 0.5);
+    int nh = (int)floor(bb0h * sy + 0.5);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    RECT nbb = bb0;
+    if (g_boxScale.edges & 1) nbb.left = nbb.right - nw;
+    else nbb.right = nbb.left + nw;
+    if (g_boxScale.edges & 4) nbb.top = nbb.bottom - nh;
+    else nbb.bottom = nbb.top + nh;
+
+    g_boxScale.lastSx1000 = (int)(sx * 1000.0 + 0.5);
+    g_boxScale.lastSy1000 = (int)(sy * 1000.0 + 0.5);
+
+    // the strip: its window rectangle scales, its layout follows by itself (WM_SIZE -> paint)
+    RECT ns = ScaleMemberRect(g_boxScale.strip0, bb0, nbb, sx, sy);
+    g_cfg.x = ns.left;
+    g_cfg.y = ns.top;
+    g_cfg.w = ns.right - ns.left;
+    g_cfg.h = ns.bottom - ns.top;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, ns.left, ns.top, ns.right - ns.left, ns.bottom - ns.top,
+                 SWP_NOACTIVATE);
+
+    // the companion(s): same mapping, repainted because their icon size changes with them
+    if (g_trayBar.hwnd && g_trayBar.enabled) {
+        RECT nc = ScaleMemberRect(g_boxScale.comp0, bb0, nbb, sx, sy);
+        CompanionSetRect(g_trayBar, nc.left, nc.top, nc.right - nc.left, nc.bottom - nc.top,
+                         true);
+        AnchorPublish(kAnchorQuickSettings, &g_trayBar.rc, 8);
+    }
+
+    // the frame is re-derived so it always hugs the members (rounding makes it ±1 px off the
+    // cursor, the invariant we verify is what matters)
+    GroupBoxRecompute();
+}
+
+static void GroupBoxScaleBegin(POINT cur, int edges) {
+    g_boxScale.active = true;
+    g_boxScale.edges = edges;
+    g_boxScale.box0 = g_groupBox.rc;
+    GetWindowRect(g_hwnd, &g_boxScale.strip0);
+    if (g_trayBar.hwnd && g_trayBar.enabled) g_boxScale.comp0 = g_trayBar.rc;
+    g_boxScale.origin = cur;
+    g_boxScale.lastSx1000 = g_boxScale.lastSy1000 = 1000;
+    DLog(L"group scale: start edges=%d frame=%ld,%ld %ldx%ld", edges,
+         (long)g_groupBox.rc.left, (long)g_groupBox.rc.top,
+         (long)(g_groupBox.rc.right - g_groupBox.rc.left),
+         (long)(g_groupBox.rc.bottom - g_groupBox.rc.top));
+}
+
+static void GroupBoxScaleEnd() {
+    if (!g_boxScale.active) return;
+    g_boxScale.active = false;
+    SavePosition();      // also saves the companions' positions
+    SaveSize();
+    GroupBoxRecompute();
+    DLog(L"group scale: done strip=%ld,%ld %ldx%ld scale=%d.%03d,%d.%03d",
+         (long)g_cfg.x, (long)g_cfg.y, (long)g_cfg.w, (long)g_cfg.h,
+         g_boxScale.lastSx1000 / 1000, g_boxScale.lastSx1000 % 1000,
+         g_boxScale.lastSy1000 / 1000, g_boxScale.lastSy1000 % 1000);
+}
+
 static LRESULT CALLBACK GroupBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
-        case WM_NCHITTEST:
-            // The frame is purely visual this round: even its 1 px line must not swallow a
-            // click that was meant for whatever is below. R3 will turn the border into the
-            // resize handle.
-            return HTTRANSPARENT;
+        case WM_NCHITTEST: {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(h, &p);
+            RECT client;
+            GetClientRect(h, &client);
+            // only the margin ring counts as the handle; the inside must keep falling through
+            return GroupBoxEdgeAt(p, client) ? HTCLIENT : HTTRANSPARENT;
+        }
+        case WM_SETCURSOR: {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(h, &p);
+            RECT client;
+            GetClientRect(h, &client);
+            int e = GroupBoxEdgeAt(p, client);
+            if (e) {
+                LPCWSTR cur = IDC_ARROW;
+                if ((e & 1) && (e & 4)) cur = IDC_SIZENWSE;
+                else if ((e & 2) && (e & 4)) cur = IDC_SIZENESW;
+                else if ((e & 8) && (e & 1)) cur = IDC_SIZENESW;
+                else if ((e & 8) && (e & 2)) cur = IDC_SIZENWSE;
+                else if ((e & 1) || (e & 2)) cur = IDC_SIZEWE;
+                else cur = IDC_SIZENS;
+                SetCursor(LoadCursorW(nullptr, cur));
+                return TRUE;
+            }
+            break;
+        }
+        case WM_LBUTTONDOWN: {
+            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            RECT client;
+            GetClientRect(h, &client);
+            int edges = GroupBoxEdgeAt(p, client);
+            if (!edges) return 0;
+            POINT screen{};
+            GetCursorPos(&screen);
+            GroupBoxScaleBegin(screen, edges);
+            SetCapture(h);
+            return 0;
+        }
+        case WM_MOUSEMOVE:
+            if (g_boxScale.active) {
+                POINT p{};
+                GetCursorPos(&p);
+                GroupBoxScaleTo(p);
+                return 0;
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_boxScale.active) {
+                ReleaseCapture();
+                GroupBoxScaleEnd();
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (g_boxScale.active) {
+                GroupBoxScaleEnd();
+            }
+            return 0;
         case WM_ERASEBKGND:
             return 1;
         case WM_DESTROY:
@@ -3578,8 +3812,11 @@ static void GroupBoxCreate() {
         wc.lpszClassName = L"DockGroupBoxWindow";
         RegisterClassExW(&wc);
     }
+    // No WS_EX_TRANSPARENT: since R3 the margin ring is the group's resize handle. Everything
+    // else still falls through, because a layered window is only hit-tested where its alpha is
+    // non-zero - and only the ring has alpha.
     g_groupBox.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                                          WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                          WS_EX_LAYERED,
                                       L"DockGroupBoxWindow", L"dock group box", WS_POPUP, 0, 0,
                                       10, 10, nullptr, nullptr, GetModuleHandleW(nullptr),
                                       nullptr);
@@ -3592,14 +3829,16 @@ static void GroupBoxCreate() {
     RECT want{};
     if (GroupBoxRect(&want)) {
         g_groupBox.rc = want;
-        GroupBoxEnsureDib(want.right - want.left, want.bottom - want.top);
-        GroupBoxPaint();
+        int w = want.right - want.left, h = want.bottom - want.top;
+        GroupBoxEnsureDib(w, h);
+        GroupBoxPaint(w, h);
         GroupBoxPresent();
     }
     ShowWindow(g_groupBox.hwnd, SW_HIDE);
-    DLog(L"group box: created, frame %ld,%ld %ldx%ld", (long)g_groupBox.rc.left,
-         (long)g_groupBox.rc.top, (long)(g_groupBox.rc.right - g_groupBox.rc.left),
-         (long)(g_groupBox.rc.bottom - g_groupBox.rc.top));
+    DLog(L"group box: created, frame %ld,%ld %ldx%ld (grab ring %d px)",
+         (long)g_groupBox.rc.left, (long)g_groupBox.rc.top,
+         (long)(g_groupBox.rc.right - g_groupBox.rc.left),
+         (long)(g_groupBox.rc.bottom - g_groupBox.rc.top), GroupBoxGrabBand());
 }
 
 // ---------------------------------------------------------------- visibility
@@ -3724,6 +3963,9 @@ static void CompanionFollowTo(int stripX, int stripY) {
     g_companionLastStripX = stripX;
     g_companionLastStripY = stripY;
     if (!dx && !dy) return;
+    // A group scale moves *and* resizes every member itself (GroupBoxScaleTo); translating
+    // here on top of that would shift everything a second time.
+    if (g_boxScale.active) return;
     // The frame is pure derived geometry, so a group-wide move is just a translation - and it
     // has to happen on this path (not on the 16 ms housekeeping gate) for the same reason the
     // companions do: the frame must land in the strip's composition, not a frame later.

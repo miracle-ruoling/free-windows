@@ -452,6 +452,8 @@ dumpBake=0
 51. **`dev/logtail.ps1` 只输出最后 25 行且不认 `-Lines`**：想确认"某条日志出现没出现"必须用 `dev/loggrep.ps1 -Pattern <正则>`，否则会得出"日志里没有"的错误结论（本轮踩过）。
 52. **`ShrinkToIcons()` 的方向曾经读 ini 的 `dock.vertical`**（只在 `LoadConfig()` 写、拖动时不更新）→ 全透明档里把条拉成竖的，松手会被压回横条。现在改成按**当前窗口形状**（`oldH > oldW`）判断。凡是"松手后形状/尺寸突变"的问题，先看这里。
 53. **Windows 的 shell 弹窗有两套完全不同的定位机制**：开始菜单是 XAML 画布里的 frame（改 XAML 的 alignment/margin/transform），Win+X 是 explorer 的真窗口（在进程内改写 `SetWindowPos` 的坐标）。**别指望一个办法通吃**；判断依据：`WindowFromPoint` 看这块像素属于哪个窗口、挪一下窗口看画面跟不跟。
+54. **`DLog()` 是每行 `fopen` + `fclose`**：绝不能在每帧路径打日志。2026-11-15 实测：锚点/跟随每帧各一行 → 拖动时 ~1500 行/秒 → 帧率崩、风扇起飞。诊断行要么限流（n 次以内）、要么只在状态变化时打。
+55. **layered 窗口"能点"完全取决于像素 alpha**：图标/字形之间的缝隙是透明的，鼠标会**穿透**到下面的窗口（点"扬声器"正中间会点到浏览器）。想整块可点，必须铺一层 alpha 极低（4% 白）的底色 —— 首格 Win 按钮和托盘小窗都是这么做的。
 
 ## 6. 代码地图（`dock.cpp`）
 
@@ -462,6 +464,8 @@ dumpBake=0
 | `BuildTray()` / `BuildTrayFromBridge()` / `TrayBridgeOpen()` / `TrayBridgeEnsureExists()` | 托盘数据（桥 → 兜底） |
 | `ComputeButtons()` / `ComputeLayout()` | 条布局、翻页。**第一格固定是 Windows 按钮（`kSlotWin=-3`）、最后一格是 `^`（`kSlotChevron=-1`）**；`g_capacity`=格子数、`g_pageItems`=可见图标数；几何变化时打 `layout:` 一条 |
 | `PaintWinButton()` / `OpenStartMenu()` / `OpenPowerUserMenu()` / `HideNativeTaskbar()` | 【2026-11-15】首格 Windows 按钮：手绘四方块 logo；左键 Ctrl+Esc 开开始菜单、右键 Win+X；600ms 后把被带出来的原生任务栏收回去（`RememberTaskbars()` 记 handle，因为任务栏展开后 `EnumWindows` 看不到它） |
+| **`AnchorPublish()` / `PublishAnchors()` / `RememberTaskbars()`** | 【2026-11-15】`Local\DockAnchor_v1`：条把自己的按钮矩形发布给 Windhawk mod（kind 1 开始菜单 / 2 快速设置 / 4 Win+X），mod 用它把 shell 弹窗摆到按钮旁边。**这里不许打日志**（每帧路径，见坑 54） |
+| **`Companion*` / `TrayPaint()` / `QuickSettingsTick()`** | 【2026-11-15】附属窗口（`DockTrayBarWindow` 托盘三合一：`Segoe Fluent Icons` 字形 + WLAN/音量/电量状态 + 原生 tooltip + 点击 Win+A + 拖动/拉伸 + 跟随条 + 淡入淡出）；`QuickSettingsTick()` 在两帧差分里量出快速设置面板的内容框再把窗口挪到位 |
 | `Paint()` / `Present()` / `RenderIconCache()` | 绘制、图层输出 |
 | `CaptureBackdrop()` / `GrabScreenUnderUs()` / `WindowUnderUs()` | 玻璃背景 |
 | `GridShow` / `GridLayout` / `GridPaint` / `GridProc` / `GridClick` | 宫格（`GridTick` 已删除，收起由 `PressWatchTick`/`FocusWatchTick` 决定） |

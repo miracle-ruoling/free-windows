@@ -1,28 +1,33 @@
 # 交接：下一轮从这里开始
 
-> 写于 2026-11-15 18:20（本轮把"固定 Windows 按钮（开始菜单 / Win+X）"做完并自测通过）。
+> 写于 2026-11-15 23:40（本轮做完：Win+X 锚定、**附属窗口 + 托盘三合一（R1）**、
+> 快速设置面板锚定与测量；**遗留一个 bug：托盘小窗自身拖动掉帧**）。
 > 上一轮（图标拖动重排 + 动效 + 边界滚入）的过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，
 > **别重读历史排查**，看本文即可。
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
+> **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（本轮做的，含遗留 bug 与排查方法）** →
+> §4（改代码前必须知道的 9 件事）→ `PLAN_COMPANION.md` 的 R1 现状与 R2/R3 计划。
+> 然后直接处理 §3.7 末尾的"下一步"。
+
 ---
 
 ## 0. 三分钟版本
 
-- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~7100 行。
-- 本轮之前的**大坑已经全部收尾**：玻璃背景"位移/抖动"的根因是
-  "`UpdateLayeredWindow` 的矩形和像素没落在同一次合成里"，修法是 `presentSync=2`
-  （ULW **之前** `DwmFlush()`）。**这一条别动**。
-- 现在条的性能：静止 16–20 次抓图/秒（每帧合成 0.37 ms）、拖动 115–119 次重绘/秒、
-  每帧 `paint≈1.3 ms`、`present≈0.2 ms`。本轮加的四方块 logo 相当于多画一个图标，量级不变。
-- 本轮新增：**第一格固定 Windows 按钮**——左键开始菜单、右键 Win+X；和 `^` 一套槽位规则
-  （不滚动、抓不走、不能插到它前面）。见 **§3.2**。
-- **这轮最重要的结论**：开始菜单 / Win+X 都是 shell 的 XAML 窗口，**外部进程搬不动位置**
-  （`SetWindowPos` 成功但画面一像素不动）。所以"把弹窗迁到条附近"没做成，
-  用户 2026-11-15 选的是"先按原生位置弹"。细节与证据见 §3.2 末尾。
-- **下一步待办见 §3**：①（已修，仅留记录）被拖图标锯齿；
-  ②把任务栏更多东西搬到条上（形式待定，**先和用户对齐**）。
+- 项目：`dock/`（一个自绘的 Win11 图标条 + 托盘宫格），源码 `dock/dock.cpp` 单文件 ~8000 行。
+- 玻璃背景"位移/抖动"的根因是 `UpdateLayeredWindow` 的矩形和像素没落在同一次合成里，
+  修法是 `presentSync=2`（ULW **之前** `DwmFlush()`）。**这一条别动**。
+- **已经能用的**（本轮及之前）：
+  - 第一格固定 **Windows 按钮**：左键开始菜单、右键 Win+X，和 `^` 同一套槽位规则（§3.2）；
+  - **开始菜单 / Win+X / 快速设置** 三个 shell 弹窗都能**跟着条上的按钮**摆位置（§3.2、§3.4、§3.7）；
+  - **附属窗口框架 + 托盘三合一**（网络/音量/电量）：独立小窗、真实状态、悬停 tooltip、
+    点击弹快速设置、可拖动/拉伸、跟随条位移、鼠标上条淡入（§3.7、`PLAN_COMPANION.md`）。
+- **遗留 bug（下一轮第一件事）**：**拖动托盘小窗本身时帧率低**。条已经修好
+  （每帧日志是元凶，拖动 10 秒只占 10.5% 单核）；小窗的原因还没找到，§3.7 末尾写了
+  "已排除项 + 该用什么方法测"，**别重复排除**。
+- **下一步待办**：①修小窗拖动的帧率；②组框（R2）；③组缩放（R3）；④图标精细度（R4）。
+  详见 `PLAN_COMPANION.md`。用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
 
 ---
 
@@ -30,29 +35,33 @@
 
 | 顺序 | 文件 / 章节 | 为什么 |
 |---|---|---|
-| 1 | **本文 §0–§4** | 现场、模块地图、改代码前必须知道的 8 件事 |
-| 2 | `HANDOVER.md` **§1 语义模型**、**§3 关键实现**、**§5 坑（血泪清单）**、**§9 用户习惯** | 项目的基本盘；§5 里 40 多条坑不要重踩 |
-| 3 | `HANDOVER_TODO_GLASS_LAG.md` **§4.10 / §4.13 / §4.15 / §4.16 / §4.17** | 玻璃延迟的最终结论、混色搬进抓图、透明档热区、重排与动效 |
-| 4 | `HANDOVER.md` §6 代码地图 | 找函数用 |
+| 1 | **本文 §0–§4** | 现场、模块地图、改代码前必须知道的 9 件事 |
+| 2 | **本文 §3.2 / §3.4 / §3.7** | 三个 shell 弹窗的锚定链路 + 附属窗口/托盘三合一 + **遗留 bug 的排查线索** |
+| 3 | **`PLAN_COMPANION.md`**（全文，短） | 附属窗口/组的语义、ini 结构、R1 现状、R2–R4 计划、用户拍板的 8 条 |
+| 4 | `HANDOVER.md` **§1 语义模型**、**§3 关键实现**、**§5 坑（血泪清单）**、**§9 用户习惯** | 项目的基本盘；§5 里 50 多条坑不要重踩 |
+| 5 | `HANDOVER_TODO_GLASS_LAG.md` **§4.10 / §4.13 / §4.15 / §4.16 / §4.17** | 玻璃延迟的最终结论、混色搬进抓图、透明档热区、重排与动效 |
+| 6 | `HANDOVER.md` §6 代码地图 | 找函数用 |
 
 > `HANDOVER_TODO_GLASS_LAG.md` 的 §1–§4.9、§4.12、§4.14 是**历史排查过程**（含几次错误假设）。
 > 只需要知道结论；不要照着重新验证一遍。
 
 ---
 
-## 2. 现场（2026-11-15 18:20）
+## 2. 现场（2026-11-15 23:40）
 
 | | |
 |---|---|
 | 构建 | `dock.cpp` → `build.ps1`（MSVC 18 / SDK 26100）→ 部署到 `%LOCALAPPDATA%\Programs\Dock\` |
-| 重启 | `dev/redeploy.ps1`：关掉 dock → 复制 exe → **通过 explorer.exe 拉起**（必须，低完整性会自愈但会闪一下）。**先杀 dock 再 build**，否则 `build.ps1` 的复制会报"文件被占用"（`cl.exe` 已经产出新 exe，但脚本以错误退出） |
-| 条 | 本轮实测 `x=872 y=40 w=665 h=121`（用户会自己摆/改宽度，别当成固定值） |
-| ini | `material=1 / glassOpacity=1 / tintStrength=0 / lightMode=1 / tint=#A6101010 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / presentOrder=0 / debugBeacon=0 / radius=77 / pad=10 / maxIcon=72` |
-| git | 仓库在 `dock/`，`.gitignore` 已覆盖产物/截图/帧转储 → **`git add -A` 就够** |
+| 重启 | `dev/redeploy.ps1`。**先杀 dock 再 build**，否则 `build.ps1` 的复制报"文件被占用"（脚本以错误退出，看起来像编译失败） |
+| 条 | 实测 `x=661 y=60 w=716 h=92`（用户会自己摆，别当固定值） |
+| 托盘小窗 | 实测 `x=1188 y=146 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
+| ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
+| Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
+| git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`2d9941f` 首格固定 Windows 按钮 → `1b33eab` 文档：§4.18 被拖图标锯齿 →
-`ef19e64` 修锯齿 + 交接文档 → `1bee953` 重排不跟手的修复 → `1761d5f` 重排动效+边界滚入 →
-`c9c3e03` 重排本身 → `66d849c` 混色搬进抓图 → `c8fcaf1` 拉伸闪烁 → `15badf9` 存档点。
+最近提交（倒序）：`53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
+`b9f6195` 去每帧日志 + mod actionCenter=dock → `ba9848e` R1 附属窗口+托盘三合一 →
+`469ca7b` 计划文档 → `fb00bd1` 竖条修复 → `4f29f0a` 锚点 v2 + Win+X → `2d9941f` 首格 Win 按钮。
 
 ---
 
@@ -253,6 +262,68 @@ mod-status 里 4 个进程的记录全刷新了），所以不用重启 explorer
 
 ---
 
+### 3.7 附属窗口 + 托盘三合一 + 快速设置锚定（R1，2026-11-15 22:0x–23:3x）
+
+**语义**（用户原话整理，另有 `PLAN_COMPANION.md` 全文）：附属窗口是"挂在条旁边的独立小窗"，
+有 `继承(follow=1)/独立(0)`；继承的跟随条位移、样式继承条、**只在鼠标上条时淡入**、
+鼠标离开"条∪跟随窗口"就淡出；条自身仍按距离淡出。第一个附属窗口 = **托盘三合一**
+（网络/音量/电量，整块当一个按钮，点击弹 Win+A 快速设置）。组框/组缩放是 R2/R3，还没做。
+
+**实现落点（都在 `dock.cpp` 的 `// ---- companions` 段与 `// ---- quick settings placement` 段）**
+
+| 项 | 关键点 |
+|---|---|
+| 窗口 | `DockTrayBarWindow`，`WS_EX_LAYERED｜TOPMOST｜TOOLWINDOW｜NOACTIVATE`；ini 节 **`[traybar]`** |
+| 尺寸/方向 | `CompanionIconPx()` = 短边 - 2*pad，夹在 minIcon..maxIcon；`TrayCells()`：高>宽就竖排，否则横排 |
+| 绘制 | **复用**条的原语：把 `g_paintBits/g_paintW/g_paintH` 临时指向自己的 DIB（和 `GridPaint()`/`SettingsPaint()` 同一招），画完换回 |
+| 字形 | `Segoe Fluent Icons`；`RenderGlyphMask()` 把字形渲染成**蒙版 → 量墨迹包围盒 → 双线性缩放**到格子的 78%（不然 GDI 行高会把字形撑爆/裁掉），按 (code,px) 缓存 |
+| 状态 | 网络：`WlanOpenHandle/EnumInterfaces/QueryInterface`（SSID + 信号）+ `InternetGetConnectedState` 判有线；音量：`IAudioEndpointVolume`；电量：`GetSystemPowerStatus` |
+| 字形码位 | wifi `E874`、以太网 `E839`、未连接 `E871`；音量 `E992`–`E995` + 静音 `E74F`；电量 `E850`–`E859`（10 档）、充电 `E85A`–`E862`（**E863 是节能叶子，别用**） |
+| tooltip | 原生 `TOOLTIPS_CLASS` + `TTF_TRACK|TTF_ABSOLUTE`；**`TTM_ADDTOOL` 只吃 `TTTOOLINFOW_V1_SIZE`（这台机器 56 字节），`sizeof(TOOLINFO)`=72 会被拒** |
+| 点击 | 任意位置 → `AnchorPublish(kAnchorQuickSettings)` + `SendChord({VK_LWIN,'A'})` |
+| 跟随 | `CompanionTick()` 拿条的实际窗口矩形算 delta；**隐藏时只挪记录、不动窗口**，显示时再同步一次 |
+| 显隐 | `CompanionVisibilityTick()`：光标在条上 → 显示；离开"条∪跟随窗口"（外扩 6px）→ 隐藏；快速淡入淡出 ~120ms |
+
+**两个必须记住的坑（都踩过）**
+
+1. **layered 窗口按 alpha 命中**：字形中间是透明像素，鼠标落在"扬声器"中间会**穿透**到底下的窗口
+   （第一次测试点到的是浏览器的链接提示）。修法：整块铺一层 4% 白（`0x0AFFFFFF`），肉眼看不见但整块可点
+   —— 和首格 Win 按钮同一招。任何"要能点"的区域都必须有 alpha。
+2. **`DLog()` 是每行 `fopen`+`fclose`**：本轮一开始我在锚点/跟随里每帧打日志（拖动时 ~1500 行/秒），
+   直接把拖动打成幻灯片 + 风扇起飞。**任何每帧路径都不许打日志**（除了限流的诊断行）。
+
+**快速设置面板的锚定（用户选了"统一规则 A" + "测量"方案 b）**
+
+- 面板真身：**`ControlCenterWindow`（`ShellHost.exe`，480x1020 满高侧栏）**，
+  不是小弹窗；**媒体播放卡片和面板是同一个窗口**（命中测试证实），用户已确认"去不掉、接受"。
+- 可见内容是**窗口底部对齐**的，窗口又能自由移动（外部 `SetWindowPos` 生效），
+  所以纵向靠"移动窗口"实现，但**必须知道内容框**：
+  - **横向**由 mod 负责（`AdjustCoreWindowPos` 的 dock 分支，`kind=2`）；
+  - **纵向**由 dock 负责：`QuickSettingsBeginPlacement()` 在点击时抓一帧全屏，
+    420ms 后确认前台是 `ControlCenterWindow` → 再抓一帧 → **只在面板窗口矩形内**做差分
+    → 得到内容框 → 按"内容顶端=按钮下方 8px，放不下翻到上方，再夹进工作区"挪窗口。
+  - 日志：`qs: content 480x990 already at 90 (button 166..226)`。
+- **几何现实**：带媒体卡片时内容是 **480×990**，屏幕 1080 → 纵向只有 90px 余量，
+  所以"贴着屏幕下边界"是**几何必然**（不是 bug）；没有媒体卡片时内容 ~600 高，就会正确落到按钮下方。
+- 踩过的崩：`CaptureScreenInto()` 里 `DeleteObject(bmp)` 之后才 `assign(bits…)` → 读已释放内存 → dock 崩。
+  已修（先拷再删）。
+
+**遗留 bug（下一轮第一件事）：拖动托盘小窗本身掉帧**
+
+- 条已经修好：拖动 10 秒 dock 只占 **10.5% 单核**，重绘数 605–669/10s（受注入步进 62 步/秒限制）。
+- 小窗仍然卡。**已排除**：①每帧日志（已删干净）；②附属窗口每帧重传位图/z 序（改成纯移动后只 `SetWindowPos`）；
+  ③每秒一次的 WLAN 查询（已改成只在可见时 + 网络 5 秒一次）；④条本身（A/B：`[traybar] enabled=0` 时条的重绘数几乎不变）。
+- **下一步该怎么测**（别重复瞎猜）：在 `CompanionProc` 的 `WM_MOUSEMOVE` 与 `CompanionSetRect` 里加
+  **计数 + 每 10 秒一条**统计（`SetWindowPos` 次数、tick 数、每次耗时），跑 `dev/t_traybar_drag.ps1 -Dx 60 -Dy 30`
+  或让用户真手拖 10 秒，看是"消息来得就少"还是"每次花了十几毫秒"。
+  怀疑点（按可能性）：①`sethost`/`SetCapture` 下每次 `SetWindowPos` 触发 `WM_SETCURSOR`→`EdgeAt` 反复算；
+  ②目标窗口是 layered + topmost，移动时 DWM 合成更贵；③`CompanionTick` 每 16ms 还在 `GetWindowRect` 条窗口。
+- 相关脚本：`dev/t_traybar_probe.ps1`（窗口 rect/可见性）、`dev/t_traybar_hit.ps1`（命中测试）、
+  `dev/t_traybar_drag.ps1`（真鼠标拖动并打印前后 rect）、`dev/t_qs_watch.ps1`（点小窗 + 观察前台）、
+  `dev/loggrep.ps1`（**正经 grep 日志**，`logtail.ps1` 只给 25 行且不认 `-Lines`）、`dev/anchordump.ps1`（锚点表）。
+
+---
+
 ## 4. 改代码前必须知道的 9 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -308,6 +379,13 @@ mod-status 里 4 个进程的记录全刷新了），所以不用重启 explorer
 | `t_winscroll.ps1 -Notches N` | 【本轮】给条发滚轮，验证首格不动（配合 `loggrep.ps1 -Pattern "layout:"` 看 `scroll=` 与 `win=` 矩形） |
 | `t_bar_handle.ps1` | 【本轮】"任务栏展开后枚举不到、但记住的 handle 仍有效"的探针（`GetWindowRect` 报 `y=1020` = 展开、`y=1078` = 收起） |
 | `t_ctrlesc_hide.ps1` | 【本轮】Ctrl+Esc 开开始菜单期间任务栏是否露头（结论：不露头），以及"菜单开着时 post 隐藏没用" |
+| **`t_traybar_probe.ps1`** | 【本轮】打印 `DockTrayBarWindow` 的 rect / 可见性 / ex-style（判断"有没有建出来、是不是被隐藏"） |
+| **`t_traybar_hit.ps1`** | 【本轮】把小窗的可见性和**命中测试**摆出来（`WindowFromPoint` 在中心点是否回到它自己） |
+| **`t_traybar_drag.ps1 -Dx -Dy`** | 【本轮】真鼠标抓小窗第一格拖动 → 打印前后 rect（验证拖动 + 存档） |
+| **`t_qs_watch.ps1`** | 【本轮】点小窗 → 每 120ms 打印前台窗口类/rect（看快速设置有没有弹、弹到哪） |
+| `t_qs_move.ps1` / `t_qs_move2.ps1` / `t_qs_probe2.ps1` / `t_qs_vertical.ps1` | 【本轮】快速设置窗口的探针：命中测试/移动/缩放/把窗口移到负 y 看内容跟不跟 |
+| `t_win_a_state.ps1` | 【本轮】Win+A 的分步状态（任务栏 y、前台类、命中点）——**Win+A 偶发不生效**时先用它** |
+| `glyphsheet.py` / `glyphsheet2.py` / `glyph_tray_check.py` / `glyph_bolt_check.py` | 【本轮】把 `Segoe Fluent Icons` 的码位渲染成对照表（挑 wifi/音量/电池字形用） |
 
 **测量心法**：静态截图看不见"只在运动中"的现象；要把"位置/内容"从**同一张合成帧**里读出来
 （`debugBeacon` 临时画一个 10×10 品红块当作条体标记），或者相邻帧两两对比。

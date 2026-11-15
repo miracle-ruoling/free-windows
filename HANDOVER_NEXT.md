@@ -169,19 +169,62 @@
 ③透明档（`glassOpacity=0 && tintStrength=0`）里**空白像素收不到鼠标事件**（见 §4.3），
 新加的东西必须是"不透明像素"才点得到。
 
-### 3.4 候选（未开工，等用户拍板）：把开始菜单锚到首格
+### 3.4 浮窗锚点：把 shell 弹窗放到条上的按钮旁边（**A 方案进行中，dock 侧已完成**）
 
-结论见 §3.2 末尾：面板在 `StartMenuExperienceHost.exe` 的 XAML 画布里，**XAML 层能精确挪**，
-外部 `SetWindowPos` 只能算野路子。三条路，代价差很多：
+用户 2026-11-15 决定：走 A（fork mod），而且**不要只为首格写死**——以后可能加"音量/网络"按钮
+（Win+A 快速设置）之类，机制必须能复用。
 
-| 方案 | 做法 | 代价 / 风险 |
-|---|---|---|
-| **A. fork `shell-flyout-positions`** | 复制 `dev/shell-flyout-positions.wh.cpp` 成 `windhawk/start-anchor-dock.wh.cpp`；把 `GetStartButtonBoundsForMonitor()` 的锚点换成"dock 首格的 rect"（用 `Local\DockFlyoutAnchor_v1` 共享内存传：dock 写 `{magic,ver,winRect,barRect,workRect}`，mod 读；现有 `TrayBridge*` 是同一套写法）。其余 clamp / 卸载复原 / 多显示器逻辑原样复用 | 改动约 100–150 行；**每次迭代要用户在 Windhawk UI 点"编译"**（无 CLI）；Windows 更新可能失效；GPLv3 + 保留作者署名 |
-| **B. 野路子 demo（零 mod）** | dock 检测到开始菜单（`WindowFromPoint` 撞到 SMEH 那个 `1920x1020` 窗口）就 `SetWindowPos` 挪它，关掉时复原 | 已验证能精确跟手（`+120,+90` → 面板 `419→539`），但：①面板出画布就被裁（阴影也裁）②画布不再铺满屏幕，点空白可能收不起菜单③shell 不重置位置，dock 崩了会留偏移。**只适合让你看"这样放好不好看"** |
-| **C. 不动** | 保持原生位置 | 0 |
+**dock 侧（已完成、已实测）**
+- `Local\DockAnchor_v1`（`DockAnchorShm`，`magic='DANK'` = `0x4B4E4144`，size 720B）：
+  dock 用**空 DACL** 自己创建并一直持有 handle（写法与 `TrayBridgeEnsureExists()` 相同），
+  结构 = `{magic, version=1, count, updatedMs, entries[16]}`，
+  每条 = `{kind, flags, left/top/right/bottom（屏幕物理像素）, gapPx, pad[4]}`。
+- kind：`1 = 开始菜单`、`2 = 快速设置（音量/网络，Win+A）`、`3 = 通知中心`（后两个是预留位）。
+- `PublishAnchors()` 在 `ComputeButtons()` 末尾和 `OpenStartMenu()` 之前各调一次，
+  只写有变化的项；**dock 退出 → 共享块随之消失 → mod 侧自动退回原生位置**（不存在脏数据）。
+- 实测：`dev/anchordump.ps1` 从另一个进程读到了 `magic=0x4B4E4144 version=1 count=1
+  kind=1 rect=731,-1-798,66 gap=8`，`sizeof(Table)=720` 与 mod 侧一致。
 
-还没解决的：**Win+X 菜单**（explorer 的 XAML 弹窗，没有参考实现，纯逆向）。真要做，最省的路是
-"从 `%LOCALAPPDATA%\Microsoft\Windows\WinX\Group1..3` 读快捷方式、自己 `TrackPopupMenu`"——
+**mod 侧（已写好，**还没编译**）**：`windhawk/dock-flyout-anchor.wh.cpp`
+（fork 自 m417z 的 `shell-flyout-positions` v1.3，GPLv3，署名保留；原文件留在
+`dev/shell-flyout-positions.wh.cpp` 供对照）
+- 新增 `dock` 对齐值：`startMenu.horizontalAlignment/verticalAlignment`、
+  `actionCenter.horizontalAlignment`、`notificationCenter.horizontalAlignment`；
+  新增 `dockAnchor.gap`（96-dpi 单位）。**开始菜单的默认值就是 `dock/dock`**。
+- `DockAnchor::Get()`：每次按名字 `OpenFileMapping` → 读 → `UnmapViewOfFile`
+  （不缓存：dock 重启/退出时立刻读不到，比缓存干净）。
+- `DockAnchor::Place()`（与 dock 的 `GridPlacement()` 同源）：横向对左边缘 → 右边溢出就右对齐 →
+  夹进工作区；纵向先试"按钮下方"→ 试"上方"→ 都放不下选空间大的一边 → 再夹紧。
+- 落点实现：新开始菜单（`StartMenu.StartBlendedFlexFrame` / 兜底路径）改 `FrameRoot` 的
+  `HorizontalAlignment=Left` + `RenderTransform.X`（横向绝对偏移）、
+  `VerticalAlignment=Top` + `Margin.Top`（纵向绝对偏移），都是相对 `rcMonitor` 左上角的 DIP；
+  老开始菜单（Canvas）改 `Canvas.Left/Top`；**快速设置/通知中心走 `CoreWindowUI`**：
+  在进程内 hook `SetWindowPos` 改写 X/Y（`AdjustCoreWindowPos`，kind=`QuickSettings`）。
+- 兜底：XAML 内容类名不是已知的那个也照样走 redesigned 路径（只找 `FrameRoot` 这个名字），
+  避免 25H2 改了类名就整段失效。
+- 自检日志：`%TEMP%\dock-flyout-anchor.log`（`DockTrace()`，256KB 上限；Wh_Log 只能在
+  Windhawk UI 里看，写个镜像文件方便离线排查；稳定后可以删）。
+
+**以后加一个"音量/网络"按钮要做什么（不用改 mod 代码）**
+1. dock 里给它一个固定槽位（照 `kSlotWin` 的写法），点击时发 `Win+A`；
+2. 在该槽位每次都 `AnchorPublish(kAnchorQuickSettings, &screenRect, 8)`；
+3. Windhawk 里把 `Dock Flyout Anchor` 的 `Action Center → Horizontal alignment` 设成
+   `Next to the dock button`（设完 mod 会重载，并挂上 QuickActions 的 `SetWindowPos` 钩子）。
+放大到别的弹窗同理：dock 加一个 kind，mod 里加一个 `DockAnchor::Kind` 和在那个弹窗的定位路径里用 `Place()`。
+
+**编译流程（本机没有 CLI，只能走 UI）**
+1. 已经复制到 `C:\ProgramData\Windhawk\ModsSource\local@dock-flyout-anchor.wh.cpp`；
+2. Windhawk UI → **Create new mod** → 名字 `Dock Flyout Anchor`（id 自动是 `dock-flyout-anchor`）；
+   若编辑器里是空模板，先切到别的 mod 再切回来，让它从磁盘重载我们的源码；
+3. **Compile** → **Enable**（`@include` 保持 upstream 的 4 个进程）。
+4. 验证：`dev/t_anchor_check.ps1` 点首格开开始菜单并抓前后两帧 → `dev/shotdiff.py anchor_a.png anchor_b.png`
+   给面板包围盒，再和 `dev/anchordump.ps1` 打印的按钮矩形对照。
+
+**风险**：25H2 的 XAML 结构未知（类名/元素名可能又变，已加兜底但仍可能找不到 `FrameRoot`）；
+每次迭代都要用户在 UI 里点一次 Compile；Windows 更新后可能要跟着修。
+
+**没解决**：Win+X 菜单（explorer 的 XAML 弹窗，位置由 explorer 的弹窗放置引擎决定，上游没碰过，
+没有参考实现）。最省的路是自己读 `%LOCALAPPDATA%\Microsoft\Windows\WinX\Group1..3` 画菜单，
 但那是"自己做窗口"，用户明确不要。
 
 ---

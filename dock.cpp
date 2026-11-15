@@ -1670,6 +1670,9 @@ static void RenderIconCache(int px) {
     DLog(L"iconcache px=%d items=%d noIcon=%d", px, (int)g_items.size(), empty);
 }
 
+// Publishes the flyout anchor rects to the Windhawk mod (defined further down).
+static void PublishAnchors();
+
 static void ComputeButtons() {
     g_slots.clear();
     RECT rc{};
@@ -1779,6 +1782,7 @@ static void ComputeButtons() {
     // One line whenever the geometry changes: which cells exist and where the two fixed
     // buttons are. Probing a slot from a script needs this instead of re-deriving the
     // centred row (and the hover zoom moves it all the time anyway).
+    PublishAnchors();      // the shell flyouts anchor on those same rects (see below)
     {
         static int lastCap = -1, lastShow = -1, lastCells = -1, lastScroll = -1;
         if (cap != lastCap || show != lastShow || cellCount != lastCells ||
@@ -2308,6 +2312,7 @@ static void SendChord(const BYTE* vks, int count) {
 
 static void OpenStartMenu() {
     const BYTE chord[] = {VK_CONTROL, VK_ESCAPE};
+    PublishAnchors();      // the mod reads this the moment the menu appears
     DLog(L"win button: left click -> start menu (ctrl+esc)");
     SendChord(chord, 2);
 }
@@ -2496,6 +2501,120 @@ static void Reload() {
     LoadConfig();
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
+}
+
+// ---------------------------------------------------------------- flyout anchors
+// The shell's own flyouts (Start menu, the volume/network panel, ...) place themselves
+// relative to the native taskbar, which is nowhere near our strip. We cannot move them
+// from out here: the Start panel is XAML inside StartMenuExperienceHost's full-work-area
+// window, and SetWindowPos on it either does nothing visible or gets reverted. A
+// Windhawk mod can (windhawk/dock-flyout-anchor.wh.cpp, forked from m417z's
+// shell-flyout-positions) - but it runs inside the shell processes and cannot see our
+// geometry, so the strip publishes the rect of every button that anchors a flyout here.
+// One entry per flyout kind; the mod does the final placement math because only it knows
+// the flyout's size and the work area.
+// Layout must match windhawk/dock-flyout-anchor.wh.cpp exactly.
+enum : unsigned {
+    kAnchorStartMenu = 1,      // left click on the Windows button
+    kAnchorQuickSettings = 2,  // reserved: a future volume/network button (Win+A)
+    kAnchorNotifications = 3,  // reserved: notification centre
+    kAnchorKindMax = 16,
+};
+struct DockAnchorEntry {
+    unsigned int kind;         // 0 = unused
+    unsigned int flags;        // 0 = automatic (the mod picks the side with room)
+    int left, top, right, bottom;   // the anchor button, screen coordinates, physical px
+    int gapPx;                 // space to keep between the button and the flyout
+    int pad[4];
+};
+struct DockAnchorShm {
+    unsigned int magic;        // 'DANK'
+    unsigned int version;
+    unsigned int count;        // highest used slot + 1
+    unsigned int updatedMs;
+    DockAnchorEntry entries[kAnchorKindMax];
+};
+static HANDLE g_anchorOwnMap = nullptr;
+static DockAnchorShm* g_anchorShm = nullptr;
+
+static void AnchorEnsureExists() {
+    if (g_anchorShm) return;
+    SECURITY_DESCRIPTOR sd{};
+    SECURITY_ATTRIBUTES sa{};
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) return;
+    if (!SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE)) return;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+    if (!g_anchorOwnMap) {
+        g_anchorOwnMap = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
+                                            sizeof(DockAnchorShm), L"Local\\DockAnchor_v1");
+        DLog(L"anchor: flyout block %s (err=%lu)",
+             g_anchorOwnMap ? L"available" : L"NOT available", (unsigned long)GetLastError());
+        if (!g_anchorOwnMap) return;
+    }
+    g_anchorShm = (DockAnchorShm*)MapViewOfFile(g_anchorOwnMap, FILE_MAP_WRITE, 0, 0,
+                                                sizeof(DockAnchorShm));
+    if (!g_anchorShm) return;
+    memset(g_anchorShm, 0, sizeof(DockAnchorShm));
+    g_anchorShm->magic = 0x4B4E4144;      // 'DANK'
+    g_anchorShm->version = 1;
+}
+
+// Publish (or clear, with a null rect) one anchor. Called for every flyout button we own,
+// so the mod always sees the current geometry; the block dies with the dock, which is why
+// a stale entry can never survive us.
+static void AnchorPublish(unsigned kind, const RECT* screenRect, int gapPx) {
+    AnchorEnsureExists();
+    if (!g_anchorShm || kind == 0 || kind > kAnchorKindMax) return;
+    DockAnchorEntry& e = g_anchorShm->entries[kind - 1];
+    bool empty = (screenRect == nullptr);
+    int l = empty ? 0 : screenRect->left;
+    int t = empty ? 0 : screenRect->top;
+    int r = empty ? 0 : screenRect->right;
+    int b = empty ? 0 : screenRect->bottom;
+    if (!empty && e.kind == kind && e.left == l && e.top == t && e.right == r && e.bottom == b &&
+        e.gapPx == gapPx)
+        return;      // unchanged
+    if (empty && e.kind == 0) return;
+    memset(&e, 0, sizeof(e));
+    e.kind = empty ? 0 : kind;
+    e.left = l;
+    e.top = t;
+    e.right = r;
+    e.bottom = b;
+    e.gapPx = empty ? 0 : gapPx;
+    if (!empty && (unsigned)(kind) >= g_anchorShm->count) g_anchorShm->count = kind;
+    g_anchorShm->updatedMs = GetTickCount();
+    if (!empty)
+        DLog(L"anchor: published kind=%u rect=%d,%d-%d,%d gap=%d", kind, l, t, r, b, gapPx);
+}
+
+// Screen rect of a slot (client rect -> screen), or false when the slot is not on screen.
+static bool SlotScreenRect(int slot, RECT* out) {
+    if (!g_hwnd || slot < 0 || slot >= (int)g_slots.size()) return false;
+    RECT r = g_slots[slot].rc;
+    POINT tl{r.left, r.top}, br{r.right, r.bottom};
+    if (!ClientToScreen(g_hwnd, &tl) || !ClientToScreen(g_hwnd, &br)) return false;
+    *out = RECT{tl.x, tl.y, br.x, br.y};
+    return true;
+}
+
+static RECT AnchorRectForItem(int wantItem) {
+    RECT r{};
+    for (int i = 0; i < (int)g_slots.size(); i++)
+        if (g_slots[i].item == wantItem && SlotScreenRect(i, &r)) return r;
+    return RECT{0, 0, 0, 0};
+}
+
+// Republish every anchor the strip owns. Cheap (a few compares) and called from both
+// ComputeButtons() and right before a flyout is opened, so a moved/resized strip cannot
+// leave the mod with a stale target.
+static void PublishAnchors() {
+    const int gap = 8;
+    RECT win = AnchorRectForItem(kSlotWin);
+    bool haveWin = win.right > win.left;
+    AnchorPublish(kAnchorStartMenu, haveWin ? &win : nullptr, gap);
 }
 
 // ---------------------------------------------------------------- tray icons

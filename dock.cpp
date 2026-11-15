@@ -1811,6 +1811,12 @@ static void ComputeButtons() {
 // read the same against any wallpaper.
 static void PaintWinButton(const RECT& rc, int size) {
     if (size < 10) return;
+    // A layered window is hit-tested through its alpha channel, so the gap between the
+    // four squares would be a hole the click falls through - right in the middle of the
+    // button, where people aim. This faint wash (4% white, invisible against any
+    // wallpaper) makes the whole button clickable and keeps its rounded outline.
+    FillRound(g_memDC, rc, RadiusFor(rc.right - rc.left, rc.bottom - rc.top) / 2 + 2,
+              0x0AFFFFFF);
     // the glyph spans ~92% of the button, split 2x2 with a ~9% gap (Fluent logo metrics);
     // corners are only slightly rounded - too much radius melts the four squares into one
     int span = (int)(size * 0.92f + 0.5f);
@@ -2601,10 +2607,23 @@ static bool SlotScreenRect(int slot, RECT* out) {
 }
 
 static RECT AnchorRectForItem(int wantItem) {
+    // Deliberately the *cell* rect at the configured icon size, not the current slot:
+    // the hover zoom would otherwise move the anchor by up to 34% while the flyout is
+    // being opened, and the flyout only needs to know which button this is.
     RECT r{};
-    for (int i = 0; i < (int)g_slots.size(); i++)
-        if (g_slots[i].item == wantItem && SlotScreenRect(i, &r)) return r;
-    return RECT{0, 0, 0, 0};
+    for (int i = 0; i < (int)g_slots.size(); i++) {
+        if (g_slots[i].item != wantItem) continue;
+        RECT cell = g_slots[i].rc;
+        int cx = (cell.left + cell.right) / 2;
+        int cy = (cell.top + cell.bottom) / 2;
+        int half = g_iconPx / 2;
+        cell = RECT{cx - half, cy - half, cx + half, cy + half};
+        POINT tl{cell.left, cell.top}, br{cell.right, cell.bottom};
+        if (!g_hwnd || !ClientToScreen(g_hwnd, &tl) || !ClientToScreen(g_hwnd, &br))
+            return RECT{0, 0, 0, 0};
+        return RECT{tl.x, tl.y, br.x, br.y};
+    }
+    return r;
 }
 
 // Republish every anchor the strip owns. Cheap (a few compares) and called from both

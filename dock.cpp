@@ -24,6 +24,10 @@
 #include <wincodec.h>
 #include <uiautomation.h>
 #include <tlhelp32.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <wlanapi.h>
+#include <wininet.h>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -46,8 +50,11 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "uiautomationcore.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "wlanapi.lib")
+#pragma comment(lib, "wininet.lib")
 
 static HWND g_hwnd;
+static void CompanionSaveAllPositions();      // defined with the companions
 static void* g_paintBits;
 static HWND g_setWnd;
 static int g_paintW, g_paintH;
@@ -305,6 +312,7 @@ static void SavePosition() {
     swprintf_s(b, L"%d", g_cfg.x); WritePrivateProfileStringW(L"dock", L"x", b, g_iniPath.c_str());
     swprintf_s(b, L"%d", g_cfg.y); WritePrivateProfileStringW(L"dock", L"y", b, g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"hasPos", L"1", g_iniPath.c_str());
+    CompanionSaveAllPositions();      // attached windows moved with us; keep the ini honest
 }
 
 static void SaveSize() {
@@ -2460,11 +2468,15 @@ static void UpdateHoverFromCursor() {
     Present();
 }
 
+static bool CursorInCompanionGroup();   // defined with the companions
+
 static void UpdateAlpha() {
     // Settings open, or the panel/menu is up: never fade. The strip is part of the
     // interaction while the user is picking from the grid, and the user asked for it
     // to stay at full strength no matter where the pointer wanders.
-    if (g_setWnd || g_gridVisible || g_menuOpen) {
+    // Same for "the pointer is somewhere in the group": if the attached windows are up,
+    // the strip they belong to must not fade out from under the cursor (user, 2026-11-15).
+    if (g_setWnd || g_gridVisible || g_menuOpen || CursorInCompanionGroup()) {
         if (g_alpha != 255) {
             g_alpha = 255;
             if (g_clickThrough) {
@@ -2660,6 +2672,930 @@ static void ArmWinXAnchor() {
     PublishAnchors();      // fresh rect first, then the arm flag
     RECT win = AnchorRectForItem(kSlotWin);
     if (win.right > win.left) AnchorPublish(kAnchorWinXMenu, &win, 8, true);
+}
+
+// ---------------------------------------------------------------- companions
+// Attached windows: small windows that live *next to* the strip instead of inside it, so
+// they can be moved and resized on their own. Style is not copied - they read the same
+// `g_cfg`, and they reuse the strip's drawing primitives by pointing the shared pixel
+// pointers at their own DIB for the duration of a paint, which is exactly what
+// GridPaint()/SettingsPaint() already do.
+//
+// First (and for now only) companion: the tray bar - network / volume / battery as one
+// button. Any click opens the shell's quick settings (Win+A), and the anchor block tells
+// the Windhawk mod to put that panel next to us (kind = QuickSettings).
+//
+// Group rules (see PLAN_COMPANION.md): follow = 1 means "moves with the strip, appears
+// only while the pointer is on the strip (or inside the group)". follow = 0 is an
+// independent window that fades with cursor distance like the strip does.
+static int EdgeAt(POINT p, const RECT& rcIn);      // defined further down
+
+struct TrayState {
+    int netKind = 0;                  // 0 none, 1 wifi, 2 ethernet
+    int netQuality = 0;               // 0..100 (wifi)
+    wchar_t netName[96] = L"";        // profile name / "以太网"
+    int volPercent = 0;
+    bool muted = false;
+    int batPercent = -1;              // -1 = no battery
+    bool charging = false;
+};
+static TrayState g_trayState;
+
+struct Companion {
+    HWND hwnd = nullptr;
+    const wchar_t* iniSection = L"traybar";
+    bool enabled = true;
+    bool follow = true;
+    RECT rc{0, 0, 0, 0};              // screen px
+    // own 32bpp premultiplied buffer (the strip's pixel helpers are pointed at it while
+    // painting, see TrayPaint)
+    HDC dc = nullptr;
+    HBITMAP bmp = nullptr;
+    void* bits = nullptr;
+    int dibW = 0, dibH = 0;
+    int alpha = 0;
+    int alphaTarget = 0;
+    bool dragging = false;
+    bool resizing = false;
+    int resizeEdge = 0;
+    RECT resizeRect{};
+    POINT resizeOrigin{};
+    POINT dragStart{};
+    bool pressActive = false;
+    POINT pressScreen{};
+    int hoverCell = -1;
+    HWND tipWnd = nullptr;
+    TOOLINFOW tipInfo{};
+    DWORD stateAt = 0;
+    bool visible = false;
+};
+static Companion g_trayBar;
+
+#define kTrayCellCount 3
+
+// forward declarations (the state poller repaints, and the painting code is further down)
+static void TrayRepaint(Companion& c);
+static void CompanionPresent(Companion& c);
+
+static int CompanionIconPx(const Companion& c) {
+    int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
+    int shortSide = w < h ? w : h;
+    int icon = shortSide - g_cfg.pad * 2;
+    if (icon < g_cfg.minIcon) icon = g_cfg.minIcon;
+    if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
+    return icon;
+}
+
+// Cell rects in client coordinates. The tray bar keeps the same orientation rule as the
+// strip: tall window -> cells stacked, wide window -> cells in a row.
+static void TrayCells(const Companion& c, RECT out[kTrayCellCount]) {
+    int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
+    bool vertical = (h > w);
+    int icon = CompanionIconPx(c);
+    int gap = g_cfg.gap;
+    int cell = icon + gap;
+    int span = kTrayCellCount * cell - gap;
+    int startX = (w - span) / 2;
+    int startY = (h - span) / 2;
+    for (int i = 0; i < kTrayCellCount; i++) {
+        if (vertical) {
+            int x = (w - icon) / 2;
+            out[i] = RECT{x, startY + i * cell, x + icon, startY + i * cell + icon};
+        } else {
+            int y = (h - icon) / 2;
+            out[i] = RECT{startX + i * cell, y, startX + i * cell + icon, y + icon};
+        }
+    }
+}
+
+// ---------------------------------------------------------------- tray state
+static void QueryVolume() {
+    static IMMDeviceEnumerator* enumerator = nullptr;
+    static IAudioEndpointVolume* volume = nullptr;
+    if (!enumerator) {
+        CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                         __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    }
+    if (enumerator && !volume) {
+        IMMDevice* device = nullptr;
+        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) && device) {
+            device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&volume);
+            device->Release();
+        }
+    }
+    if (!volume) return;
+    float scalar = 0;
+    BOOL mute = FALSE;
+    if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar))) {
+        int pct = (int)(scalar * 100.0f + 0.5f);
+        g_trayState.volPercent = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    }
+    if (SUCCEEDED(volume->GetMute(&mute))) g_trayState.muted = mute != FALSE;
+}
+
+static void QueryPower() {
+    SYSTEM_POWER_STATUS st{};
+    if (!GetSystemPowerStatus(&st)) return;
+    if (st.BatteryLifePercent == 255) {
+        g_trayState.batPercent = -1;
+        g_trayState.charging = false;
+        return;
+    }
+    g_trayState.batPercent = st.BatteryLifePercent;
+    g_trayState.charging = (st.ACLineStatus == 1);
+}
+
+static void QueryNetwork() {
+    g_trayState.netKind = 0;
+    g_trayState.netQuality = 0;
+    g_trayState.netName[0] = 0;
+
+    // Wi-Fi first: the WLAN API tells us both whether it is up and how good the signal is.
+    bool wifiUp = false;
+    HANDLE wlan = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &wlan) == ERROR_SUCCESS) {
+        PWLAN_INTERFACE_INFO_LIST list = nullptr;
+        if (WlanEnumInterfaces(wlan, nullptr, &list) == ERROR_SUCCESS && list) {
+            for (DWORD i = 0; i < list->dwNumberOfItems; i++) {
+                PWLAN_INTERFACE_INFO info = &list->InterfaceInfo[i];
+                if (info->isState != wlan_interface_state_connected) continue;
+                wifiUp = true;
+                PWLAN_CONNECTION_ATTRIBUTES attr = nullptr;
+                DWORD attrSize = 0;
+                WLAN_OPCODE_VALUE_TYPE opType;
+                if (WlanQueryInterface(wlan, &info->InterfaceGuid,
+                                       wlan_intf_opcode_current_connection, nullptr, &attrSize,
+                                       (PVOID*)&attr, &opType) == ERROR_SUCCESS &&
+                    attr) {
+                    g_trayState.netQuality =
+                        (int)attr->wlanAssociationAttributes.wlanSignalQuality;
+                    wcsncpy_s(g_trayState.netName,
+                              attr->strProfileName[0] ? attr->strProfileName : L"WLAN",
+                              _TRUNCATE);
+                    WlanFreeMemory(attr);
+                }
+                break;
+            }
+            WlanFreeMemory(list);
+        }
+        WlanCloseHandle(wlan, nullptr);
+    }
+
+    if (wifiUp) {
+        g_trayState.netKind = 1;
+        if (!g_trayState.netName[0]) wcscpy_s(g_trayState.netName, L"WLAN");
+        return;
+    }
+
+    // No Wi-Fi: a live LAN connection means the cable is in. (InternetGetConnectedState is
+    // "there is a network", which is exactly what the tray icon shows before it has decided
+    // whether the internet is reachable.)
+    DWORD flags = 0;
+    if (InternetGetConnectedState(&flags, 0)) {
+        g_trayState.netKind = 2;
+        wcscpy_s(g_trayState.netName, L"以太网");
+    }
+}
+
+static void TrayStateRefresh(DWORD now) {
+    if (g_trayBar.stateAt && now - g_trayBar.stateAt < 1000) return;
+    g_trayBar.stateAt = now;
+
+    TrayState before = g_trayState;
+    QueryVolume();
+    QueryPower();
+    QueryNetwork();
+    bool changed = memcmp(&before, &g_trayState, sizeof(TrayState)) != 0;
+    if (changed && g_trayBar.hwnd) {
+        DLog(L"tray bar: net=%d(q=%d '%s') vol=%d mute=%d bat=%d chg=%d",
+             g_trayState.netKind, g_trayState.netQuality, g_trayState.netName,
+             g_trayState.volPercent, (int)g_trayState.muted, g_trayState.batPercent,
+             (int)g_trayState.charging);
+        TrayRepaint(g_trayBar);
+        CompanionPresent(g_trayBar);
+    }
+}
+
+// ---------------------------------------------------------------- tray painting
+// A glyph from the system icon font (the taskbar uses the same one). GDI writes alpha 0
+// into a 32bpp DIB, so the glyph is rasterised into a scratch mask first; the mask is then
+// measured and scaled to fit the cell (the font's line height is much larger than its ink,
+// which made an unlucky first version overflow and clip), and finally blended through
+// SetPixelPremul - the same idea as DrawTextAlpha() for the settings panel.
+struct GlyphMask {
+    wchar_t code = 0;
+    int px = 0;
+    int w = 0, h = 0;
+    std::vector<unsigned char> a;
+};
+static std::vector<GlyphMask> g_glyphCache;
+
+static bool RenderGlyphMask(wchar_t code, int px, GlyphMask* out) {
+    for (const auto& g : g_glyphCache)
+        if (g.code == code && g.px == px) {
+            *out = g;
+            return true;
+        }
+
+    const int box = px * 2;                     // room for ascenders/descenders
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = box;
+    bi.bmiHeader.biHeight = -box;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { ReleaseDC(nullptr, screen); return false; }
+    HDC dc = CreateCompatibleDC(screen);
+    HGDIOBJ old = SelectObject(dc, bmp);
+    memset(bits, 0, (size_t)box * box * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    HFONT font = CreateFontW(px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH, L"Segoe Fluent Icons");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    RECT tr{0, 0, box, box};
+    wchar_t text[2] = {code, 0};
+    DrawTextW(dc, text, 1, &tr, DT_SINGLELINE | DT_CENTER | DT_TOP | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
+
+    // ink bounding box
+    auto* src = (uint32_t*)bits;
+    int minX = box, minY = box, maxX = -1, maxY = -1;
+    for (int y = 0; y < box; y++)
+        for (int x = 0; x < box; x++) {
+            int a = ((src[(size_t)y * box + x] >> 16) & 0xFF);
+            if (a <= 4) continue;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+        }
+
+    bool ok = maxX > minX && maxY > minY;
+    if (ok) {
+        out->code = code;
+        out->px = px;
+        out->w = maxX - minX + 1;
+        out->h = maxY - minY + 1;
+        out->a.assign((size_t)out->w * out->h, 0);
+        for (int y = 0; y < out->h; y++)
+            for (int x = 0; x < out->w; x++) {
+                int a = ((src[(size_t)(minY + y) * box + (minX + x)] >> 16) & 0xFF);
+                out->a[(size_t)y * out->w + x] = (unsigned char)(a > 255 ? 255 : a);
+            }
+        if (g_glyphCache.size() < 24) g_glyphCache.push_back(*out);
+    }
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return ok;
+}
+
+// Draw one glyph centred in `cell`, its ink scaled to fill `fill` (0..1) of the cell.
+static void DrawGlyphInCell(const RECT& cell, wchar_t code, DWORD rgb, float fill) {
+    if (!g_paintBits) return;
+    int cw = cell.right - cell.left, ch = cell.bottom - cell.top;
+    if (cw <= 0 || ch <= 0) return;
+
+    GlyphMask mask;
+    if (!RenderGlyphMask(code, ch, &mask)) return;
+
+    int targetH = (int)(ch * fill + 0.5f);
+    if (targetH < 1) return;
+    int targetW = (int)((float)mask.w * targetH / (float)mask.h + 0.5f);
+    if (targetW > cw) {
+        targetW = cw;
+        targetH = (int)((float)mask.h * targetW / (float)mask.w + 0.5f);
+    }
+    int ox = cell.left + (cw - targetW) / 2;
+    int oy = cell.top + (ch - targetH) / 2;
+
+    DWORD r0 = rgb & 0xFF, g0 = (rgb >> 8) & 0xFF, b0 = (rgb >> 16) & 0xFF;
+    for (int y = 0; y < targetH; y++) {
+        // bilinear sample of the mask (it is a coverage map, so this stays smooth)
+        float sy = (y + 0.5f) * mask.h / targetH - 0.5f;
+        int y0 = (int)floorf(sy);
+        float fy = sy - y0;
+        int y1 = y0 + 1;
+        if (y0 < 0) y0 = 0;
+        if (y1 < 0) y1 = 0;
+        if (y0 >= mask.h) y0 = mask.h - 1;
+        if (y1 >= mask.h) y1 = mask.h - 1;
+        for (int x = 0; x < targetW; x++) {
+            float sx = (x + 0.5f) * mask.w / targetW - 0.5f;
+            int x0 = (int)floorf(sx);
+            float fx = sx - x0;
+            int x1 = x0 + 1;
+            if (x0 < 0) x0 = 0;
+            if (x1 < 0) x1 = 0;
+            if (x0 >= mask.w) x0 = mask.w - 1;
+            if (x1 >= mask.w) x1 = mask.w - 1;
+            float a00 = mask.a[(size_t)y0 * mask.w + x0];
+            float a10 = mask.a[(size_t)y0 * mask.w + x1];
+            float a01 = mask.a[(size_t)y1 * mask.w + x0];
+            float a11 = mask.a[(size_t)y1 * mask.w + x1];
+            float a = (a00 * (1 - fx) + a10 * fx) * (1 - fy) +
+                      (a01 * (1 - fx) + a11 * fx) * fy;
+            int ai = (int)(a * 1.6f + 0.5f);        // icon ink is thinner than text
+            if (ai > 255) ai = 255;
+            if (ai <= 6) continue;
+            SetPixelPremul(ox + x, oy + y,
+                           ((DWORD)ai << 24) | ((DWORD)(r0 * ai / 255) << 16) |
+                               ((DWORD)(g0 * ai / 255) << 8) | (DWORD)(b0 * ai / 255));
+        }
+    }
+}
+
+static wchar_t TrayGlyphNet() {
+    if (g_trayState.netKind == 2) return 0xE839;      // Ethernet
+    if (g_trayState.netKind == 1) return 0xE874;      // Wi-Fi
+    return 0xE871;                                     // no connection
+}
+
+static wchar_t TrayGlyphVolume() {
+    if (g_trayState.muted) return 0xE74F;             // muted speaker
+    int p = g_trayState.volPercent;
+    if (p <= 0) return 0xE992;
+    if (p < 33) return 0xE993;
+    if (p < 66) return 0xE994;
+    return 0xE995;
+}
+
+static wchar_t TrayGlyphBattery() {
+    int pct = g_trayState.batPercent;
+    if (pct < 0) return 0xE850;               // no battery: the empty shell
+    if (g_trayState.charging) {
+        // E85A..E862 are "battery N + bolt"; E863 is the eco leaf, so stop at 8.
+        int level = pct * 9 / 100;
+        if (level > 8) level = 8;
+        if (level < 0) level = 0;
+        return (wchar_t)(0xE85A + level);
+    }
+    int level = pct * 10 / 100;               // E850 (empty) .. E859 (full)
+    if (level > 9) level = 9;
+    if (level < 0) level = 0;
+    return (wchar_t)(0xE850 + level);
+}
+
+static std::wstring TrayTipText(int cell) {
+    wchar_t buf[160];
+    if (cell == 0) {
+        if (g_trayState.netKind == 0) return L"未连接";
+        if (g_trayState.netKind == 2) return L"以太网";
+        swprintf_s(buf, L"%s（信号 %d%%）", g_trayState.netName, g_trayState.netQuality);
+        return buf;
+    }
+    if (cell == 1) {
+        if (g_trayState.muted) return L"音量：静音";
+        swprintf_s(buf, L"音量：%d%%", g_trayState.volPercent);
+        return buf;
+    }
+    if (g_trayState.batPercent < 0) return L"未检测到电池";
+    swprintf_s(buf, g_trayState.charging ? L"电池：%d%%，正在充电" : L"电池：%d%%",
+               g_trayState.batPercent);
+    return buf;
+}
+
+static void TrayRepaint(Companion& c);
+
+// ---------------------------------------------------------------- companion plumbing
+// A DIB cannot be deleted while it is still selected into the DC, so park a 1x1 dummy
+// there first (creating one lazily keeps this simple).
+static HBITMAP g_dummyBmp = nullptr;
+static HBITMAP DummyBitmap() {
+    if (g_dummyBmp) return g_dummyBmp;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 1;
+    bi.bmiHeader.biHeight = -1;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    g_dummyBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    return g_dummyBmp;
+}
+
+static void CompanionEnsureDib(Companion& c, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (c.bits && c.dibW == w && c.dibH == h) return;
+    if (c.bmp) {
+        if (c.dc && DummyBitmap()) SelectObject(c.dc, g_dummyBmp);
+        DeleteObject(c.bmp);
+        c.bmp = nullptr;
+        c.bits = nullptr;
+    }
+    if (!c.dc) c.dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    c.bmp = CreateDIBSection(c.dc, &bi, DIB_RGB_COLORS, &c.bits, nullptr, 0);
+    if (c.bmp) SelectObject(c.dc, c.bmp);
+    c.dibW = w;
+    c.dibH = h;
+}
+
+static void CompanionPresent(Companion& c) {
+    if (!c.hwnd || !c.bits) return;
+    POINT src{0, 0};
+    SIZE size{c.dibW, c.dibH};
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, (BYTE)c.alpha, AC_SRC_ALPHA};
+    POINT dst{c.rc.left, c.rc.top};
+    // Same reason as Present(): when the window geometry changes in the same step as the
+    // pixels, wait for a composition first, otherwise the new content shows at the old
+    // place for a few milliseconds (the "glass slides" bug).
+    if (g_cfg.presentSync == 2 && (c.dragging || c.resizing || c.alpha != c.alphaTarget)) {
+        DwmFlush();
+    }
+    UpdateLayeredWindow(c.hwnd, nullptr, &dst, &size, c.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+static bool CursorInCompanionGroup() {    if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return false;
+    if (g_trayBar.alpha <= 0) return false;      // nothing of ours is on screen
+    POINT p{};
+    if (!GetCursorPos(&p)) return false;
+    RECT group{};
+    if (!GetWindowRect(g_hwnd, &group)) return false;
+    UnionRect(&group, &group, &g_trayBar.rc);
+    return PtInRect(&group, p) != FALSE;
+}
+
+// Move the window without moving the pixels twice: geometry and content in one go.
+static void CompanionSetRect(Companion& c, int x, int y, int w, int h, bool repaint) {
+    c.rc = RECT{x, y, x + w, y + h};
+    CompanionEnsureDib(c, w, h);
+    if (repaint) TrayRepaint(c);
+    if (IsWindow(c.hwnd)) {
+        SetWindowPos(c.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        CompanionPresent(c);
+    }
+    // The quick settings panel anchors on this rect; republish as it moves.
+    AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
+}
+
+static void CompanionSave(Companion& c) {
+    if (g_iniPath.empty()) return;
+    wchar_t b[32];
+    swprintf_s(b, L"%d", c.rc.left);
+    WritePrivateProfileStringW(c.iniSection, L"x", b, g_iniPath.c_str());
+    swprintf_s(b, L"%d", c.rc.top);
+    WritePrivateProfileStringW(c.iniSection, L"y", b, g_iniPath.c_str());
+    swprintf_s(b, L"%d", c.rc.right - c.rc.left);
+    WritePrivateProfileStringW(c.iniSection, L"w", b, g_iniPath.c_str());
+    swprintf_s(b, L"%d", c.rc.bottom - c.rc.top);
+    WritePrivateProfileStringW(c.iniSection, L"h", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c.iniSection, L"hasPos", L"1", g_iniPath.c_str());
+    WritePrivateProfileStringW(c.iniSection, L"follow", c.follow ? L"1" : L"0",
+                               g_iniPath.c_str());
+    DLog(L"tray bar: saved %ld,%ld %ldx%ld (follow=%d)", (long)c.rc.left, (long)c.rc.top,
+         (long)(c.rc.right - c.rc.left), (long)(c.rc.bottom - c.rc.top), (int)c.follow);
+}
+
+// Called from SavePosition(): the attached windows moved with the strip, so their stored
+// position has to follow, otherwise a restart would put them back where the strip used to be.
+static void CompanionSaveAllPositions() {
+    if (!g_trayBar.hwnd || !g_trayBar.enabled) return;
+    CompanionSave(g_trayBar);
+}
+
+// The ini is read with the same helpers the strip uses (GetInt), so the semantics match.
+static void CompanionLoad(Companion& c) {
+    c.enabled = GetInt(c.iniSection, L"enabled", 1) != 0;
+    c.follow = GetInt(c.iniSection, L"follow", 1) != 0;
+
+    int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
+    if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
+    int defW = kTrayCellCount * (icon + g_cfg.gap) - g_cfg.gap + g_cfg.pad * 2;
+    int defH = icon + g_cfg.pad * 2;
+
+    int w = GetInt(c.iniSection, L"w", defW);
+    int h = GetInt(c.iniSection, L"h", defH);
+    if (w < 40) w = 40;
+    if (h < 40) h = 40;
+
+    RECT sr{};
+    GetWindowRect(g_hwnd, &sr);
+    int defX = sr.right - w;
+    int defY = sr.bottom + 8;
+    int x = GetInt(c.iniSection, L"x", defX);
+    int y = GetInt(c.iniSection, L"y", defY);
+    c.rc = RECT{x, y, x + w, y + h};
+    DLog(L"tray bar: loaded %ld,%ld %dx%d (follow=%d enabled=%d)", (long)x, (long)y, w, h,
+         (int)c.follow, (int)c.enabled);
+}
+
+static void TrayRepaint(Companion& c) {
+    if (!c.hwnd || !c.bits) return;
+
+    // retarget the shared pixel helpers at our own DIB (same as GridPaint)
+    void* savePaint = g_paintBits;
+    int savePW = g_paintW, savePH = g_paintH;
+    g_paintBits = c.bits;
+    g_paintW = c.dibW;
+    g_paintH = c.dibH;
+
+    memset(c.bits, 0, (size_t)c.dibW * c.dibH * 4);
+
+    RECT all{0, 0, c.dibW, c.dibH};
+    // A layered window is hit-tested through its alpha, and the glyphs have holes in them -
+    // hovering/clicking the middle of a speaker would fall straight through to whatever is
+    // behind. This wash (4% white, invisible against any wallpaper) makes the whole bar one
+    // button, which is exactly what the user asked for ("clicking anywhere opens the menu").
+    FillRound(c.dc, all, RadiusFor(all.right, all.bottom), 0x0AFFFFFF);
+
+    RECT cells[kTrayCellCount];
+    TrayCells(c, cells);
+    int icon = CompanionIconPx(c);
+
+    for (int i = 0; i < kTrayCellCount; i++) {
+        const RECT& cellRect = cells[i];
+        if (i == c.hoverCell) {
+            FillRound(c.dc, cellRect, RadiusFor(cellRect.right - cellRect.left,
+                                                cellRect.bottom - cellRect.top) / 2 + 2,
+                      ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
+        }
+        wchar_t glyph = (i == 0) ? TrayGlyphNet() : (i == 1) ? TrayGlyphVolume()
+                                                             : TrayGlyphBattery();
+        DrawGlyphInCell(cellRect, glyph, 0xE8FFFFFF, 0.78f);
+    }
+
+    g_paintBits = savePaint;
+    g_paintW = savePW;
+    g_paintH = savePH;
+}
+
+// ---------------------------------------------------------------- tooltip
+static void CompanionTooltipEnsure(Companion& c) {
+    if (c.tipWnd || !c.hwnd) return;
+    c.tipWnd = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                               WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                               GetModuleHandleW(nullptr), nullptr);
+    if (!c.tipWnd) {
+        DLog(L"tray bar: tooltip create failed err=%lu", (unsigned long)GetLastError());
+        return;
+    }
+
+    // This shell's tooltip only accepts the V1 TOOLINFO layout for TTM_ADDTOOL (measured:
+    // sizeof(TOOLINFO) = 72 is rejected, TTTOOLINFOW_V1_SIZE is accepted), so try the small
+    // layout first and fall back to the full one.
+    RECT cells[kTrayCellCount];
+    TrayCells(c, cells);
+    const int sizes[] = {(int)TTTOOLINFOW_V1_SIZE, (int)sizeof(TOOLINFOW)};
+    for (int size : sizes) {
+        c.tipInfo = TOOLINFOW{};
+        c.tipInfo.cbSize = (UINT)size;
+        c.tipInfo.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+        c.tipInfo.hwnd = c.hwnd;
+        c.tipInfo.uId = 0x51;
+        c.tipInfo.rect = cells[0];
+        c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
+        SetLastError(0);
+        LRESULT added = SendMessageW(c.tipWnd, TTM_ADDTOOLW, 0, (LPARAM)&c.tipInfo);
+        DLog(L"tray bar: tooltip %p add cb=%d -> %ld (err=%lu)", (void*)c.tipWnd, size,
+             (long)added, (unsigned long)GetLastError());
+        if (added) return;
+    }
+}
+
+static void CompanionTooltipShow(Companion& c, int cell) {
+    if (!c.tipWnd) return;
+    if (cell < 0) {
+        c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
+        SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, FALSE, (LPARAM)&c.tipInfo);
+        return;
+    }
+    static std::wstring text;
+    text = TrayTipText(cell);
+    c.tipInfo.lpszText = const_cast<LPWSTR>(text.c_str());
+    SendMessageW(c.tipWnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&c.tipInfo);
+
+    RECT cells[kTrayCellCount];
+    TrayCells(c, cells);
+    // centre of the hovered cell, just below it (screen coordinates)
+    POINT pt{c.rc.left + (cells[cell].left + cells[cell].right) / 2,
+             c.rc.top + cells[cell].bottom + 6};
+    SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x, pt.y));
+    LRESULT on = SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&c.tipInfo);
+    static int logged = 0;
+    if (logged < 6) {
+        logged++;
+        DLog(L"tray bar: tooltip cell=%d text='%s' at %ld,%ld track=%ld", cell, text.c_str(),
+             (long)pt.x, (long)pt.y, (long)on);
+    }
+}
+
+// ---------------------------------------------------------------- visibility
+// Rule (user, 2026-11-15): a following companion only shows while the pointer is on the
+// strip, and stays while the pointer is anywhere in the group; the strip itself keeps its
+// distance fade. An independent companion fades with distance like the strip.
+static void CompanionVisibilityTick(DWORD now) {
+    static bool shown = false;
+    POINT p{};
+    GetCursorPos(&p);
+    RECT sr{};
+    GetWindowRect(g_hwnd, &sr);
+
+    bool wantShown;
+    if (!g_trayBar.follow) {
+        wantShown = true;                     // distance fade instead
+    } else {
+        bool onStrip = PtInRect(&sr, p) != FALSE;
+        RECT group = sr;
+        if (g_trayBar.enabled) UnionRect(&group, &group, &g_trayBar.rc);
+        InflateRect(&group, 6, 6);
+        bool inGroup = PtInRect(&group, p) != FALSE;
+        if (onStrip) shown = true;
+        else if (!inGroup && !g_trayBar.dragging && !g_trayBar.resizing) shown = false;
+        wantShown = shown;
+    }
+
+    if (!g_trayBar.enabled) wantShown = false;
+
+    int target = 0;
+    if (wantShown) {
+        if (g_trayBar.follow) {
+            target = 255;
+        } else {
+            // same fade the strip uses, measured to the companion itself
+            int dx = 0, dy = 0;
+            if (p.x < g_trayBar.rc.left) dx = g_trayBar.rc.left - p.x;
+            else if (p.x > g_trayBar.rc.right) dx = p.x - g_trayBar.rc.right;
+            if (p.y < g_trayBar.rc.top) dy = g_trayBar.rc.top - p.y;
+            else if (p.y > g_trayBar.rc.bottom) dy = p.y - g_trayBar.rc.bottom;
+            int d = (dx == 0 && dy == 0) ? 0 : (int)sqrt((double)dx * dx + (double)dy * dy);
+            if (d <= g_cfg.fadeStart) target = 255;
+            else if (d >= g_cfg.fadeEnd) target = 0;
+            else target = 255 - (d - g_cfg.fadeStart) * 255 / (g_cfg.fadeEnd - g_cfg.fadeStart);
+        }
+    } else {
+        target = 0;
+    }
+
+    bool wasVisible = g_trayBar.visible;
+    g_trayBar.visible = wantShown;
+    if (wantShown && !wasVisible && g_trayBar.hwnd) {
+        // keep the strip above us: the group is drawn "from under the strip"
+        SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd) != (wantShown && target > 0)) {
+        ShowWindow(g_trayBar.hwnd, (wantShown && target > 0) ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (!wantShown) CompanionTooltipShow(g_trayBar, -1);
+    }
+    g_trayBar.alphaTarget = target;
+}
+
+// ---------------------------------------------------------------- per-frame tick
+static void CompanionTick(DWORD now) {
+    if (!g_trayBar.hwnd) return;
+
+    // 1. follow the strip: whatever moved it (drag, dodge, snap), move with the same delta
+    static int lastStripX = INT_MIN, lastStripY = INT_MIN;
+    RECT sr{};
+    GetWindowRect(g_hwnd, &sr);
+    if (lastStripX != INT_MIN && g_trayBar.follow && !g_trayBar.dragging && !g_trayBar.resizing) {
+        int dx = sr.left - lastStripX;
+        int dy = sr.top - lastStripY;
+        if (dx || dy) {
+            DLog(L"tray bar: follow dx=%d dy=%d (strip %ld,%ld, bar %ld,%ld)", dx, dy,
+                 (long)sr.left, (long)sr.top, (long)g_trayBar.rc.left, (long)g_trayBar.rc.top);
+            CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
+                             g_trayBar.rc.right - g_trayBar.rc.left,
+                             g_trayBar.rc.bottom - g_trayBar.rc.top, false);
+        }
+    }
+    lastStripX = sr.left;
+    lastStripY = sr.top;
+
+    // 2. state + fade
+    TrayStateRefresh(now);
+    CompanionVisibilityTick(now);
+
+    if (g_trayBar.alpha != g_trayBar.alphaTarget) {
+        int diff = g_trayBar.alphaTarget - g_trayBar.alpha;
+        int step = (int)(255 * 16 / 120);        // ~120 ms for a full fade at 60 fps
+        if (step < 1) step = 1;
+        if (diff > 0) g_trayBar.alpha += step < diff ? step : diff;
+        else g_trayBar.alpha += (-step) > diff ? -step : diff;
+        CompanionPresent(g_trayBar);
+    }
+}
+
+// ---------------------------------------------------------------- window proc
+static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    Companion& c = g_trayBar;
+    switch (msg) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
+        case WM_MOUSEMOVE: {
+            int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            POINT pt{x, y};
+
+            if (c.resizing) {
+                POINT p{};
+                GetCursorPos(&p);
+                RECT r = c.resizeRect;
+                int dx = p.x - c.resizeOrigin.x;
+                int dy = p.y - c.resizeOrigin.y;
+                if (c.resizeEdge & 1) r.left += dx;
+                if (c.resizeEdge & 2) r.right += dx;
+                if (c.resizeEdge & 4) r.top += dy;
+                if (c.resizeEdge & 8) r.bottom += dy;
+                int minSide = g_cfg.minIcon + g_cfg.pad * 2;
+                if (r.right - r.left < minSide) {
+                    if (c.resizeEdge & 1) r.left = r.right - minSide;
+                    else r.right = r.left + minSide;
+                }
+                if (r.bottom - r.top < minSide) {
+                    if (c.resizeEdge & 4) r.top = r.bottom - minSide;
+                    else r.bottom = r.top + minSide;
+                }
+                CompanionSetRect(c, r.left, r.top, r.right - r.left, r.bottom - r.top, true);
+                return 0;
+            }
+            if (c.dragging) {
+                POINT p{};
+                GetCursorPos(&p);
+                if (!(GetKeyState(VK_LBUTTON) & 0x8000)) {
+                    c.dragging = false;
+                    ReleaseCapture();
+                    CompanionSave(c);
+                    return 0;
+                }
+                CompanionSetRect(c, p.x - c.dragStart.x, p.y - c.dragStart.y,
+                                 c.rc.right - c.rc.left, c.rc.bottom - c.rc.top, false);
+                return 0;
+            }
+            if (c.pressActive) {
+                POINT p{};
+                GetCursorPos(&p);
+                int ddx = p.x - c.pressScreen.x;
+                int ddy = p.y - c.pressScreen.y;
+                if (ddx * ddx + ddy * ddy >= 16) {
+                    c.pressActive = false;
+                    c.dragging = true;
+                    c.dragStart.x = p.x - c.rc.left;
+                    c.dragStart.y = p.y - c.rc.top;
+                    SetCapture(h);
+                    return 0;
+                }
+            }
+
+            RECT cells[kTrayCellCount];
+            TrayCells(c, cells);
+            int hover = -1;
+            for (int i = 0; i < kTrayCellCount; i++)
+                if (PtInRect(&cells[i], pt)) { hover = i; break; }
+            if (hover != c.hoverCell) {
+                c.hoverCell = hover;
+                TrayRepaint(c);
+                CompanionPresent(c);
+                CompanionTooltipShow(c, hover);
+            }
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            if (c.hoverCell != -1) {
+                c.hoverCell = -1;
+                TrayRepaint(c);
+                CompanionPresent(c);
+                CompanionTooltipShow(c, -1);
+            }
+            return 0;
+
+        case WM_LBUTTONDOWN: {
+            int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            POINT pt{x, y};
+            RECT client;
+            GetClientRect(h, &client);
+            int edge = EdgeAt(pt, client);
+            if (edge && g_cfg.allowResize) {
+                c.resizeRect = c.rc;
+                GetCursorPos(&c.resizeOrigin);
+                c.resizeEdge = edge;
+                c.resizing = true;
+                SetCapture(h);
+                DLog(L"tray bar: resize start edge=%d", edge);
+                return 0;
+            }
+            c.pressActive = true;
+            GetCursorPos(&c.pressScreen);
+            SetCapture(h);
+            return 0;
+        }
+
+        case WM_LBUTTONUP:
+            if (c.resizing) {
+                c.resizing = false;
+                ReleaseCapture();
+                CompanionSave(c);
+                return 0;
+            }
+            if (c.dragging) {
+                c.dragging = false;
+                ReleaseCapture();
+                CompanionSave(c);
+                return 0;
+            }
+            if (c.pressActive) {
+                c.pressActive = false;
+                ReleaseCapture();
+                // Anywhere in the tray bar opens the same panel (user, 2026-11-15)
+                RECT r = c.rc;
+                AnchorPublish(kAnchorQuickSettings, &r, 8);
+                const BYTE chord[] = {VK_LWIN, 'A'};
+                DLog(L"tray bar: click -> quick settings (win+a)");
+                SendChord(chord, 2);
+                return 0;
+            }
+            return 0;
+
+        case WM_SETCURSOR: {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(h, &p);
+            RECT client;
+            GetClientRect(h, &client);
+            int e = EdgeAt(p, client);
+            if (e) {
+                LPCWSTR cur = IDC_ARROW;
+                if ((e & 1) && (e & 4)) cur = IDC_SIZENWSE;
+                else if ((e & 2) && (e & 4)) cur = IDC_SIZENESW;
+                else if ((e & 8) && (e & 1)) cur = IDC_SIZENESW;
+                else if ((e & 8) && (e & 2)) cur = IDC_SIZENWSE;
+                else if ((e & 1) || (e & 2)) cur = IDC_SIZEWE;
+                else cur = IDC_SIZENS;
+                SetCursor(LoadCursorW(nullptr, cur));
+                return TRUE;
+            }
+            break;
+        }
+
+        case WM_DESTROY:
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void CompanionCreate() {
+    Companion& c = g_trayBar;
+    CompanionLoad(c);
+    if (!c.enabled) return;
+
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = CompanionProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"DockTrayBarWindow";
+        RegisterClassExW(&wc);
+    }
+
+    int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
+    c.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                                 WS_EX_LAYERED,
+                             L"DockTrayBarWindow", L"dock tray bar", WS_POPUP, c.rc.left,
+                             c.rc.top, w, h, nullptr, nullptr, GetModuleHandleW(nullptr),
+                             nullptr);
+    if (!c.hwnd) {
+        DLog(L"tray bar: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
+        return;
+    }
+    c.alpha = 0;
+    c.alphaTarget = 0;
+    CompanionEnsureDib(c, w, h);
+    c.stateAt = 0;
+    TrayStateRefresh(GetTickCount());    // real state first, so the first paint is correct
+    TrayRepaint(c);
+    CompanionPresent(c);
+    CompanionTooltipEnsure(c);
+    ShowWindow(c.hwnd, SW_HIDE);
+    RECT r = c.rc;
+    AnchorPublish(kAnchorQuickSettings, &r, 8);
+    DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
+         (int)c.follow);
 }
 
 // ---------------------------------------------------------------- tray icons
@@ -6592,6 +7528,7 @@ static void RenderTick() {
             TrayMenuTick();
             LaunchWatchTick();
             FlushPendingUp(now);
+            CompanionTick(now);      // attached windows: follow, fade, tray state
             PressWatchTick();
             FocusWatchTick();
             if (g_trayRetryAt && (LONG)(now - g_trayRetryAt) >= 0) {
@@ -7368,6 +8305,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_alpha = 255;
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     Present();
+    CompanionCreate();       // the tray bar sits next to the strip, hidden until hovered
     StartFrameClock();      // drive the frames from a high-resolution timer
     TrayBridgeEnsureExists();   // own the block so nobody can hand us a bad DACL
     StartTrayWarmup(1500);   // fill the tray bridge table once the shell is up

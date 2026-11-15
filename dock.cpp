@@ -56,6 +56,7 @@
 static HWND g_hwnd;
 static void CompanionSaveAllPositions();      // defined with the companions
 static void CompanionFollowTo(int stripX, int stripY);   // ditto; called from Present()
+static void ShowSettings();                   // defined near the settings window
 static void* g_paintBits;
 static HWND g_setWnd;
 static int g_paintW, g_paintH;
@@ -1186,12 +1187,16 @@ static void FillRound4(const RECT& r, int radius, DWORD argb) {
     }
 }
 
-static int RadiusFor(int w, int h) {
+static int RadiusForPercent(int w, int h, int percent) {
     int side = w < h ? w : h;
-    int r = side * g_cfg.radius / 200;      // radius% of (short side / 2)
+    int r = side * percent / 200;      // radius% of (short side / 2)
     if (r < 0) r = 0;
     if (r > side / 2) r = side / 2;
     return r;
+}
+
+static int RadiusFor(int w, int h) {
+    return RadiusForPercent(w, h, g_cfg.radius);
 }
 // Corner rounding is per corner (top-left, top-right, bottom-left, bottom-right):
 // 1 = the configured radius, 0 = square. A strip pushed against the screen edge
@@ -2790,10 +2795,21 @@ struct Companion {
     DWORD stateAt = 0;
     DWORD netAt = 0;              // the WLAN query is expensive: its own, slower cadence
     bool visible = false;
+    // Per-window style overrides (R4): [traybar] radius/pad/gap. -1 = inherit from [dock],
+    // which is the "跟随条样式" default; the plan's "独立样式" hook is exactly this.
+    int padOv = -1, gapOv = -1, radiusOv = -1;
 };
 static Companion g_trayBar;
 
+// Style accessors: one place decides "override or inherit" for every drawing site.
+static int CompanionPad(const Companion& c) { return c.padOv >= 0 ? c.padOv : g_cfg.pad; }
+static int CompanionGap(const Companion& c) { return c.gapOv >= 0 ? c.gapOv : g_cfg.gap; }
+static int CompanionRadiusPercent(const Companion& c) {
+    return c.radiusOv >= 0 ? c.radiusOv : g_cfg.radius;
+}
+
 #define kTrayCellCount 3
+#define kTrayVolumeStep 2        // percent per wheel detent over the volume cell (user 2026-11-16)
 
 // forward declarations (the state poller repaints, and the painting code is further down)
 static void TrayRepaint(Companion& c);
@@ -2807,7 +2823,7 @@ static void QuickSettingsBeginPlacement(const RECT& button);
 static int CompanionIconPx(const Companion& c) {
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
     int shortSide = w < h ? w : h;
-    int icon = shortSide - g_cfg.pad * 2;
+    int icon = shortSide - CompanionPad(c) * 2;
     if (icon < g_cfg.minIcon) icon = g_cfg.minIcon;
     if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
     return icon;
@@ -2819,7 +2835,7 @@ static void TrayCells(const Companion& c, RECT out[kTrayCellCount]) {
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
     bool vertical = (h > w);
     int icon = CompanionIconPx(c);
-    int gap = g_cfg.gap;
+    int gap = CompanionGap(c);
     int cell = icon + gap;
     int span = kTrayCellCount * cell - gap;
     int startX = (w - span) / 2;
@@ -2836,28 +2852,51 @@ static void TrayCells(const Companion& c, RECT out[kTrayCellCount]) {
 }
 
 // ---------------------------------------------------------------- tray state
-static void QueryVolume() {
-    static IMMDeviceEnumerator* enumerator = nullptr;
-    static IAudioEndpointVolume* volume = nullptr;
-    if (!enumerator) {
+// The COM pointers live at file scope because the wheel handler writes through the same
+// interface the poller reads (both on the UI thread, so no marshalling).
+static IMMDeviceEnumerator* g_volEnum = nullptr;
+static IAudioEndpointVolume* g_vol = nullptr;
+static bool VolumeEnsure() {
+    if (!g_volEnum) {
         CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                         __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+                         __uuidof(IMMDeviceEnumerator), (void**)&g_volEnum);
     }
-    if (enumerator && !volume) {
+    if (g_volEnum && !g_vol) {
         IMMDevice* device = nullptr;
-        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) && device) {
-            device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&volume);
+        if (SUCCEEDED(g_volEnum->GetDefaultAudioEndpoint(eRender, eConsole, &device)) && device) {
+            device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&g_vol);
             device->Release();
         }
     }
-    if (!volume) return;
+    return g_vol != nullptr;
+}
+
+static void QueryVolume() {
+    if (!VolumeEnsure()) return;
     float scalar = 0;
     BOOL mute = FALSE;
-    if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&scalar))) {
+    if (SUCCEEDED(g_vol->GetMasterVolumeLevelScalar(&scalar))) {
         int pct = (int)(scalar * 100.0f + 0.5f);
         g_trayState.volPercent = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
     }
-    if (SUCCEEDED(volume->GetMute(&mute))) g_trayState.muted = mute != FALSE;
+    if (SUCCEEDED(g_vol->GetMute(&mute))) g_trayState.muted = mute != FALSE;
+}
+
+// Used by the wheel: one detent = 2 % (user, 2026-11-16).
+static bool SetVolumePercent(int pct) {
+    if (!VolumeEnsure()) return false;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (FAILED(g_vol->SetMasterVolumeLevelScalar(pct / 100.0f, nullptr))) return false;
+    g_trayState.volPercent = pct;
+    return true;
+}
+
+static bool SetMuted(bool muted) {
+    if (!VolumeEnsure()) return false;
+    if (FAILED(g_vol->SetMute(muted ? TRUE : FALSE, nullptr))) return false;
+    g_trayState.muted = muted;
+    return true;
 }
 
 static void QueryPower() {
@@ -3269,11 +3308,16 @@ static void CompanionSaveAllPositions() {
 static void CompanionLoad(Companion& c) {
     c.enabled = GetInt(c.iniSection, L"enabled", 1) != 0;
     c.follow = GetInt(c.iniSection, L"follow", 1) != 0;
+    // Style overrides (R4): absent (or negative) means "inherit the strip's style".
+    c.padOv = GetInt(c.iniSection, L"pad", -1);
+    c.gapOv = GetInt(c.iniSection, L"gap", -1);
+    c.radiusOv = GetInt(c.iniSection, L"radius", -1);
 
     int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
     if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
-    int defW = kTrayCellCount * (icon + g_cfg.gap) - g_cfg.gap + g_cfg.pad * 2;
-    int defH = icon + g_cfg.pad * 2;
+    int pad = CompanionPad(c), gap = CompanionGap(c);
+    int defW = kTrayCellCount * (icon + gap) - gap + pad * 2;
+    int defH = icon + pad * 2;
 
     int w = GetInt(c.iniSection, L"w", defW);
     int h = GetInt(c.iniSection, L"h", defH);
@@ -3308,7 +3352,8 @@ static void TrayRepaint(Companion& c) {
     // hovering/clicking the middle of a speaker would fall straight through to whatever is
     // behind. This wash (4% white, invisible against any wallpaper) makes the whole bar one
     // button, which is exactly what the user asked for ("clicking anywhere opens the menu").
-    FillRound(c.dc, all, RadiusFor(all.right, all.bottom), 0x0AFFFFFF);
+    FillRound(c.dc, all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
+             0x0AFFFFFF);
 
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
@@ -3653,20 +3698,21 @@ static void GroupBoxScaleTo(POINT cur) {
     // No member may fall below its own minimum: the strip and the companion both clamp at
     // minIcon + 2*pad on any side (same rule their own edge drags use).
     int minSide = g_cfg.minIcon + g_cfg.pad * 2;
+    int compMinSide = g_cfg.minIcon + CompanionPad(g_trayBar) * 2;
     double sxMin = 0.0, syMin = 0.0;
-    auto account = [&](const RECT& m0) {
+    auto account = [&](const RECT& m0, int memberMin) {
         int w0 = m0.right - m0.left, h0 = m0.bottom - m0.top;
         if (w0 > 0) {
-            double f = (double)minSide / w0;
+            double f = (double)memberMin / w0;
             if (f > sxMin) sxMin = f;
         }
         if (h0 > 0) {
-            double f = (double)minSide / h0;
+            double f = (double)memberMin / h0;
             if (f > syMin) syMin = f;
         }
     };
-    account(g_boxScale.strip0);
-    if (g_trayBar.hwnd && g_trayBar.enabled) account(g_boxScale.comp0);
+    account(g_boxScale.strip0, minSide);
+    if (g_trayBar.hwnd && g_trayBar.enabled) account(g_boxScale.comp0, compMinSide);
 
     double sx = (double)wantW / bb0w;
     double sy = (double)wantH / bb0h;
@@ -3848,6 +3894,63 @@ static void GroupBoxCreate() {
          (long)g_groupBox.rc.left, (long)g_groupBox.rc.top,
          (long)(g_groupBox.rc.right - g_groupBox.rc.left),
          (long)(g_groupBox.rc.bottom - g_groupBox.rc.top), GroupBoxGrabBand());
+}
+
+// ---------------------------------------------------------------- companion menu (R4)
+// Right-click on the tray bar: its own settings. Everything here takes effect immediately and
+// is written to the ini, so a restart keeps it. (The ini-only route was R1's stopgap; the plan
+// parked the UI until "the fully transparent profile can host a menu", which the tray bar can:
+// its whole surface carries the 4% wash, so a right click always lands.)
+#define kCmdFollow 1
+#define kCmdSize 2
+#define kCmdFrame 3
+#define kCmdSettings 4
+static void CompanionShowMenu(Companion& c) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | (c.follow ? MF_CHECKED : 0), kCmdFollow, L"跟随条（在组内）");
+    AppendMenuW(menu, MF_STRING, kCmdSize, L"重置为默认尺寸（3 格）");
+    AppendMenuW(menu, MF_STRING | (g_groupBox.enabled ? MF_CHECKED : 0), kCmdFrame,
+                L"显示组框");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdSettings, L"Dock 设置…");
+    POINT sp{};
+    GetCursorPos(&sp);
+    g_popupOpen = true;
+    int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, c.hwnd,
+                                  nullptr);
+    g_popupOpen = false;
+    DestroyMenu(menu);
+    if (cmd <= 0) return;
+    if (cmd == kCmdFollow) {
+        c.follow = !c.follow;
+        CompanionSave(c);            // persists follow=
+        GroupBoxRecompute();         // an independent companion leaves the frame
+        DLog(L"tray bar: menu -> follow=%d", (int)c.follow);
+    } else if (cmd == kCmdSize) {
+        int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
+        if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
+        int pad = CompanionPad(c), gap = CompanionGap(c);
+        int w = kTrayCellCount * (icon + gap) - gap + pad * 2;
+        int h = icon + pad * 2;
+        CompanionSetRect(c, c.rc.left, c.rc.top, w, h, true);
+        CompanionSave(c);
+        GroupBoxRecompute();
+        DLog(L"tray bar: menu -> default size %dx%d", w, h);
+    } else if (cmd == kCmdFrame) {
+        g_groupBox.enabled = !g_groupBox.enabled;
+        WritePrivateProfileStringW(L"group", L"enabled", g_groupBox.enabled ? L"1" : L"0",
+                                   g_iniPath.c_str());
+        if (g_groupBox.enabled) {
+            GroupBoxRecompute();
+        } else {
+            g_groupBox.alphaTarget = 0;
+            g_groupBox.alpha = 0;
+            if (g_groupBox.hwnd) ShowWindow(g_groupBox.hwnd, SW_HIDE);
+        }
+        DLog(L"group box: menu -> enabled=%d", (int)g_groupBox.enabled);
+    } else if (cmd == kCmdSettings) {
+        ShowSettings();
+    }
 }
 
 // ---------------------------------------------------------------- visibility
@@ -4069,7 +4172,7 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (c.resizeEdge & 2) r.right += dx;
                 if (c.resizeEdge & 4) r.top += dy;
                 if (c.resizeEdge & 8) r.bottom += dy;
-                int minSide = g_cfg.minIcon + g_cfg.pad * 2;
+                int minSide = g_cfg.minIcon + CompanionPad(c) * 2;
                 if (r.right - r.left < minSide) {
                     if (c.resizeEdge & 1) r.left = r.right - minSide;
                     else r.right = r.left + minSide;
@@ -4187,6 +4290,50 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
 
+        case WM_RBUTTONUP:
+            // The tray bar's own settings menu (R4). Its whole surface carries the 4% wash, so
+            // a right click always lands here - unlike the strip's transparent blank space.
+            CompanionShowMenu(c);
+            return 0;
+
+        case WM_MOUSEWHEEL: {
+            // Wheel over the volume cell: +/- 2 % per detent (user, 2026-11-16). The wheel
+            // reaches a never-focused window because this machine scrolls the window under the
+            // pointer (the same reason the strip can be paged without focus).
+            // Careful: WM_MOUSEWHEEL's point is in *screen* coordinates, unlike the buttons.
+            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(h, &p);
+            RECT cells[kTrayCellCount];
+            TrayCells(c, cells);
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            {
+                // First few wheels are logged: "the wheel never arrives" and "the point is
+                // outside the volume cell" look identical from the outside.
+                static int wheelLogged = 0;
+                if (wheelLogged < 10) {
+                    wheelLogged++;
+                    DLog(L"tray bar: WM_MOUSEWHEEL delta=%d at client %ld,%ld volumeCell=%d",
+                         delta, (long)p.x, (long)p.y, (int)(PtInRect(&cells[1], p) != FALSE));
+                }
+            }
+            if (delta == 0 || !PtInRect(&cells[1], p)) break;   // volume cell only
+            int notches = delta / WHEEL_DELTA;
+            if (notches == 0) notches = delta > 0 ? 1 : -1;
+            int step = notches * kTrayVolumeStep;
+            // Scrolling up while muted is a request to hear something: leave mute first,
+            // otherwise the wheel looks broken.
+            if (step > 0 && g_trayState.muted) SetMuted(false);
+            if (SetVolumePercent(g_trayState.volPercent + step)) {
+                c.stateAt = GetTickCount();      // we are the freshest value now
+                TrayRepaint(c);
+                CompanionPresent(c);
+                CompanionTooltipShow(c, 1);      // keep the tooltip honest while scrolling
+                DLog(L"tray bar: wheel %+d%% -> %d%% (mute=%d)", step, g_trayState.volPercent,
+                     (int)g_trayState.muted);
+            }
+            return 0;
+        }
+
         case WM_SETCURSOR: {
             POINT p{};
             GetCursorPos(&p);
@@ -4253,6 +4400,12 @@ static void CompanionCreate() {
     AnchorPublish(kAnchorQuickSettings, &r, 8);
     DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
          (int)c.follow);
+    // Which style actually applies (R4 overrides): one line, so "did my ini key take effect"
+    // never needs a screenshot.
+    DLog(L"tray bar: style pad=%d gap=%d radius=%d%% -> corner %d px (overrides pad=%d gap=%d "
+         L"radius=%d)",
+         CompanionPad(c), CompanionGap(c), CompanionRadiusPercent(c),
+         RadiusForPercent(w, h, CompanionRadiusPercent(c)), c.padOv, c.gapOv, c.radiusOv);
     // R2: the frame around "the strip + this companion". It needs the companion to exist (a
     // frame around the strip alone is not drawn), so it is created from here, not from WinMain.
     GroupBoxCreate();

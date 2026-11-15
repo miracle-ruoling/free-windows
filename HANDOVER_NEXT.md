@@ -23,7 +23,7 @@
   - **开始菜单 / Win+X / 快速设置** 三个 shell 弹窗都能**跟着条上的按钮**摆位置（§3.2、§3.4、§3.7）；
   - **附属窗口框架 + 托盘三合一**（网络/音量/电量）：独立小窗、真实状态、悬停 tooltip、
     点击弹快速设置、可拖动/拉伸、跟随条位移、鼠标上条淡入（§3.7、`PLAN_COMPANION.md`）。
-- **本轮修掉/做完**（2026-11-16 00:0x–00:4x）：
+- **本轮修掉/做完**（2026-11-16 00:0x–01:0x）：
   1. **拖条时托盘小窗像 30fps** 的遗留 bug。根因是"跟随"跑在 16 ms 的清理节流门里
      （实测小窗 40.7 次/秒 vs 条 111.4 次/秒），修法是把跟随搬进 `Present()`（每帧、和条的位移同一次合成）。
      修完 105.7 vs 105.7、偏移漂移 0 px。见 §3.7 末尾的"修复记录"。
@@ -33,8 +33,10 @@
      —— 条的外框直接变，图标格数会跳（用户已同意）；对边固定；缩到成员最小值就停。见 §3.9。
   4. **快速拉框边时小窗闪没**（用户报的 bug）：可见性白名单漏了"组缩放进行中"，框边落后光标 → 误判"离开组"。
      修完同条件隐藏比例 71.7% → 0%。见 §3.9 末尾。
-- **下一步待办**：R4（图标精细度：wifi 格数/有线切换/静音/电量档位、文案、每窗口 ini 覆盖项、右键设置 UI）。
-  详见 `PLAN_COMPANION.md`。用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
+  5. **R4**：音量滚轮（音格上每格 ±2%）、`[traybar] radius/pad/gap` 每窗口样式覆盖、小窗右键菜单
+     （跟随/重置尺寸/显示组框/Dock 设置）。用户砍掉了 wifi 格数与电量档位（三态与 tooltip 已够）。见 §3.10。
+- **下一步待办**：没有排定的轮次了 —— R1–R4 全部完成。候补（要用户点头才做）：
+  设置面板里给新键加行（`[group]`/`[traybar]` 目前只能改 ini + 重启）、框边悬停高亮、组内更多附属窗口。
 
 ---
 
@@ -64,10 +66,12 @@
 | 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
 | ini `[group]` | `enabled=1 / margin=8 / lineAlpha=64 / lineWidth=1 / radius=12`（R2 组框 + R3 缩放把手；**margin 同时是抓取环宽度**，调成 0 = 关掉组缩放；**改完要重启 dock**） |
+| ini `[traybar]` | 位置/尺寸 + `enabled/follow/hasPos`；**R4 新增样式覆盖** `radius / pad / gap`（不写或 -1 = 继承 `[dock]`；**改完要重启 dock**） |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`（R3）组缩放` → `f96388f` R2 组框 → `9d9be89` 修拖条时小窗掉帧 + follow 探针 → `8d4dced` 交接文档 →
+最近提交（倒序）：`（R4）音量滚轮 + 样式覆盖 + 右键菜单` → `089131d` 修快速拉框边闪没 →
+`bdd8233` R3 组缩放 → `f96388f` R2 组框 → `9d9be89` 修拖条时小窗掉帧 + follow 探针 → `8d4dced` 交接文档 →
 `53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
 `b9f6195` 去每帧日志 + mod actionCenter=dock → `ba9848e` R1 附属窗口+托盘三合一 →
 `469ca7b` 计划文档 → `fb00bd1` 竖条修复 → `4f29f0a` 锚点 v2 + Win+X → `2d9941f` 首格 Win 按钮。
@@ -486,6 +490,34 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ---
 
+### 3.10 R4（2026-11-16 01:0x）：音量滚轮 + 每窗口样式覆盖 + 右键菜单
+
+**用户这一轮砍掉/新增的**
+- 砍掉：**wifi 格数**（只要"WLAN / 有线 / 未连接"三态，早就有了）、**电量档位**（悬浮 tooltip 就能看）。
+- 澄清（本来就已经实现、不用做）：**有线切换** = 按当前连接换图标（`E874`/`E839`/`E871`）；
+  **文案** = tooltip 文字（`SEU-WLAN（信号 84%）` / `以太网` / `未连接` / `音量：8%` / `音量：静音` / `电池：99%，正在充电`）。
+- 新增：**悬浮在音量格上滚轮 = 每格 ±2% 音量**。
+
+| 项 | 实现 | 证据 |
+|---|---|---|
+| 音量滚轮 | `WM_MOUSEWHEEL`（**注意 lParam 是屏幕坐标**）→ 只认第 2 格（音量）→ `kTrayVolumeStep=2`；往上滚时如果静音先取消静音（否则"看着没反应"）；改完立刻重画 + 刷新 tooltip + 打一条 `tray bar: wheel +2% -> 12%` 日志 | 注入 3 格：`8% → 10% → 12% → 14%`；再 −1 ×3 回到 `8%`。探针 `dev/t_wheel.ps1 -X -Y -Notches` |
+| 滚轮能到未聚焦窗口 | 本机开着"悬停在非活动窗口上时滚动它"，条一直靠这条吃滚轮（翻页），小窗同理——不用 hook、不用抢焦点 | 同一次注入里先验了条：`scroll=0 → 2` |
+| 每窗口样式覆盖 | 新 ini 键 **`[traybar] radius / pad / gap`**，**不写或 -1 = 继承 `[dock]`**；集中在 `CompanionPad/Gap/RadiusPercent()`，绘制、`TrayCells()`、自身最小尺寸、组缩放的最小值都走它 | 日志 `tray bar: style pad=4 gap=6 radius=200% -> corner 37 px (overrides pad=4 gap=-1 radius=200)`；恢复后 `pad=10 gap=6 radius=77% -> corner 28 px (overrides -1/-1/-1)`；截图 `dev/traybar_override.png`（pad=4 时图标明显变大） |
+| 右键菜单 | `CompanionShowMenu()`：`跟随条（在组内）`（勾选）/ `重置为默认尺寸（3 格）` / `显示组框`（勾选）/ `Dock 设置…`；每项立即生效并写回 ini；`g_popupOpen` 期间抑制缩略图 | 菜单截图 `dev/compmenu_open.png`；点"显示组框"→ `group box: menu -> enabled=0`，框 `visible=True → False`；再点 → `enabled=1`，悬停条后 `visible=True` 且几何 `exact`。探针 `dev/t_rclick.ps1`、`dev/t_menupick.ps1` |
+| 新增一行启动日志 | `tray bar: style pad=… gap=… radius=…% -> corner … px (overrides …)`：以后"我的 ini 到底生效了没"不用截图 | 见上 |
+
+**坑**
+- `WM_MOUSEWHEEL` 的坐标是**屏幕坐标**（其它鼠标消息是客户区），忘了转换就会"只有在某个位置滚才有效"。
+- 小窗的滚轮测试必须**先把光标停在条上**再移过去：小窗隐藏时那个点上是别的窗口（第一次测试就是这么
+  把滚轮发给了 Chrome，日志里什么都没有）。
+- `重置为默认尺寸` 用 `kTrayCellCount*(icon+gap)-gap+pad*2`，和 `CompanionLoad()` 的默认值同一公式；
+  改了公式要两处一起改。
+
+**未由人手复核**：滚轮手感（一格 2% 是否合适）、右键菜单的排版/文案、`跟随条` 与 `重置尺寸` 两个菜单项
+机器上没有点过（只点了"显示组框"，因为它可逆且不动尺寸）。
+
+---
+
 ## 4. 改代码前必须知道的 11 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -548,6 +580,9 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_groupbox_live.ps1 [-Dx -Dy]`** | 【R2】拖小窗时框是否**实时**跟随：20 万次/秒采样"框 vs 成员外接 + margin"，报告偏离 >1px 的采样数与段数（松手才重算会是一整段） |
 | **`t_groupscale.ps1 [-Edge right\|left\|bottom\|corner] [-Dx -Dy]`** | 【R3】拖框的边/角缩放整组：打印三个窗口的缩放比例、对边是否固定、`frame == members + margin`；同时验证抓取环吃按下、框内空白仍穿透 |
 | **`t_groupscale_fast.ps1 [-Dx -Ms]`** | 【R3 修 bug 用】快速拉框边（默认 700px/250ms ≈ 2800 px/s）时采样小窗/框的可见性，输出"拖动过程中被隐藏的采样比例"，正确的实现必须是 0% |
+| **`t_wheel.ps1 -X -Y -Notches`** | 【R4】在某个屏幕点注入滚轮（正数向上）。先去把光标停在条上再移过去，否则小窗是隐藏的、滚轮会发给下面的窗口 |
+| **`t_rclick.ps1 -X -Y`** | 【R4】先扫过条再右键某个点，**故意把菜单留着不关**（另一个进程截图用），再用 Esc 关 |
+| **`t_compmenu.ps1 -X -Y -PickX -PickY`** | 【R4】右键开小窗菜单 + 点某一项，前后打印框的可见性（验证"菜单命令真的执行了"）。**别叫它 `t_menupick.ps1`——那个名字早就被 App 菜单探针占了** |
 | **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |

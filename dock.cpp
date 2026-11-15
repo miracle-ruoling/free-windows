@@ -5005,22 +5005,28 @@ static void ShrinkToIcons() {
     if (!FullyTransparent()) return;                    // only when invisible
     RECT wr{};
     if (!GetWindowRect(g_hwnd, &wr)) return;
+    int oldW = wr.right - wr.left, oldH = wr.bottom - wr.top;
     ComputeButtons();
     int cells = (int)g_slots.size();
     if (cells < 1) return;
     const int pad = g_cfg.pad, gap = g_cfg.gap;
     int span = cells * (g_iconPx + gap) - gap;
+    // Orientation comes from the shape that was just dragged, NOT from the ini key: the
+    // strip is rotated by resizing it, and the ini value is only what the last session
+    // ended with (nothing updates it while dragging). Reading the key here made a tall
+    // strip snap back to a wide one the moment the button was released.
+    bool vertical = (oldH > oldW);
+    g_cfg.vertical = vertical ? 1 : 0;
     int tw, th;
-    if (g_cfg.vertical) { th = span + pad * 2; tw = g_iconPx + pad * 2; }
+    if (vertical) { th = span + pad * 2; tw = g_iconPx + pad * 2; }
     else { tw = span + pad * 2; th = g_iconPx + pad * 2; }
-    int oldW = wr.right - wr.left, oldH = wr.bottom - wr.top;
     if (tw == oldW && th == oldH) return;
     if (tw <= 0 || th <= 0) return;
     // keep the centre where it was, so the strip settles instead of jumping to one side
     int x = wr.left + (oldW - tw) / 2;
     int y = wr.top + (oldH - th) / 2;
-    DLog(L"shrink: %dx%d -> %dx%d at %d,%d (transparent strip hugs its icons)",
-         oldW, oldH, tw, th, x, y);
+    DLog(L"shrink: %dx%d -> %dx%d at %d,%d (transparent strip hugs its icons, vertical=%d)",
+         oldW, oldH, tw, th, x, y, (int)vertical);
     g_cfg.x = x;
     g_cfg.y = y;
     g_cfg.w = tw;

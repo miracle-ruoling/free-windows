@@ -450,6 +450,8 @@ dumpBake=0
 49. **开始菜单 / Win+X 菜单搬不动**：两个都是 shell 的 XAML 窗口（`Windows.UI.Core.CoreWindow` / `Xaml_WindowedPopupClass`），`SetWindowPos` 要么被驳回（矩形不变），要么矩形变了但**画面一像素不动**（整屏截图逐字节相同）。想让它们出现在指定位置只能 hook shell 的布局函数。详见 `HANDOVER_NEXT.md` §3.2。
 50. **`EnumWindows` 看不见"正在显示"的那批 shell 窗口**：Start/Search 面板、展开状态的任务栏都枚举不到（`GetForegroundWindow`、`GetWindowRect`、`PostMessage` 却都正常）。所以：①判断"任务栏在不在屏上"要用**记下来的 handle** + `GetWindowRect`（`y≈1020` = 展开、`y≈1078` = 收起），不要靠枚举；②`FindWindow("Shell_TrayWnd")` 在这两种状态下都可能返回 0。
 51. **`dev/logtail.ps1` 只输出最后 25 行且不认 `-Lines`**：想确认"某条日志出现没出现"必须用 `dev/loggrep.ps1 -Pattern <正则>`，否则会得出"日志里没有"的错误结论（本轮踩过）。
+52. **`ShrinkToIcons()` 的方向曾经读 ini 的 `dock.vertical`**（只在 `LoadConfig()` 写、拖动时不更新）→ 全透明档里把条拉成竖的，松手会被压回横条。现在改成按**当前窗口形状**（`oldH > oldW`）判断。凡是"松手后形状/尺寸突变"的问题，先看这里。
+53. **Windows 的 shell 弹窗有两套完全不同的定位机制**：开始菜单是 XAML 画布里的 frame（改 XAML 的 alignment/margin/transform），Win+X 是 explorer 的真窗口（在进程内改写 `SetWindowPos` 的坐标）。**别指望一个办法通吃**；判断依据：`WindowFromPoint` 看这块像素属于哪个窗口、挪一下窗口看画面跟不跟。
 
 ## 6. 代码地图（`dock.cpp`）
 

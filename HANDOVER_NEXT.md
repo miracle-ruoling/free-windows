@@ -1,15 +1,15 @@
 # 交接：下一轮从这里开始
 
-> 写于 2026-11-15 23:40，2026-11-16 00:1x 更新（本轮做完：Win+X 锚定、**附属窗口 + 托盘三合一（R1）**、
-> 快速设置面板锚定与测量；**并修掉了上一版留的 bug：拖条时托盘小窗掉帧**）。
+> 写于 2026-11-15 23:40，2026-11-16 00:2x 更新（本轮做完：Win+X 锚定、**附属窗口 + 托盘三合一（R1）**、
+> 快速设置面板锚定与测量；**修掉"拖条时小窗掉帧"**；**R2 组框**）。
 > 上一轮（图标拖动重排 + 动效 + 边界滚入）的过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，
 > **别重读历史排查**，看本文即可。
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
-> **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（含修复记录与测量脚本）** →
-> §4（改代码前必须知道的 10 件事）→ `PLAN_COMPANION.md` 的 R1 现状与 R2/R3 计划。
-> 然后从 `PLAN_COMPANION.md` 的 R2（组框）开始。
+> **新对话第一件事（3 分钟）**：读本文 §0 → §2 → **§3.7（小窗跟随修复 + 测量脚本）** →
+> **§3.8（R2 组框）** → §4（改代码前必须知道的 10 件事）→ `PLAN_COMPANION.md` 的 R1/R2 现状与 R3 计划。
+> 然后从 `PLAN_COMPANION.md` 的 R3（组缩放）开始。
 
 ---
 
@@ -23,12 +23,14 @@
   - **开始菜单 / Win+X / 快速设置** 三个 shell 弹窗都能**跟着条上的按钮**摆位置（§3.2、§3.4、§3.7）；
   - **附属窗口框架 + 托盘三合一**（网络/音量/电量）：独立小窗、真实状态、悬停 tooltip、
     点击弹快速设置、可拖动/拉伸、跟随条位移、鼠标上条淡入（§3.7、`PLAN_COMPANION.md`）。
-- **本轮修掉**（2026-11-16 00:0x）：**拖条时托盘小窗像 30fps** 的遗留 bug。
-  根因是"跟随"跑在 16 ms 的清理节流门里（实测小窗 40.7 次/秒 vs 条 111.4 次/秒），
-  修法是把跟随搬进 `Present()`（每帧、和条的位移同一次合成）。修完 105.7 vs 105.7、偏移漂移 0 px。
-  见 §3.7 末尾的"修复记录"。
-- **下一步待办**：①组框（R2）；②组缩放（R3）；③图标精细度（R4）。详见 `PLAN_COMPANION.md`。
-  用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
+- **本轮修掉/做完**（2026-11-16 00:0x–00:2x）：
+  1. **拖条时托盘小窗像 30fps** 的遗留 bug。根因是"跟随"跑在 16 ms 的清理节流门里
+     （实测小窗 40.7 次/秒 vs 条 111.4 次/秒），修法是把跟随搬进 `Present()`（每帧、和条的位移同一次合成）。
+     修完 105.7 vs 105.7、偏移漂移 0 px。见 §3.7 末尾的"修复记录"。
+  2. **R2 组框**：条 + 所有跟随窗口的外接矩形（+margin）画一圈 1px 圆角框，内部完全穿透，
+     框内空白算"在组里"（鼠标从条走去小窗不会让小窗消失），拖小窗时框实时重算。见 §3.8。
+- **下一步待办**：①R3 组缩放（拖框边按比例缩放成员 + 条加入组）；②R4 图标精细度/设置 UI。
+  详见 `PLAN_COMPANION.md`。用户 2026-11-15 已确认：媒体卡片去不掉、接受；纵向锚定走"测量"方案。
 
 ---
 
@@ -57,10 +59,11 @@
 | 条 | 实测 `x=842 y=184 w=716 h=92`（用户会自己摆，别当固定值；`layout:` 行给的是 client 坐标） |
 | 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
+| ini `[group]` | `enabled=1 / margin=8 / lineAlpha=64 / lineWidth=1 / radius=12`（R2 组框；**改完要重启 dock**） |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`（本轮）修拖条时小窗跟随掉帧 + follow 探针` → `8d4dced` 交接文档 →
+最近提交（倒序）：`（R2）组框` → `9d9be89` 修拖条时小窗掉帧 + follow 探针 → `8d4dced` 交接文档 →
 `53c27cb` 快速设置测量+挪窗口 → `2e175a4` 托盘状态轮询降频 →
 `b9f6195` 去每帧日志 + mod actionCenter=dock → `ba9848e` R1 附属窗口+托盘三合一 →
 `469ca7b` 计划文档 → `fb00bd1` 竖条修复 → `4f29f0a` 锚点 v2 + Win+X → `2d9941f` 首格 Win 按钮。
@@ -376,6 +379,48 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ---
 
+### 3.8 组框 R2（2026-11-16 00:2x）
+
+**语义（用户 2026-11-16 00:1x 原话整理 + 5 个拍板）**
+- 平时**只有条**按鼠标距离淡出淡入；组里的其他小窗**只有在鼠标上条**（= 用户想跟 dock 交互）时才**迅速淡入**，
+  而且**只有鼠标移出组框**才淡出 —— 这样"从条走去看小窗"的路上不会让小窗在光标底下消失。
+- 拍板：①**框内空白算"在组里"**（严格按上面那条，副作用是框很大时那片空白会让条保持不透明）；
+  ②框线 **1px / 圆角 12 / 白色 ~25%**；③本轮**只做框**（出现、穿透、显隐联动），拖框边缩放留到 R3；
+  ④组里只有条时**不画框**；⑤拖/拉小窗时框**实时**跟着变。
+
+**实现落点（`dock.cpp` 的 `// ---- group box (R2)` 段，紧跟 companions 之后）**
+
+| 项 | 关键点 |
+|---|---|
+| 数据 | `GroupBox g_groupBox`；ini 新节 **`[group]`**：`enabled/margin/lineAlpha/lineWidth/radius`（默认 1/8/64/1/12，**改完要重启**） |
+| 几何 | `GroupBoxMembers()` = 条 + 所有 `enabled && follow` 成员的**外接矩形**；`GroupBoxRect()` 再外扩 `margin`；没有 follow 成员 → false（= 不画） |
+| 窗口 | `DockGroupBoxWindow`，`WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE|`**`TRANSPARENT`**，**尺寸就是框矩形**（不做全屏窗口） |
+| 绘制 | `FillRoundRing()`（新原语，和 `FillRound` 同一套子像素覆盖：外圆角距离 - 内缩圆角距离 = 环）；**只扫边框带**（`radius+lineWidth+2` 厚），成本按周长算；内部严格 alpha=0 |
+| 同帧跟随 | `CompanionFollowTo()` 里多一句 `GroupBoxTranslate(dx,dy)`：条一帧移动多少，框就平移多少（**同一份 delta 记账**，和第 3.7 的修复同一个位置） |
+| 实时重算 | 成员被拖动/拉伸、条的尺寸变化（`CompanionTick` 里的尺寸比较兜底）、组刚显示 → `GroupBoxRecompute()` |
+| 显隐 | `CompanionVisibilityTick()` 里：`GroupBoxRect()` 就是"在组里"的判据（框内空白也算）；框的 alpha 和小窗用**同一个 target、同一个步进**（~120ms）；z 序 条 > 小窗 > 框 |
+| 输入 | `WM_NCHITTEST → HTTRANSPARENT` + `WS_EX_TRANSPARENT`：本轮框**一点点击都不吃**（连 1px 线也不吃）。R3 把边线变成缩放把手时要**去掉 `WS_EX_TRANSPARENT`** 并改 `HTCLIENT` |
+
+**证据（都在 `dev/`）**
+- `t_groupbox.ps1`：`geometry matches the members + margin 8: True`；框内 `WindowFromPoint` → 底下的窗口（条/Chrome）；
+  **鼠标停在框内空白处（826,292）→ 框和小窗都还 visible**；离开框 25px → 两者都 `visible=False`。
+- `t_followfps.ps1`（现同时采三个窗口）：拖条时 `strip 102.1/s | companion 102.1/s | frame 101.4/s`，
+  `frame mean 0.01px max 4px`，结束时 `frame 798,136-1543,298 expected ... -> exact`。
+- `t_groupbox_live.ps1 -Dx 150 -Dy 80`：约 100 万个采样里 **2036 个（0.2%）偏离 >1px，分 3 段**（约 10ms 总计）
+  —— 就是"逐条消息重算"的 1–2 帧中间态；若是松手才重算会是一整段 1.2s。
+- 外观：`dev/groupbox_corner.png`（框左上角 8× 放大：1px、圆角 12、~25% 白，抗锯齿无台阶）。
+- 开销：空闲 0.6–0.9% 单核（改前 0.5%）；拖条 10 秒 13–19%（改前 13–16%，窗口不同不可精确对比，同档）。
+  框的窗口在隐藏时**零成本**（只在 `CompanionTick` 里被 `GetWindowRect` 顺手看一下尺寸）。
+
+**这轮踩到/要注意的**
+- 框窗口**必须** `WS_EX_TRANSPARENT`（本轮）：否则 1px 边框线会吃掉点在那条线上的点击
+  （`WindowFromPoint` 会返回框自己；实测加了之后返回的是底下窗口）。
+- `FillRoundRing` 千万别写成整块遍历：框可以到 900×300，成员一拖动就是**每条消息**一次重绘。
+- 框的几何**不能**用"当前 GetWindowRect(条)"在 `Present()` 里算：那一刻条的矩形还是旧的（ULW 还没跑），
+  只能用 delta 平移（`GroupBoxTranslate`）。重算只在"事件"里做（显示、成员拖动/拉伸、条的尺寸变化）。
+
+---
+
 ## 4. 改代码前必须知道的 10 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -425,6 +470,8 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_dragfps.ps1 -Target traybar\|strip`** | 【本轮】只量一个窗口自己的位移更新率，判断"拖动本身有没有被节流" |
 | **`t_walk.ps1 -Class -X -Y [-GrabX -GrabY]`** | 【本轮】用真拖动把窗口挪到指定坐标（`SetWindowPos` 会被 ini 覆盖，只有拖动路径才持久化）。抓取点默认 `layout:` 的 chevron 中心，**但透明档里那里是字形的洞**，按不动就用 `-GrabX 46 -GrabY 46`（Win 按钮）。注意两者的抓取偏移记录时机不同（条在 `LBUTTONDOWN`、小窗在越过阈值那一下），脚本里按类偏 6 px —— 记错就会正好差 6 px |
 | **`t_hit_at.ps1 x y …`** | 【本轮】一堆屏幕点的 `WindowFromPoint`：透明档里判断"这个像素能不能点"最快的办法 |
+| **`t_groupbox.ps1 [-Margin 8]`** | 【R2】组框四连检查：几何 == 成员外接 + margin、内部点击是否穿透、鼠标停在框内空白处是否保持显示、离开框 25px 是否淡出 |
+| **`t_groupbox_live.ps1 [-Dx -Dy]`** | 【R2】拖小窗时框是否**实时**跟随：20 万次/秒采样"框 vs 成员外接 + margin"，报告偏离 >1px 的采样数与段数（松手才重算会是一整段） |
 | **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |

@@ -1103,6 +1103,60 @@ static void FillRound(HDC dc, const RECT& r, int radius, DWORD argb) {
     }
 }
 
+// A 1 px (or thicker) rounded outline, antialiased the same way FillRound is: two signed
+// distances - the outer rounded rect and the same shape inset by `thickness` - and the ring is
+// their difference. Only the border band is visited: the group frame is repainted whenever a
+// member is dragged, so this has to stay proportional to the perimeter, not to the area.
+static void FillRoundRing(int w, int h, int radius, int thickness, DWORD argb) {
+    if (w <= 0 || h <= 0) return;
+    if (thickness < 1) thickness = 1;
+    int maxR = (w < h ? w : h) / 2;
+    if (radius > maxR) radius = maxR;
+    if (radius < 0) radius = 0;
+    int iw = w - 2 * thickness, ih = h - 2 * thickness;
+    int iR = radius - thickness;
+    if (iR < 0) iR = 0;
+    DWORD baseA = (argb >> 24) & 0xFF;
+    double R = radius;
+    int band = radius + thickness + 2;
+    for (int y = 0; y < h; y++) {
+        bool rowBand = (y < band) || (y >= h - band);
+        for (int x = 0; x < w; x++) {
+            if (!rowBand && x >= band && x < w - band) {
+                x = w - band - 1;            // jump across the empty middle of the row
+                continue;
+            }
+            double qx = fabs(x + 0.5 - w / 2.0) - (w / 2.0 - R);
+            double qy = fabs(y + 0.5 - h / 2.0) - (h / 2.0 - R);
+            double ax = qx > 0 ? qx : 0, ay = qy > 0 ? qy : 0;
+            double corner = qx > qy ? qx : qy;
+            if (corner > 0) corner = 0;
+            double dOut = sqrt(ax * ax + ay * ay) + corner - R;
+            double covOut = 0.5 - dOut;
+            if (covOut <= 0) continue;
+            if (covOut > 1) covOut = 1;
+            double covIn = 0;
+            if (iw > 0 && ih > 0) {
+                double ix = x + 0.5 - thickness, iy = y + 0.5 - thickness;
+                double jx = fabs(ix - iw / 2.0) - (iw / 2.0 - iR);
+                double jy = fabs(iy - ih / 2.0) - (ih / 2.0 - iR);
+                double bx = jx > 0 ? jx : 0, by = jy > 0 ? jy : 0;
+                double inner = jx > jy ? jx : jy;
+                if (inner > 0) inner = 0;
+                double dIn = sqrt(bx * bx + by * by) + inner - iR;
+                covIn = 0.5 - dIn;
+                if (covIn < 0) covIn = 0;
+                if (covIn > 1) covIn = 1;
+            }
+            double cov = covOut * (1.0 - covIn);
+            if (cov <= 0) continue;
+            DWORD a = (DWORD)(baseA * cov);
+            if (!a) continue;
+            SetPixelPremul(x, y, (a << 24) | (argb & 0x00FFFFFF));
+        }
+    }
+}
+
 // Same as FillRound, but each corner uses its own animated radius (TL, TR, BL, BR).
 static int CornerRadiusAt(int x, int y, int w, int h, int radius);
 
@@ -2744,6 +2798,8 @@ static Companion g_trayBar;
 // forward declarations (the state poller repaints, and the painting code is further down)
 static void TrayRepaint(Companion& c);
 static void CompanionPresent(Companion& c);
+// the group frame (R2) is derived geometry: "the strip + every following companion"
+static bool GroupBoxRect(RECT* out);
 // quick settings placement (defined after the companions: it needs the capture helpers)
 static void QuickSettingsBeginPlacement(const RECT& button);
 
@@ -3143,10 +3199,15 @@ static void CompanionPresent(Companion& c) {
     UpdateLayeredWindow(c.hwnd, nullptr, &dst, &size, c.dc, &src, 0, &bf, ULW_ALPHA);
 }
 
-static bool CursorInCompanionGroup() {    if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return false;
+static bool CursorInCompanionGroup() {
+    if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return false;
     if (g_trayBar.alpha <= 0) return false;      // nothing of ours is on screen
     POINT p{};
     if (!GetCursorPos(&p)) return false;
+    // "The group" is the visible frame now (user, 2026-11-16): anywhere inside it - including
+    // the empty space between the strip and a companion - keeps the strip at full strength.
+    RECT box{};
+    if (GroupBoxRect(&box)) return PtInRect(&box, p) != FALSE;
     RECT group{};
     if (!GetWindowRect(g_hwnd, &group)) return false;
     UnionRect(&group, &group, &g_trayBar.rc);
@@ -3326,10 +3387,228 @@ static void CompanionTooltipShow(Companion& c, int cell) {
     }
 }
 
+// ---------------------------------------------------------------- group box (R2)
+// The frame around "the strip + every companion that follows it" (user, 2026-11-16 00:1x):
+//   * it exists only while the group is shown, and shares the companions' fade;
+//   * its inside is strictly alpha = 0, so clicks fall straight through (a layered window is
+//     hit-tested through its alpha - the same rule that made the tray bar need its 4% wash);
+//   * the geometry is *derived*, so it is translated with the strip's own delta inside
+//     CompanionFollowTo() (same composition as the strip, see the 2026-11-16 follow fix) and
+//     only recomputed when a member changes its size or its offset inside the group.
+// Decisions taken by the user for this round: the box counts as "inside the group" (so the
+// pointer can travel from the strip to a companion through empty space without anything
+// fading), 1 px / radius 12 / white at ~25%, no frame when the strip is alone, and the frame
+// follows a member being dragged live. Resizing members by dragging the frame is R3.
+struct GroupBox {
+    HWND hwnd = nullptr;
+    bool enabled = true;
+    int margin = 8;              // [group] margin    - gap between the frame and the members
+    int lineAlpha = 64;          // [group] lineAlpha - ~25% white
+    int lineWidth = 1;           // [group] lineWidth - 1..4
+    int radius = 12;             // [group] radius    - 0 = square corners
+    RECT rc{0, 0, 0, 0};         // screen px, empty when there is nothing to frame
+    int alpha = 0, alphaTarget = 0;
+    HDC dc = nullptr;
+    HBITMAP bmp = nullptr;
+    void* bits = nullptr;
+    int dibW = 0, dibH = 0;
+};
+static GroupBox g_groupBox;
+
+static void GroupBoxLoad() {
+    g_groupBox.enabled = GetInt(L"group", L"enabled", 1) != 0;
+    g_groupBox.margin = GetInt(L"group", L"margin", 8);
+    if (g_groupBox.margin < 0) g_groupBox.margin = 0;
+    if (g_groupBox.margin > 64) g_groupBox.margin = 64;
+    g_groupBox.lineAlpha = GetInt(L"group", L"lineAlpha", 64);
+    if (g_groupBox.lineAlpha < 0) g_groupBox.lineAlpha = 0;
+    if (g_groupBox.lineAlpha > 255) g_groupBox.lineAlpha = 255;
+    g_groupBox.lineWidth = GetInt(L"group", L"lineWidth", 1);
+    if (g_groupBox.lineWidth < 1) g_groupBox.lineWidth = 1;
+    if (g_groupBox.lineWidth > 4) g_groupBox.lineWidth = 4;
+    g_groupBox.radius = GetInt(L"group", L"radius", 12);
+    if (g_groupBox.radius < 0) g_groupBox.radius = 0;
+    if (g_groupBox.radius > 64) g_groupBox.radius = 64;
+    DLog(L"group box: enabled=%d margin=%d line=%d/%d radius=%d", (int)g_groupBox.enabled,
+         g_groupBox.margin, g_groupBox.lineWidth, g_groupBox.lineAlpha, g_groupBox.radius);
+}
+
+// Members = the strip plus every companion that follows it. False when there is nothing to
+// frame (the strip alone): a frame around one window is pure noise (user, 2026-11-16).
+static bool GroupBoxMembers(RECT* out) {
+    if (!g_hwnd) return false;
+    RECT r{};
+    if (!GetWindowRect(g_hwnd, &r)) return false;
+    *out = r;
+    bool have = false;
+    if (g_trayBar.hwnd && g_trayBar.enabled && g_trayBar.follow) {
+        UnionRect(out, out, &g_trayBar.rc);
+        have = true;
+    }
+    return have;
+}
+
+static bool GroupBoxRect(RECT* out) {
+    if (!g_groupBox.enabled) return false;
+    RECT r{};
+    if (!GroupBoxMembers(&r)) return false;
+    InflateRect(&r, g_groupBox.margin, g_groupBox.margin);
+    *out = r;
+    return true;
+}
+
+static void GroupBoxEnsureDib(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (g_groupBox.bits && g_groupBox.dibW == w && g_groupBox.dibH == h) return;
+    if (g_groupBox.bmp) {
+        if (g_groupBox.dc && DummyBitmap()) SelectObject(g_groupBox.dc, g_dummyBmp);
+        DeleteObject(g_groupBox.bmp);
+        g_groupBox.bmp = nullptr;
+        g_groupBox.bits = nullptr;
+    }
+    if (!g_groupBox.dc) g_groupBox.dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_groupBox.bmp =
+        CreateDIBSection(g_groupBox.dc, &bi, DIB_RGB_COLORS, &g_groupBox.bits, nullptr, 0);
+    if (g_groupBox.bmp) SelectObject(g_groupBox.dc, g_groupBox.bmp);
+    g_groupBox.dibW = w;
+    g_groupBox.dibH = h;
+}
+
+static void GroupBoxPaint() {
+    if (!g_groupBox.bits) return;
+    void* savePaint = g_paintBits;
+    int savePW = g_paintW, savePH = g_paintH;
+    g_paintBits = g_groupBox.bits;
+    g_paintW = g_groupBox.dibW;
+    g_paintH = g_groupBox.dibH;
+    memset(g_groupBox.bits, 0, (size_t)g_groupBox.dibW * g_groupBox.dibH * 4);
+    FillRoundRing(g_groupBox.dibW, g_groupBox.dibH, g_groupBox.radius, g_groupBox.lineWidth,
+                  ((DWORD)g_groupBox.lineAlpha << 24) | 0x00FFFFFF);
+    g_paintBits = savePaint;
+    g_paintW = savePW;
+    g_paintH = savePH;
+}
+
+static void GroupBoxPresent() {
+    if (!g_groupBox.hwnd || !g_groupBox.bits) return;
+    POINT src{0, 0};
+    SIZE size{g_groupBox.dibW, g_groupBox.dibH};
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, (BYTE)g_groupBox.alpha, AC_SRC_ALPHA};
+    POINT dst{g_groupBox.rc.left, g_groupBox.rc.top};
+    // No DwmFlush here on purpose: the frame never changes size and position in the same step
+    // as its pixels (a move is applied with SetWindowPos alone, see GroupBoxTranslate), so
+    // there is no "new content at old geometry" to avoid - only the fade alpha changes.
+    UpdateLayeredWindow(g_groupBox.hwnd, nullptr, &dst, &size, g_groupBox.dc, &src, 0, &bf,
+                        ULW_ALPHA);
+}
+
+// Size the DIB / repaint the ring only when the geometry actually changed: a strip drag is a
+// pure translation (no repaint at all), a member drag repaints the band.
+static void GroupBoxPlace() {
+    int w = g_groupBox.rc.right - g_groupBox.rc.left;
+    int h = g_groupBox.rc.bottom - g_groupBox.rc.top;
+    if (w <= 0 || h <= 0 || !g_groupBox.hwnd) return;
+    bool sizeChanged = (w != g_groupBox.dibW || h != g_groupBox.dibH);
+    if (sizeChanged) {
+        GroupBoxEnsureDib(w, h);
+        GroupBoxPaint();
+    }
+    SetWindowPos(g_groupBox.hwnd, nullptr, g_groupBox.rc.left, g_groupBox.rc.top, w, h,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    if (sizeChanged) GroupBoxPresent();
+}
+
+// Re-derive the frame from the current member rectangles (member moved by hand, group show,
+// member resize, ini reload).
+static void GroupBoxRecompute() {
+    RECT want{};
+    if (!GroupBoxRect(&want)) {
+        g_groupBox.rc = RECT{0, 0, 0, 0};
+        if (g_groupBox.hwnd) ShowWindow(g_groupBox.hwnd, SW_HIDE);
+        return;
+    }
+    g_groupBox.rc = want;
+    GroupBoxPlace();
+}
+
+// The strip moved by (dx,dy): the frame is translated by the same delta, so the frame and the
+// strip land in the same composition (called from CompanionFollowTo, which is on the frame path).
+static void GroupBoxTranslate(int dx, int dy) {
+    if ((!dx && !dy) || g_groupBox.rc.right <= g_groupBox.rc.left) return;
+    OffsetRect(&g_groupBox.rc, dx, dy);
+    if (g_groupBox.hwnd && IsWindowVisible(g_groupBox.hwnd))
+        SetWindowPos(g_groupBox.hwnd, nullptr, g_groupBox.rc.left, g_groupBox.rc.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static LRESULT CALLBACK GroupBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_NCHITTEST:
+            // The frame is purely visual this round: even its 1 px line must not swallow a
+            // click that was meant for whatever is below. R3 will turn the border into the
+            // resize handle.
+            return HTTRANSPARENT;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_DESTROY:
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void GroupBoxCreate() {
+    GroupBoxLoad();
+    if (!g_groupBox.enabled) return;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = GroupBoxProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"DockGroupBoxWindow";
+        RegisterClassExW(&wc);
+    }
+    g_groupBox.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                                          WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                      L"DockGroupBoxWindow", L"dock group box", WS_POPUP, 0, 0,
+                                      10, 10, nullptr, nullptr, GetModuleHandleW(nullptr),
+                                      nullptr);
+    if (!g_groupBox.hwnd) {
+        DLog(L"group box: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
+        return;
+    }
+    g_groupBox.alpha = 0;
+    g_groupBox.alphaTarget = 0;
+    RECT want{};
+    if (GroupBoxRect(&want)) {
+        g_groupBox.rc = want;
+        GroupBoxEnsureDib(want.right - want.left, want.bottom - want.top);
+        GroupBoxPaint();
+        GroupBoxPresent();
+    }
+    ShowWindow(g_groupBox.hwnd, SW_HIDE);
+    DLog(L"group box: created, frame %ld,%ld %ldx%ld", (long)g_groupBox.rc.left,
+         (long)g_groupBox.rc.top, (long)(g_groupBox.rc.right - g_groupBox.rc.left),
+         (long)(g_groupBox.rc.bottom - g_groupBox.rc.top));
+}
+
 // ---------------------------------------------------------------- visibility
-// Rule (user, 2026-11-15): a following companion only shows while the pointer is on the
-// strip, and stays while the pointer is anywhere in the group; the strip itself keeps its
-// distance fade. An independent companion fades with distance like the strip.
+// Rule (user, 2026-11-15, refined 2026-11-16): only the strip fades with distance. A
+// following companion (and the group frame) stays hidden until the pointer is *on the strip* -
+// that is the sign the user wants to interact with the dock - then fades in fast; it goes away
+// only when the pointer leaves the *frame*, so travelling from the strip to a companion through
+// empty space cannot make the companion disappear under the cursor. An independent companion
+// (follow=0) fades with distance like the strip and takes no part in the frame.
 static void CompanionVisibilityTick(DWORD now) {
     static bool shown = false;
     POINT p{};
@@ -3337,14 +3616,20 @@ static void CompanionVisibilityTick(DWORD now) {
     RECT sr{};
     GetWindowRect(g_hwnd, &sr);
 
+    // The frame is what "inside the group" means; fall back to strip-united-companion while
+    // there is nothing to frame (no companion, or the frame is disabled in the ini).
+    RECT box{};
+    bool haveBox = GroupBoxRect(&box);
+
     bool wantShown;
     if (!g_trayBar.follow) {
         wantShown = true;                     // distance fade instead
     } else {
         bool onStrip = PtInRect(&sr, p) != FALSE;
         RECT group = sr;
-        if (g_trayBar.enabled) UnionRect(&group, &group, &g_trayBar.rc);
-        InflateRect(&group, 6, 6);
+        if (haveBox) group = box;
+        else if (g_trayBar.enabled) UnionRect(&group, &group, &g_trayBar.rc);
+        InflateRect(&group, 6, 6);            // a little hysteresis on the frame line
         bool inGroup = PtInRect(&group, p) != FALSE;
         if (onStrip) shown = true;
         else if (!inGroup && !g_trayBar.dragging && !g_trayBar.resizing) shown = false;
@@ -3384,17 +3669,34 @@ static void CompanionVisibilityTick(DWORD now) {
                      g_trayBar.rc.right - g_trayBar.rc.left,
                      g_trayBar.rc.bottom - g_trayBar.rc.top, SWP_NOACTIVATE);
         AnchorPublish(kAnchorQuickSettings, &g_trayBar.rc, 8);
+        // the frame is drawn first so the strip and the companions stay on top of it
+        GroupBoxRecompute();
+        if (g_groupBox.hwnd && haveBox) {
+            ShowWindow(g_groupBox.hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(g_groupBox.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         // keep the strip above us: the group is drawn "from under the strip"
         SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
-    if (g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd) != (wantShown && target > 0)) {
-        ShowWindow(g_trayBar.hwnd, (wantShown && target > 0) ? SW_SHOWNOACTIVATE : SW_HIDE);
-        if (!wantShown) CompanionTooltipShow(g_trayBar, -1);
+    // Visible from the moment it should show until the fade has actually reached 0, so the
+    // fade-out is a fade instead of an instant disappearance (the alpha is stepped in
+    // CompanionTick, which hides the window when it lands on 0).
+    bool shouldBeVisible = (wantShown && target > 0) || g_trayBar.alpha > 0;
+    if (g_trayBar.hwnd && ((IsWindowVisible(g_trayBar.hwnd) != FALSE) != shouldBeVisible)) {
+        ShowWindow(g_trayBar.hwnd, shouldBeVisible ? SW_SHOWNOACTIVATE : SW_HIDE);
+        if (!shouldBeVisible) CompanionTooltipShow(g_trayBar, -1);
     }
     g_trayBar.alphaTarget = target;
+    g_groupBox.alphaTarget = (haveBox && wantShown && target > 0) ? 255 : 0;
+    if (g_groupBox.hwnd) {
+        bool boxVisible = (IsWindowVisible(g_groupBox.hwnd) != FALSE);
+        bool boxShould = g_groupBox.alphaTarget > 0 || g_groupBox.alpha > 0;
+        if (boxVisible != boxShould) ShowWindow(g_groupBox.hwnd, boxShould ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
 }
 
 // ---------------------------------------------------------------- per-frame tick
@@ -3422,6 +3724,10 @@ static void CompanionFollowTo(int stripX, int stripY) {
     g_companionLastStripX = stripX;
     g_companionLastStripY = stripY;
     if (!dx && !dy) return;
+    // The frame is pure derived geometry, so a group-wide move is just a translation - and it
+    // has to happen on this path (not on the 16 ms housekeeping gate) for the same reason the
+    // companions do: the frame must land in the strip's composition, not a frame later.
+    GroupBoxTranslate(dx, dy);
     if (!g_trayBar.hwnd || !g_trayBar.enabled || !g_trayBar.follow) return;
     if (g_trayBar.dragging || g_trayBar.resizing) return;    // the pointer owns it right now
     if (g_trayBar.alpha > 0) {
@@ -3445,6 +3751,17 @@ static void CompanionTick(DWORD now) {
     RECT sr{};
     GetWindowRect(g_hwnd, &sr);
     CompanionFollowTo(sr.left, sr.top);
+    // A *size* change of the strip (its own edge drag, ShrinkToIcons after a resize, a settings
+    // change) moves the frame's edges too, and translation cannot express that: re-derive it
+    // whenever the strip's box changed. Cheap - GroupBoxPlace only repaints on a real change.
+    {
+        static RECT lastStrip{};
+        if (sr.right - sr.left != lastStrip.right - lastStrip.left ||
+            sr.bottom - sr.top != lastStrip.bottom - lastStrip.top) {
+            lastStrip = sr;
+            GroupBoxRecompute();
+        }
+    }
 
     // 2. state + fade
     TrayStateRefresh(now);
@@ -3457,6 +3774,21 @@ static void CompanionTick(DWORD now) {
         if (diff > 0) g_trayBar.alpha += step < diff ? step : diff;
         else g_trayBar.alpha += (-step) > diff ? -step : diff;
         CompanionPresent(g_trayBar);
+        // the window is hidden only once the fade has finished, see CompanionVisibilityTick
+        if (g_trayBar.alpha == 0 && g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
+            ShowWindow(g_trayBar.hwnd, SW_HIDE);
+    }
+
+    // 3. the frame fades with the companions, in the same steps
+    if (g_groupBox.alpha != g_groupBox.alphaTarget) {
+        int diff = g_groupBox.alphaTarget - g_groupBox.alpha;
+        int step = (int)(255 * 16 / 120);
+        if (step < 1) step = 1;
+        if (diff > 0) g_groupBox.alpha += step < diff ? step : diff;
+        else g_groupBox.alpha += (-step) > diff ? -step : diff;
+        GroupBoxPresent();
+        if (g_groupBox.alpha == 0 && g_groupBox.hwnd && IsWindowVisible(g_groupBox.hwnd))
+            ShowWindow(g_groupBox.hwnd, SW_HIDE);
     }
 }
 
@@ -3491,6 +3823,7 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     else r.bottom = r.top + minSide;
                 }
                 CompanionSetRect(c, r.left, r.top, r.right - r.left, r.bottom - r.top, true);
+                GroupBoxRecompute();     // the frame follows a member being resized, live
                 return 0;
             }
             if (c.dragging) {
@@ -3500,10 +3833,12 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     c.dragging = false;
                     ReleaseCapture();
                     CompanionSave(c);
+                    GroupBoxRecompute();
                     return 0;
                 }
                 CompanionSetRect(c, p.x - c.dragStart.x, p.y - c.dragStart.y,
                                  c.rc.right - c.rc.left, c.rc.bottom - c.rc.top, false);
+                GroupBoxRecompute();     // live: the member must not "walk out of its frame"
                 return 0;
             }
             if (c.pressActive) {
@@ -3662,6 +3997,9 @@ static void CompanionCreate() {
     AnchorPublish(kAnchorQuickSettings, &r, 8);
     DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
          (int)c.follow);
+    // R2: the frame around "the strip + this companion". It needs the companion to exist (a
+    // frame around the strip alone is not drawn), so it is created from here, not from WinMain.
+    GroupBoxCreate();
 }
 
 // ---------------------------------------------------------------- quick settings placement
@@ -8014,6 +8352,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // follow has to be nudged here too - the 16 ms housekeeping gate would leave
                 // the attached windows 1-2 frames behind the strip's new origin.
                 CompanionFollowTo(r.left, r.top);
+                GroupBoxRecompute();      // the strip's own size changed: the frame resizes
                 UpdateSnap();
                 return 0;
             }

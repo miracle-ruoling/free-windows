@@ -50,7 +50,8 @@
 | ini | `material=1 / glassOpacity=1 / tintStrength=0 / lightMode=1 / tint=#A6101010 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / presentOrder=0 / debugBeacon=0 / radius=77 / pad=10 / maxIcon=72` |
 | git | 仓库在 `dock/`，`.gitignore` 已覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
-最近提交（倒序）：`（本轮）` 固定 Windows 按钮 → `1bee953` 重排不跟手的修复 → `1761d5f` 重排动效+边界滚入 →
+最近提交（倒序）：`2d9941f` 首格固定 Windows 按钮 → `1b33eab` 文档：§4.18 被拖图标锯齿 →
+`ef19e64` 修锯齿 + 交接文档 → `1bee953` 重排不跟手的修复 → `1761d5f` 重排动效+边界滚入 →
 `c9c3e03` 重排本身 → `66d849c` 混色搬进抓图 → `c8fcaf1` 拉伸闪烁 → `15badf9` 存档点。
 
 ---

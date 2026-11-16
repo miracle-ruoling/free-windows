@@ -56,7 +56,8 @@
 static HWND g_hwnd;
 static void CompanionSaveAllPositions();      // defined with the companions
 static void CompanionFollowTo(int stripX, int stripY);   // ditto; called from Present()
-static void ShowSettings();                   // defined near the settings window
+enum SPageKind { kPageDock = 0, kPageStrip = 1, kPageTray = 2, kPageGroup = 3 };
+static void ShowSettings(int hintKind = -1, int hintId = 0);   // per-window pages (G3)
 static void* g_paintBits;
 static HWND g_setWnd;
 static int g_paintW, g_paintH;
@@ -4048,7 +4049,7 @@ static bool HandleGroupCommand(Group& g, int cmd) {
         return true;
     }
     if (cmd == kGCmdSettings) {
-        ShowSettings();
+        ShowSettings(kPageGroup, g.id);
         return true;
     }
     return false;
@@ -4279,7 +4280,7 @@ static void CompanionShowMenu(Companion& c) {
         if (Group* gg = GroupById(c.groupId)) GroupRecompute(*gg);
         DLog(L"tray bar: menu -> default size %dx%d", w, h);
     } else if (cmd == kCmdSettings) {
-        ShowSettings();
+        ShowSettings(kPageTray, g_trayBar.groupId);
     } else if (cmd == kCmdGroupNew) {
         int id = NewGroupId();
         if (id) {
@@ -8088,92 +8089,264 @@ static void ToggleExpand() {
 }
 
 
-// ---------------------------------------------------------------- settings UI
-// Self-drawn panel: same layered/alpha pipeline as the dock, so it gets the same
-// rounded, translucent look, and every change is applied while you drag.
+// ---------------------------------------------------------------- settings UI (G3)
+// Self-drawn panel: same layered/alpha pipeline as the dock, so it gets the same rounded,
+// translucent look, and every change is applied while you drag.
+//
+// Since G3 the panel is **paged**: every window (the strip, each companion, each group) has its
+// own page, and every row is bound to "an ini section + a key". The pages are rebuilt when the
+// panel opens, so a group created from a menu shows up immediately.
+
 struct SRow {
     const wchar_t* key;
     const wchar_t* label;
     int minv;
     int maxv;
-    int colorAlpha;    // 1 = edits the alpha of a colour value
-    int isToggle;      // 1 = segmented buttons instead of a slider
+    int colorAlpha;             // 1 = edits the alpha of a colour value
+    int isToggle;               // 1 = segmented buttons instead of a slider
+    const wchar_t* onText;      // toggle label of value 1 (left pill); nullptr = 开
+    const wchar_t* offText;     // toggle label of value 0 (right pill); nullptr = 关
 };
 
-static const SRow kRows[] = {
-    {L"material", L"背景类型", 0, 1, 0, 1},
-    {L"lightMode", L"外观", 0, 1, 0, 1},
-    {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0},
-    {L"tintStrength", L"色调浓度", 0, 255, 0, 0},
-    {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0},
-    {L"refreshHz", L"背景刷新帧率 (Hz)", 0, 180, 0, 0},
-    {L"captureHz", L"背景截取频率 (Hz)", 0, 180, 0, 0},
-    {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0},
-    {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0},
-    {L"iconSize", L"默认图标尺寸", 16, 128, 0, 0},
-    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0},
-    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0},
+struct SPage {
+    std::wstring title;
+    std::wstring section;       // ini section the rows read/write ("" for group pages)
+    const SRow* rows;
+    int count;
+    int kind;
+    int groupId;                // kPageGroup only
 };
-static const int kRowCount = (int)(sizeof(kRows) / sizeof(kRows[0]));
-static const int kRowH = 58;      // row pitch; 12 rows have to fit on a 1080p screen
 
-static int g_rowVal[kRowCount]{};
+// Dock page: material + performance, i.e. what is true for "the dock" as a whole.
+static const SRow kRowsDock[] = {
+    {L"material", L"背景类型", 0, 1, 0, 1, L"玻璃", L"纯色"},
+    {L"lightMode", L"外观", 0, 1, 0, 1, L"浅色", L"深色"},
+    {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0, nullptr, nullptr},
+    {L"tintStrength", L"色调浓度", 0, 255, 0, 0, nullptr, nullptr},
+    {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
+    {L"refreshHz", L"背景刷新帧率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureHz", L"背景截取频率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
+};
+
+// Strip page: everything about the icon bar's own layout.
+static const SRow kRowsStrip[] = {
+    {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
+    {L"iconSize", L"默认图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
+    {L"gap", L"图标间距", 0, 40, 0, 0, nullptr, nullptr},
+    {L"pad", L"内边距", 0, 40, 0, 0, nullptr, nullptr},
+    {L"minIcon", L"最小图标", 8, 64, 0, 0, nullptr, nullptr},
+    {L"maxIcon", L"最大图标", 16, 160, 0, 0, nullptr, nullptr},
+    {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0, nullptr, nullptr},
+    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
+    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
+};
+
+// Companion page: the overrides that make it stop looking like the strip. -1 = inherit.
+static const SRow kRowsTray[] = {
+    {L"radius", L"圆角（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
+    {L"pad", L"内边距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
+    {L"gap", L"格子间距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
+};
+
+// Group page: the frame and its two switches.
+static const SRow kRowsGroup[] = {
+    {L"enabled", L"显示边框线", 0, 1, 0, 1, L"显示", L"隐藏"},
+    {L"lineAlpha", L"线不透明度", 0, 255, 0, 0, nullptr, nullptr},
+    {L"lineWidth", L"线宽", 1, 4, 0, 0, nullptr, nullptr},
+    {L"margin", L"边框外扩 (px)", 0, 40, 0, 0, nullptr, nullptr},
+    {L"radius", L"圆角", 0, 64, 0, 0, nullptr, nullptr},
+    {L"blockResize", L"屏蔽缩放", 0, 1, 0, 1, L"屏蔽", L"允许"},
+    {L"blockMove", L"屏蔽位移", 0, 1, 0, 1, L"屏蔽", L"允许"},
+};
+
+static std::vector<SPage> g_pages;
+static int g_page = 0;
+static std::vector<int> g_rowVal;
 static int g_dragRow = -1;
 static HDC g_setDC = nullptr;
 static HBITMAP g_setBmp = nullptr;
 static void* g_setBits = nullptr;
-static int g_setW = 760, g_setH = 700;
+static int g_setW = 760, g_setH = 720;
+
+static const int kTabH = 44;        // tab bar height
+static const int kRowsTop = 122;    // first row's top edge
+static const int kRowH = 58;        // row pitch
 
 static int TintAlpha() { return (int)((g_cfg.tint >> 24) & 0xFF); }
 
-static void RowLoad() {
-    for (int i = 0; i < kRowCount; i++) {
-        if (kRows[i].colorAlpha) {
-            g_rowVal[i] = TintAlpha();
-        } else {
-            g_rowVal[i] = GetPrivateProfileIntW(L"dock", kRows[i].key, 0, g_iniPath.c_str());
-        }
-        if (g_rowVal[i] < kRows[i].minv) g_rowVal[i] = kRows[i].minv;
-        if (g_rowVal[i] > kRows[i].maxv) g_rowVal[i] = kRows[i].maxv;
+static const SPage* ActivePage() {
+    if (g_page < 0 || g_page >= (int)g_pages.size()) return nullptr;
+    return &g_pages[g_page];
+}
+
+// ---- per-kind value access ----------------------------------------------------------------
+static int GroupKeyVal(Group& g, const wchar_t* key) {
+    if (!wcscmp(key, L"enabled")) return g.enabled ? 1 : 0;
+    if (!wcscmp(key, L"lineAlpha")) return g.lineAlpha;
+    if (!wcscmp(key, L"lineWidth")) return g.lineWidth;
+    if (!wcscmp(key, L"margin")) return g.margin;
+    if (!wcscmp(key, L"radius")) return g.radius;
+    if (!wcscmp(key, L"blockResize")) return g.blockResize ? 1 : 0;
+    if (!wcscmp(key, L"blockMove")) return g.blockMove ? 1 : 0;
+    return 0;
+}
+
+static int TrayKeyVal(const wchar_t* key) {
+    if (!wcscmp(key, L"radius")) return g_trayBar.radiusOv;
+    if (!wcscmp(key, L"pad")) return g_trayBar.padOv;
+    if (!wcscmp(key, L"gap")) return g_trayBar.gapOv;
+    return -1;
+}
+
+static int PageVal(int i) {
+    const SPage* p = ActivePage();
+    if (!p || i < 0 || i >= p->count) return 0;
+    const SRow& row = p->rows[i];
+    if (row.colorAlpha) return TintAlpha();
+    if (p->kind == kPageGroup) {
+        Group* g = GroupById(p->groupId);
+        return g ? GroupKeyVal(*g, row.key) : 0;
+    }
+    if (p->kind == kPageTray) return TrayKeyVal(row.key);
+    return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : 0);
+}
+
+static void PageLoad() {
+    const SPage* p = ActivePage();
+    g_rowVal.assign(p ? p->count : 0, 0);
+    for (int i = 0; i < (int)g_rowVal.size(); i++) {
+        int v = PageVal(i);
+        if (v < p->rows[i].minv) v = p->rows[i].minv;
+        if (v > p->rows[i].maxv) v = p->rows[i].maxv;
+        g_rowVal[i] = v;
     }
 }
 
-static void RowApply(int i) {
-    wchar_t buf[64]{};
-    bool needsBake = false;
-    if (kRows[i].colorAlpha) {
-        DWORD tint = (g_cfg.tint & 0x00FFFFFF) | ((DWORD)g_rowVal[i] << 24);
-        swprintf_s(buf, L"#%08X", tint);
-        WritePrivateProfileStringW(L"dock", L"tint", buf, g_iniPath.c_str());
-    } else {
-        swprintf_s(buf, L"%d", g_rowVal[i]);
-        WritePrivateProfileStringW(L"dock", kRows[i].key, buf, g_iniPath.c_str());
-        if (!wcscmp(kRows[i].key, L"blurRadius") || !wcscmp(kRows[i].key, L"material"))
-            needsBake = true;
-    }
-    // reloading the whole mod list (icons, window scan) on every drag step is
-    // what made the panel lag a second behind: just re-read the config and repaint
+// Re-applies everything a strip-page row can affect. Kept in one place because the strip's
+// layout, the companions' icon sizes and the group frame all derive from g_cfg.
+static void ApplyStripStyle() {
     LoadConfig();
-    g_glassCacheValid = false;          // glass parameters just changed
-    if (needsBake) g_bakeDirty = true;
-    // cadence rows: re-arm the repaint timer, and write the *clamped* capture rate back
-    // (it can never exceed the refresh rate - LoadConfig clamps it)
-    if (!wcscmp(kRows[i].key, L"refreshHz") || !wcscmp(kRows[i].key, L"captureHz")) {
-        for (int r = 0; r < kRowCount; r++) {
-            if (!wcscmp(kRows[r].key, L"captureHz") && g_rowVal[r] != g_cfg.captureHz) {
-                g_rowVal[r] = g_cfg.captureHz;
-                wchar_t b2[32]{};
-                swprintf_s(b2, L"%d", g_rowVal[r]);
-                WritePrivateProfileStringW(L"dock", L"captureHz", b2, g_iniPath.c_str());
-            }
-        }
-        ArmRepaintTimer(g_hwnd);
-    }
+    g_glassCacheValid = false;
+    g_bakeDirty = true;
     RECT rc{};
     GetClientRect(g_hwnd, &rc);
     Paint(rc.right, rc.bottom);
     Present();
-    RowLoad();
+    ComputeButtons();
+    PaintAndPresent();
+    if (g_trayBar.hwnd) {
+        TrayRepaint(g_trayBar);
+        CompanionPresent(g_trayBar);
+        GroupRecompute(DefaultGroup());
+    }
+}
+
+static void PageSet(int i, int v) {
+    SPage* p = nullptr;
+    if (g_page >= 0 && g_page < (int)g_pages.size()) p = &g_pages[g_page];
+    if (!p || i < 0 || i >= p->count) return;
+    const SRow& row = p->rows[i];
+    wchar_t buf[64]{};
+    if (row.colorAlpha) {
+        DWORD tint = (g_cfg.tint & 0x00FFFFFF) | ((DWORD)v << 24);
+        swprintf_s(buf, L"#%08X", tint);
+        WritePrivateProfileStringW(p->section.c_str(), L"tint", buf, g_iniPath.c_str());
+    } else {
+        swprintf_s(buf, L"%d", v);
+        if (p->kind != kPageGroup)      // group pages persist through GroupSaveFlag
+            WritePrivateProfileStringW(p->section.c_str(), row.key, buf, g_iniPath.c_str());
+    }
+
+    switch (p->kind) {
+        case kPageDock: {
+            LoadConfig();
+            g_glassCacheValid = false;
+            if (!wcscmp(row.key, L"blurRadius") || !wcscmp(row.key, L"material"))
+                g_bakeDirty = true;
+            if (!wcscmp(row.key, L"refreshHz") || !wcscmp(row.key, L"captureHz")) {
+                // write the *clamped* capture rate back (it can never exceed the refresh rate)
+                if (g_rowVal[i] != g_cfg.captureHz) {
+                    for (int r = 0; r < p->count; r++) {
+                        if (!wcscmp(p->rows[r].key, L"captureHz")) {
+                            g_rowVal[r] = g_cfg.captureHz;
+                            wchar_t b2[32]{};
+                            swprintf_s(b2, L"%d", g_cfg.captureHz);
+                            WritePrivateProfileStringW(p->section.c_str(), L"captureHz", b2,
+                                                       g_iniPath.c_str());
+                        }
+                    }
+                }
+                ArmRepaintTimer(g_hwnd);
+            }
+            RECT rc{};
+            GetClientRect(g_hwnd, &rc);
+            Paint(rc.right, rc.bottom);
+            Present();
+            break;
+        }
+        case kPageStrip:
+            ApplyStripStyle();
+            break;
+        case kPageTray: {
+            int v2 = v;
+            if (!wcscmp(row.key, L"radius")) g_trayBar.radiusOv = v2;
+            else if (!wcscmp(row.key, L"pad")) g_trayBar.padOv = v2;
+            else if (!wcscmp(row.key, L"gap")) g_trayBar.gapOv = v2;
+            if (g_trayBar.hwnd) {
+                TrayRepaint(g_trayBar);
+                CompanionPresent(g_trayBar);
+                if (Group* g = GroupById(g_trayBar.groupId)) GroupRecompute(*g);
+            }
+            break;
+        }
+        case kPageGroup: {
+            Group* g = GroupById(p->groupId);
+            if (!g) break;
+            if (!wcscmp(row.key, L"enabled")) {
+                g->enabled = v != 0;
+                GroupSaveFlag(*g, L"enabled", g->enabled);
+                GroupRepaint(*g);
+            } else if (!wcscmp(row.key, L"lineAlpha")) {
+                g->lineAlpha = v;
+                swprintf_s(buf, L"%d", v);
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                WritePrivateProfileStringW(sec, L"lineAlpha", buf, g_iniPath.c_str());
+                GroupRepaint(*g);
+            } else if (!wcscmp(row.key, L"lineWidth")) {
+                g->lineWidth = v;
+                swprintf_s(buf, L"%d", v);
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                WritePrivateProfileStringW(sec, L"lineWidth", buf, g_iniPath.c_str());
+                GroupRepaint(*g);
+            } else if (!wcscmp(row.key, L"margin")) {
+                g->margin = v;
+                swprintf_s(buf, L"%d", v);
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                WritePrivateProfileStringW(sec, L"margin", buf, g_iniPath.c_str());
+                GroupRecompute(*g);
+            } else if (!wcscmp(row.key, L"radius")) {
+                g->radius = v;
+                swprintf_s(buf, L"%d", v);
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                WritePrivateProfileStringW(sec, L"radius", buf, g_iniPath.c_str());
+                GroupRepaint(*g);
+            } else if (!wcscmp(row.key, L"blockResize")) {
+                g->blockResize = v != 0;
+                GroupSaveFlag(*g, L"blockResize", g->blockResize);
+            } else if (!wcscmp(row.key, L"blockMove")) {
+                g->blockMove = v != 0;
+                GroupSaveFlag(*g, L"blockMove", g->blockMove);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    PageLoad();
 }
 
 // GDI text into a 32bpp DIB leaves alpha at 0; render white text on black and
@@ -8225,6 +8398,38 @@ static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, 
     ReleaseDC(nullptr, screen);
 }
 
+// Tab geometry: equal slices across the panel, one per page.
+static RECT TabRect(int i, int count) {
+    int x0 = 26, x1 = g_setW - 26;
+    int w = count > 0 ? (x1 - x0) / count : 0;
+    return RECT{x0 + i * w, 64, x0 + (i + 1) * w - 6, 64 + kTabH};
+}
+
+// The panel is as tall as its current page: a 3-row page in a 9-row frame looks broken.
+static void SettingsFreeDib() {
+    if (g_setBmp) {
+        if (g_setDC) SelectObject(g_setDC, GetStockObject(NULL_BRUSH));
+        DeleteObject(g_setBmp);
+        g_setBmp = nullptr;
+    }
+    if (g_setDC) {
+        DeleteDC(g_setDC);
+        g_setDC = nullptr;
+    }
+    g_setBits = nullptr;
+}
+
+static void SettingsResizeForPage() {
+    const SPage* p = ActivePage();
+    int rows = p ? p->count : 1;
+    if (rows < 1) rows = 1;
+    g_setH = kRowsTop + rows * kRowH + 56;
+    SettingsFreeDib();
+    if (g_setWnd)
+        SetWindowPos(g_setWnd, nullptr, 0, 0, g_setW, g_setH,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 static void SettingsPaint() {
     if (!g_setWnd) return;
     if (!g_setBits) {
@@ -8249,39 +8454,58 @@ static void SettingsPaint() {
     FillRound(g_setDC, RECT{0, 0, g_setW, g_setH}, panelR, 0xE61C1C1C);
     FillRound(g_setDC, RECT{1, 1, g_setW - 1, g_setH - 1}, panelR, 0x1AFFFFFF);
 
-    DrawTextAlpha(26, 20, 340, 46, L"dock 设置", 34, 0xFFFFFF);
+    DrawTextAlpha(26, 22, 340, 40, L"dock 设置", 30, 0xFFFFFF);
     DrawTextAlpha(g_setW - 62, 18, 44, 44, L"×", 32, 0xFFFFFFFF);
 
-    int y = 96;
-    for (int i = 0; i < kRowCount; i++) {
-        DrawTextAlpha(30, y, 330, 46, kRows[i].label, 24, 0xF4FFFFFF);
-        if (!kRows[i].isToggle) {
+    // tabs
+    int count = (int)g_pages.size();
+    for (int i = 0; i < count; i++) {
+        RECT tr = TabRect(i, count);
+        bool active = (i == g_page);
+        FillRound(g_setDC, tr, 10, active ? 0xFF4C9AFF : 0x24FFFFFF);
+        DrawTextAlpha(tr.left + 14, tr.top, tr.right - tr.left - 20, tr.bottom - tr.top,
+                      g_pages[i].title, 20, active ? 0xFFFFFFFF : 0xC8FFFFFF);
+    }
+
+    const SPage* p = ActivePage();
+    if (!p) {
+        g_paintBits = g_bits; g_paintW = g_dibW; g_paintH = g_dibH;
+        return;
+    }
+    int y = kRowsTop;
+    for (int i = 0; i < p->count; i++) {
+        const SRow& row = p->rows[i];
+        DrawTextAlpha(30, y, 330, 46, row.label, 24, 0xF4FFFFFF);
+        if (!row.isToggle) {
             wchar_t val[32]{};
-            swprintf_s(val, L"%d", g_rowVal[i]);
+            if (g_rowVal[i] < 0) wcscpy_s(val, L"继承");
+            else swprintf_s(val, L"%d", g_rowVal[i]);
             DrawTextAlpha(g_setW - 150, y, 120, 46, val, 24, 0xFFFFFFFF);
         }
 
         int tx = 370, tw = g_setW - 370 - 170;
         int ty = y + 20;
-        if (kRows[i].isToggle) {
+        if (row.isToggle) {
             int half = tw / 2;
             for (int k = 0; k < 2; k++) {
-                bool on = (g_rowVal[i] == (k == 0 ? 1 : 0));   // left = 玻璃 (1)
+                bool on = (g_rowVal[i] == (k == 0 ? 1 : 0));
                 RECT pr{tx + k * half, ty - 14, tx + (k + 1) * half - 6, ty + 16};
                 FillRound(g_setDC, pr, 8, on ? 0xFF4C9AFF : 0x30FFFFFF);
             }
             bool leftOn = (g_rowVal[i] == 1);
-            const wchar_t* leftText = wcscmp(kRows[i].key, L"lightMode") ? L"玻璃" : L"浅色";
-            const wchar_t* rightText = wcscmp(kRows[i].key, L"lightMode") ? L"纯色" : L"深色";
-            DrawTextAlpha(tx + 18, ty - 22, half - 30, 44, leftText, 20,
+            const wchar_t* lt = row.onText ? row.onText : L"开";
+            const wchar_t* rt = row.offText ? row.offText : L"关";
+            DrawTextAlpha(tx + 18, ty - 22, half - 30, 44, lt, 20,
                           leftOn ? 0xFFFFFFFF : 0xC0FFFFFF);
-            DrawTextAlpha(tx + half + 18, ty - 22, half - 30, 44, rightText, 20,
+            DrawTextAlpha(tx + half + 18, ty - 22, half - 30, 44, rt, 20,
                           leftOn ? 0xC0FFFFFF : 0xFFFFFFFF);
         } else {
             FillRound(g_setDC, RECT{tx, ty, tx + tw, ty + 6}, 3, 0x40FFFFFF);
-            double frac = (kRows[i].maxv > kRows[i].minv)
-                              ? (double)(g_rowVal[i] - kRows[i].minv) / (kRows[i].maxv - kRows[i].minv)
+            double frac = (row.maxv > row.minv)
+                              ? (double)(g_rowVal[i] - row.minv) / (row.maxv - row.minv)
                               : 0.0;
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
             int px = tx + (int)(frac * tw);
             FillRound(g_setDC, RECT{tx, ty, px, ty + 6}, 3, 0xFF4C9AFF);
             FillRound(g_setDC, RECT{px - 8, ty - 5, px + 8, ty + 11}, 8, 0xFFFFFFFF);
@@ -8297,22 +8521,24 @@ static void SettingsPaint() {
 }
 
 static int RowAt(int y) {
-    int start = 96;
-    for (int i = 0; i < kRowCount; i++) {
-        if (y >= start && y < start + kRowH) return i;
-        start += kRowH;
-    }
-    return -1;
+    const SPage* p = ActivePage();
+    if (!p) return -1;
+    int start = kRowsTop;
+    if (y < start || y >= kRowsTop + p->count * kRowH) return -1;
+    int i = (y - start) / kRowH;
+    return (i >= 0 && i < p->count) ? i : -1;
 }
 
 static void RowFromX(int i, int x) {
-    if (i < 0) return;
+    const SPage* p = ActivePage();
+    if (!p || i < 0 || i >= p->count) return;
+    const SRow& row = p->rows[i];
     int tx = 370, tw = g_setW - 370 - 170;
-    if (kRows[i].isToggle) {
-        int v = (x >= tx + tw / 2) ? 0 : 1;   // left pill = 玻璃 (1), right = 纯色 (0)
+    if (row.isToggle) {
+        int v = (x >= tx + tw / 2) ? 0 : 1;
         if (v != g_rowVal[i]) {
             g_rowVal[i] = v;
-            RowApply(i);
+            PageSet(i, v);
             SettingsPaint();
         }
         return;
@@ -8320,10 +8546,10 @@ static void RowFromX(int i, int x) {
     double frac = (double)(x - tx) / tw;
     if (frac < 0) frac = 0;
     if (frac > 1) frac = 1;
-    int v = kRows[i].minv + (int)(frac * (kRows[i].maxv - kRows[i].minv) + 0.5);
+    int v = row.minv + (int)(frac * (row.maxv - row.minv) + 0.5);
     if (v != g_rowVal[i]) {
         g_rowVal[i] = v;
-        RowApply(i);
+        PageSet(i, v);
         SettingsPaint();
     }
 }
@@ -8336,12 +8562,26 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
                 DestroyWindow(h);
                 return 0;
             }
+            // tabs first: clicking one switches the page and re-reads its values
+            int count = (int)g_pages.size();
+            for (int i = 0; i < count; i++) {
+                RECT tr = TabRect(i, count);
+                if (mx >= tr.left && mx < tr.right && my >= tr.top && my < tr.bottom) {
+                    if (i != g_page) {
+                        g_page = i;
+                        PageLoad();
+                        SettingsResizeForPage();
+                        SettingsPaint();
+                    }
+                    return 0;
+                }
+            }
             int i = RowAt(my);
             if (i >= 0) {
                 g_dragRow = i;
                 SetCapture(h);
-                RowFromX(i, GET_X_LPARAM(lp));
-            } else if (GET_Y_LPARAM(lp) > g_setH - 46) {
+                RowFromX(i, mx);
+            } else if (my > g_setH - 46) {
                 DestroyWindow(h);
             }
             return 0;
@@ -8354,14 +8594,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
             GetCursorPos(&p);
             ScreenToClient(h, &p);
             int i = RowAt(p.y);
-            if (i >= 0 && !kRows[i].isToggle) {
+            const SPage* pg = ActivePage();
+            if (pg && i >= 0 && !pg->rows[i].isToggle) {
                 int delta = GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1;
                 int v = g_rowVal[i] + delta;
-                if (v < kRows[i].minv) v = kRows[i].minv;
-                if (v > kRows[i].maxv) v = kRows[i].maxv;
+                if (v < pg->rows[i].minv) v = pg->rows[i].minv;
+                if (v > pg->rows[i].maxv) v = pg->rows[i].maxv;
                 if (v != g_rowVal[i]) {
                     g_rowVal[i] = v;
-                    RowApply(i);
+                    PageSet(i, v);
                     SettingsPaint();
                 }
             }
@@ -8386,7 +8627,34 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-static void ShowSettings() {
+// One page per window: the dock as a whole, the strip, every companion, every existing group.
+static void SettingsBuildPages(int hintKind, int hintId, int* hintPage) {
+    g_pages.clear();
+    g_pages.push_back(SPage{L"全局", L"dock", kRowsDock,
+                            (int)(sizeof(kRowsDock) / sizeof(kRowsDock[0])), kPageDock, 0});
+    g_pages.push_back(SPage{L"条", L"dock", kRowsStrip,
+                            (int)(sizeof(kRowsStrip) / sizeof(kRowsStrip[0])), kPageStrip, 0});
+    if (g_trayBar.hwnd && g_trayBar.enabled)
+        g_pages.push_back(SPage{L"托盘", L"traybar", kRowsTray,
+                                (int)(sizeof(kRowsTray) / sizeof(kRowsTray[0])), kPageTray, 0});
+    for (int id = 1; id <= g_groupCount; id++) {
+        wchar_t title[32];
+        swprintf_s(title, L"组 %d", id);
+        g_pages.push_back(SPage{title, L"", kRowsGroup,
+                                (int)(sizeof(kRowsGroup) / sizeof(kRowsGroup[0])), kPageGroup, id});
+    }
+    g_page = 0;
+    *hintPage = -1;
+    for (int i = 0; i < (int)g_pages.size(); i++) {
+        if (g_pages[i].kind != hintKind) continue;
+        if (hintKind != kPageGroup || g_pages[i].groupId == hintId) {
+            *hintPage = i;
+            break;
+        }
+    }
+}
+
+static void ShowSettings(int hintKind, int hintId) {
     if (g_setWnd) {
         SetForegroundWindow(g_setWnd);
         return;
@@ -8401,8 +8669,11 @@ static void ShowSettings() {
         RegisterClassExW(&wc);
         registered = true;
     }
-    RowLoad();
-    g_setH = 96 + kRowCount * kRowH + 76;
+    int hint = -1;
+    SettingsBuildPages(hintKind, hintId, &hint);
+    if (hint >= 0) g_page = hint;
+    PageLoad();
+    SettingsResizeForPage();                 // height follows the page that was picked
     RECT dockRect{};
     GetWindowRect(g_hwnd, &dockRect);
     int px = dockRect.left + (dockRect.right - dockRect.left) / 2 - g_setW / 2;
@@ -8415,9 +8686,9 @@ static void ShowSettings() {
         if (px < mi.rcWork.left) px = mi.rcWork.left;
         if (py + g_setH > mi.rcWork.bottom) py = mi.rcWork.bottom - g_setH;
     }
-    g_setWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"DockSettingsWindow", L"dock 设置",
-                               WS_POPUP, px, py, g_setW, g_setH, nullptr, nullptr,
-                               GetModuleHandleW(nullptr), nullptr);
+    g_setWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                               L"DockSettingsWindow", L"dock 设置", WS_POPUP, px, py, g_setW,
+                               g_setH, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_setWnd) return;
     g_setBits = nullptr;
     ShowWindow(g_setWnd, SW_SHOW);      // UpdateLayeredWindow needs a visible window
@@ -9452,7 +9723,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             else if (cmd == 4) ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr,
                                             SW_SHOWNORMAL);
-            else if (cmd == 5) ShowSettings();
+            else if (cmd == 5) ShowSettings(kPageStrip, 0);
             else if (cmd == 6) {
                 bool on = SetAutoStart(!AutoStartEnabled());
                 DLog(L"autostart -> %d (ok=%d)", (int)AutoStartEnabled(), (int)on);

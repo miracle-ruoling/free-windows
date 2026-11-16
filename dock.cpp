@@ -2707,6 +2707,65 @@ struct DockAnchorShm {
 static HANDLE g_anchorOwnMap = nullptr;
 static DockAnchorShm* g_anchorShm = nullptr;
 
+// ---- "cloak the taskbar" request for taskbar-hidden-until-win --------------------------
+// While the shell's tray flyout is open it insists on keeping its taskbar on screen: its own
+// hide timer is ignored and any move is reverted (measured 2026-11-16). Cloaking the taskbar
+// stops it being drawn while the shell's state stays "expanded", which is exactly what we
+// want - but DwmSetWindowAttribute is refused from another process (E_ACCESSDENIED), and
+// SW_HIDE from here breaks the next Win press (a hidden window is not brought back by the
+// shell's expand animation). So we only ask the mod, which runs inside explorer.
+struct TaskbarCtlShm {
+    unsigned int magic;          // 'DTC1'
+    unsigned int version;
+    unsigned int cloakUntilMs;   // GetTickCount() deadline; 0 = nothing to do
+    unsigned int pad;
+};
+static HANDLE g_taskbarCtlMap = nullptr;
+static TaskbarCtlShm* g_taskbarCtl = nullptr;
+
+static void TaskbarCtlEnsure() {
+    if (g_taskbarCtl) return;
+    SECURITY_DESCRIPTOR sd{};
+    SECURITY_ATTRIBUTES sa{};
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) return;
+    if (!SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE)) return;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    g_taskbarCtlMap = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
+                                         sizeof(TaskbarCtlShm), L"Local\\DockTaskbarCtl_v1");
+    if (!g_taskbarCtlMap) {
+        DLog(L"taskbar ctl: block NOT available (err=%lu)", (unsigned long)GetLastError());
+        return;
+    }
+    g_taskbarCtl = (TaskbarCtlShm*)MapViewOfFile(g_taskbarCtlMap, FILE_MAP_ALL_ACCESS, 0, 0,
+                                                 sizeof(TaskbarCtlShm));
+    if (!g_taskbarCtl) return;
+    g_taskbarCtl->magic = 0x31435444;      // 'DTC1'
+    g_taskbarCtl->version = 1;
+    g_taskbarCtl->cloakUntilMs = 0;
+    DLog(L"taskbar ctl: block ready (mod must implement it to take effect)");
+}
+
+static void TaskbarCloakSet(bool on) {
+    TaskbarCtlEnsure();
+    if (!g_taskbarCtl) return;
+    static DWORD lastWrite = 0;
+    const DWORD now = GetTickCount();
+    if (on) {
+        if (lastWrite && now - lastWrite < 500) return;    // refresh at most twice a second
+        g_taskbarCtl->cloakUntilMs = now + 2500;
+        lastWrite = now;
+    } else if (g_taskbarCtl->cloakUntilMs) {
+        g_taskbarCtl->cloakUntilMs = 0;
+        lastWrite = now;
+        DLog(L"tray: asked the mod to un-cloak the taskbar");
+    }
+}
+
+// Opening takes a moment (Win+B, the taskbar sliding up, Space, the flyout animating in), so
+// the cloak must survive the window where the flyout is not on screen yet.
+static DWORD g_cloakGraceUntil = 0;
+
 static void AnchorEnsureExists() {
     if (g_anchorShm) return;
     SECURITY_DESCRIPTOR sd{};
@@ -6972,29 +7031,6 @@ static void ClickScreenPoint(int x, int y) {
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
 }
 
-// Hide the taskbar while the shell's overflow flyout is on screen, and give it back the
-// moment the flyout is gone. SW_HIDE works cross-process (measured) and does not disturb the
-// flyout; leaving it hidden forever would break the next Win press, hence the restore.
-static bool g_trayHiddenForFlyout = false;
-
-static void NativeTrayRestoreTaskbar() {
-    if (!g_trayHiddenForFlyout) return;
-    g_trayHiddenForFlyout = false;
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray) return;
-    // Move it to the hidden slot *while it is still hidden*, then show: showing first would
-    // make the shell animate it down from y=1020, which is exactly the "taskbar pops up and
-    // slides away" the user saw.
-    RECT tr{};
-    if (GetWindowRect(tray, &tr)) {
-        const int screenH = GetSystemMetrics(SM_CYSCREEN);
-        SetWindowPos(tray, nullptr, tr.left, screenH - 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    ShowWindow(tray, SW_SHOWNA);          // show without activating, at the hidden slot
-    DLog(L"tray: native flyout - taskbar given back");
-}
-
 // Is the shell's flyout on screen right now (a parked one does not count)?
 static bool OverflowFlyoutOnScreen() {
     if (!g_trayNative) return false;
@@ -7056,6 +7092,11 @@ static bool NativeTrayPageKeyboard() {
     if (!GetWindowRect(tray, &before)) return false;
     const bool alreadyUp = (before.top + before.bottom) / 2 < screenH;
 
+    // Ask the mod to cloak the taskbar *before* Win+B raises it: that way it is never drawn,
+    // and cloaking is visual only, so the tray still takes the keyboard focus.
+    g_cloakGraceUntil = GetTickCount() + 1500;
+    TaskbarCloakSet(true);
+
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
     keybd_event('B', 0, 0, 0);
@@ -7064,32 +7105,21 @@ static bool NativeTrayPageKeyboard() {
     Sleep(40);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
 
-    // Win+B is what hands the *keyboard focus* to the tray, and hiding the taskbar window
-    // afterwards does not take that focus away (measured). So: hide it the moment it starts
-    // to rise and the taskbar is never seen at all - no rise animation, no blink.
-    bool hidden = false;
-    if (alreadyUp) {
-        ShowWindow(tray, SW_HIDE);
-        hidden = true;
-    } else {
-        for (int i = 0; i < 45; i++) {          // up to ~450 ms for the rise to start
-            Sleep(10);
-            RECT tr{};
-            if (!GetWindowRect(tray, &tr)) continue;
-            if (tr.top == before.top) continue;  // not moving yet
-            ShowWindow(tray, SW_HIDE);
-            hidden = true;
-            break;
-        }
+    bool up = alreadyUp;
+    for (int i = 0; i < 25 && !up; i++) {
+        Sleep(20);
+        RECT tr{};
+        if (!GetWindowRect(tray, &tr)) continue;
+        if ((tr.top + tr.bottom) / 2 < screenH) up = true;
     }
-    if (!hidden) {
+    if (!up) {
         DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
         return false;
     }
-    g_trayHiddenForFlyout = true;
     // wait until the tray really owns the focus, then activate the chevron
     for (int i = 0; i < 30 && GetForegroundWindow() != tray; i++) Sleep(10);
-    DLog(L"tray: native flyout - taskbar hidden, focus=%s", GetForegroundWindow() == tray ? L"tray" : L"elsewhere");
+    DLog(L"tray: native flyout - taskbar up, focus=%s",
+         GetForegroundWindow() == tray ? L"tray" : L"elsewhere");
     keybd_event(VK_SPACE, 0, 0, 0);
     Sleep(50);
     keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
@@ -7167,7 +7197,6 @@ static void NativeTrayPark() {
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     DLog(L"tray: native flyout %p parked off screen (was %ld,%ld)", (void*)flyout,
          (long)fr.left, (long)fr.top);
-    NativeTrayRestoreTaskbar();           // parked = gone: the taskbar comes back
 }
 
 static bool IsOverflowFlyoutWindow(HWND h) {
@@ -9632,19 +9661,17 @@ static void RenderTick() {
             LaunchWatchTick();
             FlushPendingUp(now);
             TrayAutoDoubleTick(now);
-            // The shell's tray flyout: keep its taskbar out of sight while it is on screen,
-            // and give the taskbar back as soon as the flyout is gone (parked counts as
-            // gone). Self healing: if the shell re-shows the taskbar, we hide it again.
+            // The shell's tray flyout: while it is on screen the shell keeps its taskbar up
+            // and refuses to hide it, so ask the mod (inside explorer) to cloak the taskbar
+            // for us. Released once the flyout is gone (parked counts as gone), with a grace
+            // period so the cloak survives the steps before the flyout appears.
             {
+                const DWORD now2 = GetTickCount();
                 if (OverflowFlyoutOnScreen()) {
-                    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-                    if (tray && IsWindowVisible(tray)) {
-                        ShowWindow(tray, SW_HIDE);
-                        g_trayHiddenForFlyout = true;
-                        DLog(L"tray: taskbar hidden while the overflow flyout is open");
-                    }
-                } else if (g_trayHiddenForFlyout) {
-                    NativeTrayRestoreTaskbar();
+                    g_cloakGraceUntil = 0;
+                    TaskbarCloakSet(true);
+                } else if (!g_cloakGraceUntil || (LONG)(now2 - g_cloakGraceUntil) >= 0) {
+                    TaskbarCloakSet(false);
                 }
             }
             CompanionTick(now);      // attached windows: follow, fade, tray state

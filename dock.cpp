@@ -2746,20 +2746,31 @@ static void TaskbarCtlEnsure() {
     DLog(L"taskbar ctl: block ready (mod must implement it to take effect)");
 }
 
+static DWORD g_cloakLastWrite = 0;
+
 static void TaskbarCloakSet(bool on) {
     TaskbarCtlEnsure();
     if (!g_taskbarCtl) return;
-    static DWORD lastWrite = 0;
     const DWORD now = GetTickCount();
     if (on) {
-        if (lastWrite && now - lastWrite < 500) return;    // refresh at most twice a second
+        if (g_cloakLastWrite && now - g_cloakLastWrite < 500) return;   // refresh twice a second
         g_taskbarCtl->cloakUntilMs = now + 2500;
-        lastWrite = now;
+        g_cloakLastWrite = now;
     } else if (g_taskbarCtl->cloakUntilMs) {
         g_taskbarCtl->cloakUntilMs = 0;
-        lastWrite = now;
+        g_cloakLastWrite = now;
         DLog(L"tray: asked the mod to un-cloak the taskbar");
     }
+}
+
+// Opening a flyout must not wait for the 500 ms refresh: a quick second "^" used to squeeze
+// between the release of the last cloak and this request, and the taskbar was visible for
+// the length of the Win+B expansion.
+static void TaskbarCloakForce() {
+    TaskbarCtlEnsure();
+    if (!g_taskbarCtl) return;
+    g_taskbarCtl->cloakUntilMs = GetTickCount() + 2500;
+    g_cloakLastWrite = GetTickCount();
 }
 
 // Opening takes a moment (Win+B, the taskbar sliding up, Space, the flyout animating in), so
@@ -7113,7 +7124,7 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     // Ask the mod to cloak the taskbar *before* Win+B raises it: that way it is never drawn,
     // and cloaking is visual only, so the tray still takes the keyboard focus.
     g_cloakGraceUntil = GetTickCount() + 1500;
-    TaskbarCloakSet(true);
+    TaskbarCloakForce();
 
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
@@ -7226,6 +7237,10 @@ static void NativeTrayToggle() {
     g_trayJobCtx.strip = dr;
     g_trayJobCtx.chev = ChevronRect(dr);
     g_fgBeforeTray = GetForegroundWindow();
+    // cloak right now, before the worker starts: a quick second click must not squeeze
+    // between the last release and this request
+    g_cloakGraceUntil = GetTickCount() + 2500;
+    TaskbarCloakForce();
     DLog(L"tray: native flyout toggle (wasOpen=%d flyout=%p)", (int)g_trayJobWasOpen,
          (void*)flyout);
     if (!g_trayJobThread) {

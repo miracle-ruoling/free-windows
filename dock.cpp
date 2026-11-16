@@ -2478,6 +2478,43 @@ static void OpenStartMenu() {
 // the shell keeps the bar up until Start closes, which it then does by itself.
 static HWND g_barSeen[8] = {};
 static int g_barSeenCount = 0;
+// While this is in the future the dock keeps asking the shell to put its taskbar back down
+// (see HideNativeTaskbar). Cloaked counts as down: the mod cloaks the bar while our tray
+// flyout is up, and that must not be fought.
+static DWORD g_barHideRetryUntil = 0;
+
+static bool NativeTaskbarOnScreen() {
+    struct Ctx {
+        bool on;
+    } ctx{false};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            wchar_t cls[64]{};
+            if (!GetClassNameW(h, cls, 64)) return TRUE;
+            if (_wcsicmp(cls, L"Shell_TrayWnd") != 0 &&
+                _wcsicmp(cls, L"Shell_SecondaryTrayWnd") != 0)
+                return TRUE;
+            if (!IsWindowVisible(h)) return TRUE;
+            int cloaked = 0;
+            if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+                cloaked)
+                return TRUE;
+            RECT r{};
+            if (!GetWindowRect(h, &r)) return TRUE;
+            HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{sizeof(mi)};
+            if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+            const int top = r.top > mi.rcMonitor.top ? r.top : mi.rcMonitor.top;
+            const int bottom = r.bottom < mi.rcMonitor.bottom ? r.bottom : mi.rcMonitor.bottom;
+            if (bottom - top > 8) {
+                *(bool*)lp = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        (LPARAM)&ctx);
+    return ctx.on;
+}
 
 static void RememberBar(HWND h) {
     for (int i = 0; i < g_barSeenCount; i++)
@@ -2500,6 +2537,10 @@ static BOOL CALLBACK HideTaskbarProc(HWND h, LPARAM lp) {
 static void HideNativeTaskbar() {
     int found = 0;
     EnumWindows(HideTaskbarProc, (LPARAM)&found);
+    // Keep asking for a couple of seconds: the shell defers the hide while one of its popups
+    // is opening (measured with Start / Win+X), and when the deferral is lost the bar simply
+    // stays up until the user clicks somewhere else - the rare "it did not go away" case.
+    g_barHideRetryUntil = GetTickCount() + 2500;
     if (found) return;
     for (int i = 0; i < g_barSeenCount; i++) {
         if (!IsWindow(g_barSeen[i])) continue;
@@ -9734,7 +9775,29 @@ static void RenderTick() {
             LaunchWatchTick();
             FlushPendingUp(now);
             TrayAutoDoubleTick(now);
-            // The shell's tray flyout: while it is on screen the shell keeps its taskbar up
+            // The shell sometimes defers our "hide the native taskbar" while one of its own
+            // popups is opening (Start, Win+X). When that deferral is dropped the bar simply
+            // stays up until the user clicks elsewhere - the rare "it did not go away" case.
+            // So keep asking for a couple of seconds (never while our tray flyout is what
+            // keeps it on screen).
+            if (g_barHideRetryUntil && (LONG)(now - g_barHideRetryUntil) < 0 &&
+                !OverflowFlyoutOnScreen()) {
+                static DWORD lastAsk = 0;
+                if (!lastAsk || now - lastAsk >= 350) {
+                    lastAsk = now;
+                    if (NativeTaskbarOnScreen()) {
+                        int found = 0;
+                        EnumWindows(HideTaskbarProc, (LPARAM)&found);
+                        if (!found) {
+                            for (int i = 0; i < g_barSeenCount; i++) {
+                                if (IsWindow(g_barSeen[i]))
+                                    PostMessageW(g_barSeen[i], WM_TIMER, 2, 0);
+                            }
+                        }
+                        DLog(L"win button: taskbar still on screen - asked again");
+                    }
+                }
+            }
             // and refuses to hide it, so ask the mod (inside explorer) to cloak the taskbar
             // for us. Released once the flyout is gone (parked counts as gone), with a grace
             // period so the cloak survives the steps before the flyout appears.

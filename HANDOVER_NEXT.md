@@ -7,12 +7,12 @@
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
-> **新对话第一件事（5 分钟）**：读本文 §0 → **§3.15（最新进度：H1.1 的结论 + H1.2 已完成）** →
-> `PLAN_COMPONENTS.md` 全文 → §4（改代码前必须知道的 12 件事）。需要改设置面板时再看 §3.13（G3 面板结构），
-> 需要碰组/浮窗几何时看 §3.11–§3.12。
-> **接下来**：①用户做完 Windhawk 的两个 A/B 后，用 `dev/t_start_typing.ps1` 给 H1.1 定案（并补 mod 里
-> 那两个缺 `case dock` 的 switch）；②然后进 H2（设置按组件重构，用户已把 6 个决策全部拍板，见
-> `PLAN_COMPONENTS.md` §7）。
+> **新对话第一件事（5 分钟）**：读本文 §0 → **§3.16（托盘=原生浮窗，最新、最重要）** →
+> §3.15（H1 两个 bug 的结论）→ `PLAN_COMPONENTS.md` 全文 → §4（改代码前必须知道的 12 件事）。
+> 需要改设置面板时再看 §3.13（G3 面板结构），需要碰组/浮窗几何时看 §3.11–§3.12。
+> **接下来**：①H2（设置按组件重构）—— 用户已把决策全部拍板，见 `PLAN_COMPONENTS.md` §2/§7；
+> ②`PLAN_COMPONENTS.md` §3.4 那两条（玻璃页"拖动时是否更新背景"、玻璃改成"处理层"+图片背景）
+> 还等 A9/A10 三个小问题；③§3.16 末尾"极小概率任务栏露头"的可选加固（把许可撤消挪进 20ms 轮询）。
 
 ---
 
@@ -765,6 +765,51 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 `paint=26.27ms (glass 25.63) / bake=25.33ms`，`160 repaints / 160 captures in 10s`。
 ⇒ **一个玻璃窗口 ≈ 半个核**；H3 必须"每次 tick 一个预算 + 轮转"，不能每窗各抓一份（详见
 `PLAN_COMPONENTS.md` §3.3）。
+
+---
+
+### 3.16 托盘改成"原生浮窗"（2026-11-16 23:0x–00:0x，用户实测通过）
+
+**目标（用户拍板）**：宫格不再自己画、自己转发点击；**点 `^` 就把 shell 自己的溢出托盘浮窗
+（`TopLevelWindowForOverflowXamlIsland`）叫出来、摆到 `^` 下面**，之后一切交互都是原生的
+（双击 / 右键菜单 / 有鼠标钩子的 app 全部正常）。开关：**`[tray] native=1`（默认）**，`=0` 回到自绘宫格。
+
+| 环节 | 做法 |
+|---|---|
+| 打开 | `Win+B`（把键盘焦点交给托盘，**不弹开始菜单**）→ 等任务栏 rect 上屏 → `Space`（激活焦点所在的 `^`）→ 浮窗出现 |
+| 摆放 | `SettleFlyout()`：从按下 Space 起每 15ms 找一次，**一出现就搬**，并在滑入动画期间**持续钉住**（shell 在动画结束时会自己再定位一次） |
+| 任务栏 | 见下面的 cloak 协议；**不要**用 `SW_HIDE`（隐藏后 shell 再也显示不回来，Win/Win+X 全废），**不要**用 `SetWindowPos`（shell 立刻弹回），**不要**跨进程 `DwmSetWindowAttribute`（`E_ACCESSDENIED`） |
+| 关闭 | 浮窗被点掉/被挪走后：**把键盘焦点还给打开前的窗口**（否则托盘抱着焦点，shell 过几秒会把任务栏重新展开），发 shell 隐藏定时器，再保持 cloak 500ms |
+| 兜底 | 拿不到浮窗 → `PostMessage(WM_APP+21)` 回 UI 线程 → 用自绘宫格（日志 `falling back to the built-in grid`） |
+| 线程 | 整个开/关序列跑在**工作线程**（`TrayJobProc`）。在窗口线程里 `Sleep` 会饿死 `WH_MOUSE_LL` → **全系统鼠标卡顿**（用户实测"点完几百毫秒内很卡"） |
+| 关闭后立刻再点 | cloak 请求在按钮当次**强制写**（绕过节流），否则快速二次点击会落在"上次释放"和"本次请求"之间 → 看见完整的 Win+B 过程 |
+
+**任务栏 cloak 协议（dock ↔ `taskbar-hidden-until-win`）**
+- 共享块 `Local\DockTaskbarCtl_v1`：`{ magic='DTC1'(0x31435444), version=1, cloakUntilMs, pad }`，
+  `cloakUntilMs` 是 `GetTickCount()` 截止时间（0 = 不 cloak）。dock 建块（空 DACL，抄 `AnchorEnsureExists()`）。
+- mod 每 20ms 读一次：`cloakUntilMs` 未过期 → 对 `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` 设
+  `DWMWA_CLOAK=1`（mod 在 explorer 里，所以允许）；否则解 cloak。
+- **释放不是立刻的**：只要任务栏窗口还压在显示器上就继续 cloak（否则隐藏动画那几百毫秒会被点亮）。
+- **用户按 Win 时**：mod 只有在 `!DockWantsCloak()` 时才解 cloak（dock 自己那次程序化 Win+B 不能亮出来）；
+  并且 `TaskbarOnScreen()` 把 **cloaked 当成"不在屏幕上"**，这样浮窗关掉后第一次按 Win 仍然是
+  "允许一次展开"而不是"把已经展开的再藏起来"。
+- mod 源码：`windhawk/local@taskbar-hidden-until-win.wh.cpp`，运行时用
+  `C:\ProgramData\Windhawk\ModsSource\` 里那份（**改了要用户在 Windhawk UI 里 Compile**）。
+  本轮给它加了 `-ldwmapi` 和 `#include <dwmapi.h>`。
+
+**还剩下的极小概率现象（未定位，用户已接受）**：偶尔（不可复现）与本轮无关的任务栏活动
+（左键/右键条上的 Win 按钮、其它零散操作）会让任务栏露一下，**并且偶尔不自动收起，直到点别处**。
+已知的两个可信机制：
+1. **shell 会把我们的隐藏请求推迟**（开始菜单/Win+X 弹窗正在开时）：实测 `WM_TIMER 2` 被接受但
+   任务栏不降，直到弹窗关闭。⇒ 本轮加了**重试**：`HideNativeTaskbar()` 之后 2.5s 内，只要
+   `NativeTaskbarOnScreen()` 为真且不是我们的浮窗在撑，就每 350ms 再要一次（日志
+   `win button: taskbar still on screen - asked again`）。
+2. **mod 的展开许可（`g_allowOpen`）有最长 500ms 的窗口**（Watchdog 每 500ms 才撤销一次），
+   这期间"底部边缘悬停"能通过 `MouseAllowedToShow()` → 任务栏冒出来。**下一步**：把撤销移到 20ms
+   的轮询里（`Watchdog` 的其余部分保持不变），这个窗口就缩到 20ms。
+**下次排查的话**：`loggrep.ps1 -Pattern "taskbar still on screen|hid the native taskbar|via a remembered handle|native flyout"`，
+看事件前后有没有 `via a remembered handle`（说明当时枚举不到任务栏 = 已经展开）以及有没有
+`falling back to the built-in grid`。**不要在窗口线程里加 sleep**（见上表）。
 
 ---
 

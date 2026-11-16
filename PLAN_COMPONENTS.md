@@ -420,6 +420,22 @@ cadence: 160 repaints / 160 captures in 10000 ms      (refreshHz=144, captureHz=
    `SW_SHOWNA` 回来并放回屏幕外的隐藏位（`screenH-2`），这样之后按 Win 仍然能把任务栏叫出来。
    **不需要改 mod**。
 
+**2026-11-16 23:5x 最终形态（用户实测"基本正常"）**
+
+任务栏的隐藏改成 **mod 侧 cloak**（`Local\DockTaskbarCtl_v1`，`'DTC1'` + 到期时间戳）：
+
+| 时机 | 谁做什么 |
+|---|---|
+| 点 `^`（按钮当次，UI 线程） | dock **立刻**写 `cloakUntilMs = now+2500`（**绕过节流**，否则快速二次点击会落在"上一次释放"和"这次请求"之间的缝里 → 看见 Win+B 全过程） |
+| `Win+B` 上升期间 | mod 已经 cloak → **上升不可见**；mod 只在 `!DockWantsCloak()` 时才在 Win 按下时解 cloak，所以它自己那次"程序化 Win"不会把任务栏亮出来 |
+| 浮窗开着 | dock 在 16ms housekeeping 里持续刷新请求（每 500ms 一次），浮窗消失 → 焦点还给原窗口 + 发 shell 隐藏定时器 + **再 cloak 500ms**（隐藏动画整段不可见） |
+| 释放后 | mod 仍然保持 cloak，**直到任务栏窗口真的不在显示器上**（避免"释放瞬间点亮"） |
+| 用户按 Win | mod 解 cloak 并允许一次展开；因为 cloak 中的任务栏被 `TaskbarOnScreen()` 当成"不在屏幕上"，第一次 Win 就有效 |
+
+剩下的唯一瑕疵：mod 的轮询是 20ms，所以理论上最坏有 ~20ms 的窗口（一帧），用户判断不值得再优化。
+**开/关序列跑在工作线程**（`TrayJobProc`）：窗口线程里跑 500ms+ 的 `Sleep` 会把 `WH_MOUSE_LL` 饿死 →
+**全系统鼠标卡顿**（实测症状"点完按钮几百毫秒内鼠标很卡"）。
+
 ---
 
 ## 6. 探针/工具（沿用现有）

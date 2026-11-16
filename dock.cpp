@@ -2765,6 +2765,9 @@ static void TaskbarCloakSet(bool on) {
 // Opening takes a moment (Win+B, the taskbar sliding up, Space, the flyout animating in), so
 // the cloak must survive the window where the flyout is not on screen yet.
 static DWORD g_cloakGraceUntil = 0;
+// What had the focus before we opened the flyout: a tray that keeps the keyboard focus makes
+// the shell expand its taskbar again later, so the focus is handed back when the flyout goes.
+static HWND g_fgBeforeTray = nullptr;
 
 static void AnchorEnsureExists() {
     if (g_anchorShm) return;
@@ -6876,17 +6879,14 @@ static void TrayMenuTick() {
 //     (horizontal strip)
 // A strip that is bigger than the free space wins over the overlap rule, never over the
 // screen rule.
-static void PanelPlacement(const RECT& dr, int w, int h, int* outX, int* outY) {
-    RECT wa{};
-    MONITORINFO mi{sizeof(mi)};
-    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
-    if (mon && GetMonitorInfoW(mon, &mi)) {
-        wa = mi.rcWork;
-    } else {
-        wa = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    }
+// Everything the placement needs, taken once on the window thread: the worker that opens the
+// flyout must not read g_slots (the strip may rearrange under it).
+struct PanelCtx {
+    RECT strip;
+    RECT chev;
+};
 
-    // the "^" slot, in screen coordinates (fall back to the whole strip)
+static RECT ChevronRect(const RECT& dr) {
     RECT chev = dr;
     POINT org{0, 0};
     ClientToScreen(g_hwnd, &org);
@@ -6896,6 +6896,20 @@ static void PanelPlacement(const RECT& dr, int w, int h, int* outX, int* outY) {
                         org.y + s.rc.bottom};
             break;
         }
+    }
+    return chev;
+}
+
+static void PanelPlacementIn(const PanelCtx& ctx, int w, int h, int* outX, int* outY) {
+    const RECT dr = ctx.strip;
+    const RECT chev = ctx.chev;
+    RECT wa{};
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        wa = mi.rcWork;
+    } else {
+        wa = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
     }
 
     const int gap = 8;
@@ -6934,9 +6948,16 @@ static void PanelPlacement(const RECT& dr, int w, int h, int* outX, int* outY) {
          y, w, h, wa.left, wa.top, wa.right, wa.bottom);
 }
 
+static void PanelPlacement(const RECT& dr, int w, int h, int* outX, int* outY) {
+    PanelCtx ctx{dr, ChevronRect(dr)};
+    PanelPlacementIn(ctx, w, h, outX, outY);
+}
+
 static void GridPlacement(const RECT& dr, int* outX, int* outY) {
     PanelPlacement(dr, g_gridW, g_gridH, outX, outY);
-}static void GridShow() {
+}
+
+static void GridShow() {
     if (!g_gridWnd) {
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = GridProc;
@@ -7045,7 +7066,7 @@ static bool OverflowFlyoutOnScreen() {
 // shell draws it at its own place first and re-positions it at the end of its slide-in, so a
 // single SetWindowPos right after the key press is not enough (measured: it jumped back).
 // Returns true when the flyout was found at all.
-static bool SettleFlyout(int ms) {
+static bool SettleFlyout(const PanelCtx& ctx, int ms) {
     HWND flyout = nullptr;
     int tx = 0, ty = 0, tw = 0, th = 0;
     bool havePlan = false;
@@ -7057,13 +7078,10 @@ static bool SettleFlyout(int ms) {
             if (GetWindowRect(flyout, &fr)) {
                 seen = true;
                 if (!havePlan) {
-                    RECT dr{};
-                    if (GetWindowRect(g_hwnd, &dr)) {
-                        tw = (int)(fr.right - fr.left);
-                        th = (int)(fr.bottom - fr.top);
-                        PanelPlacement(dr, tw, th, &tx, &ty);
-                        havePlan = true;
-                    }
+                    tw = (int)(fr.right - fr.left);
+                    th = (int)(fr.bottom - fr.top);
+                    PanelPlacementIn(ctx, tw, th, &tx, &ty);
+                    havePlan = true;
                 }
                 if (havePlan && (fr.left != tx || fr.top != ty)) {
                     SetWindowPos(flyout, HWND_TOPMOST, tx, ty, 0, 0,
@@ -7084,7 +7102,7 @@ static bool SettleFlyout(int ms) {
 // Start menu, and the shell puts the keyboard focus on the "show hidden icons" chevron, so a
 // single Space opens the flyout (measured by the user 2026-11-16 23:0x). It also needs no
 // screen coordinates. Falls back to "Win + click the chevron" if the taskbar never shows up.
-static bool NativeTrayPageKeyboard() {
+static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
@@ -7123,14 +7141,14 @@ static bool NativeTrayPageKeyboard() {
     keybd_event(VK_SPACE, 0, 0, 0);
     Sleep(50);
     keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
-    const bool seen = SettleFlyout(500);
+    const bool seen = SettleFlyout(ctx, 500);
     DLog(L"tray: native flyout - keyboard path done, flyout %s", seen ? L"open" : L"MISSING");
     return true;
 }
 
 // Old path, kept as a fallback: Win press (which also opens Start - the flash) + a real
 // click on the chevron.
-static bool NativeTrayPageMouse() {
+static bool NativeTrayPageMouse(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
     keybd_event(VK_LWIN, 0, 0, 0);
@@ -7149,7 +7167,7 @@ static bool NativeTrayPageMouse() {
              (long)pt.x, (long)pt.y);
         ClickScreenPoint(pt.x, pt.y);
         Sleep(60);
-        const bool seen = SettleFlyout(400);
+        const bool seen = SettleFlyout(ctx, 400);
         HideNativeTaskbar();      // the flyout does not need it any more
         DLog(L"tray: native flyout - mouse path done, flyout %s", seen ? L"open" : L"MISSING");
         return true;
@@ -7158,28 +7176,68 @@ static bool NativeTrayPageMouse() {
     return false;
 }
 
-static bool NativeTrayPage() {
-    if (NativeTrayPageKeyboard()) return true;
-    return NativeTrayPageMouse();
+static bool NativeTrayPage(const PanelCtx& ctx) {
+    if (NativeTrayPageKeyboard(ctx)) return true;
+    return NativeTrayPageMouse(ctx);
+}
+
+// The whole open/close sequence needs ~0.5-1 s of waits. Running that on the window thread
+// starves our low level mouse hook, and a hook that does not answer within
+// LowLevelHooksTimeout stalls the *whole system's* pointer - measured as "the mouse is very
+// choppy for a second after clicking ^". So the waiting happens on a worker thread; it only
+// touches the shell's flyout window and posts a message back if it needs help.
+#define WM_APP_TRAY_FELL_BACK (WM_APP + 21)
+
+static HANDLE g_trayJobThread = nullptr;
+static volatile LONG g_trayJobBusy = 0;
+static PanelCtx g_trayJobCtx{};
+static bool g_trayJobWasOpen = false;
+
+static DWORD WINAPI TrayJobProc(LPVOID) {
+    const PanelCtx ctx = g_trayJobCtx;
+    const bool wasOpen = g_trayJobWasOpen;
+    if (!wasOpen) g_fgBeforeTray = GetForegroundWindow();
+    bool ok = NativeTrayPage(ctx);
+    if (ok && !wasOpen) {
+        // give it a moment to actually show up before deciding it failed
+        for (int i = 0; i < 10; i++) {
+            HWND f = FindOverflowFlyout();
+            if (f && IsWindowVisible(f)) break;
+            Sleep(30);
+        }
+    }
+    if (!ok || (!wasOpen && !OverflowFlyoutOnScreen())) {
+        DLog(L"tray: native flyout unavailable - asking for the built-in grid");
+        PostMessageW(g_hwnd, WM_APP_TRAY_FELL_BACK, 0, 0);
+    }
+    InterlockedExchange(&g_trayJobBusy, 0);
+    return 0;
 }
 
 static void NativeTrayToggle() {
-    HWND flyout = FindOverflowFlyout();
-    const bool wasOpen = flyout && IsWindowVisible(flyout);
-    DLog(L"tray: native flyout toggle (wasOpen=%d flyout=%p)", (int)wasOpen, (void*)flyout);
-    if (!NativeTrayPage()) {
-        if (!wasOpen) GridShow();          // cannot get at it: keep the built-in grid working
+    if (InterlockedCompareExchange(&g_trayJobBusy, 1, 0) != 0) {
+        DLog(L"tray: native flyout toggle ignored (previous one is still running)");
         return;
     }
-    if (wasOpen) return;                   // the click just closed it
-    // The page functions above already place the flyout (SettleFlyout); this is only the
-    // "it never showed up at all" fallback.
-    if (!flyout || !IsWindowVisible(flyout)) {
-        flyout = FindOverflowFlyout();
-        if (!flyout || !IsWindowVisible(flyout)) {
-            DLog(L"tray: native flyout did not appear - falling back to the grid");
-            GridShow();
-        }
+    HWND flyout = FindOverflowFlyout();
+    g_trayJobWasOpen = flyout && IsWindowVisible(flyout);
+    RECT dr{};
+    GetWindowRect(g_hwnd, &dr);
+    g_trayJobCtx.strip = dr;
+    g_trayJobCtx.chev = ChevronRect(dr);
+    g_fgBeforeTray = GetForegroundWindow();
+    DLog(L"tray: native flyout toggle (wasOpen=%d flyout=%p)", (int)g_trayJobWasOpen,
+         (void*)flyout);
+    if (!g_trayJobThread) {
+        g_trayJobThread = CreateThread(nullptr, 0, TrayJobProc, nullptr, 0, nullptr);
+    } else {
+        // reuse the finished thread's slot by starting a fresh one (the old handle is done)
+        CloseHandle(g_trayJobThread);
+        g_trayJobThread = CreateThread(nullptr, 0, TrayJobProc, nullptr, 0, nullptr);
+    }
+    if (!g_trayJobThread) {
+        InterlockedExchange(&g_trayJobBusy, 0);
+        DLog(L"tray: could not start the flyout worker thread");
     }
 }
 
@@ -9667,11 +9725,26 @@ static void RenderTick() {
             // period so the cloak survives the steps before the flyout appears.
             {
                 const DWORD now2 = GetTickCount();
+                static bool wasOnScreen = false;
                 if (OverflowFlyoutOnScreen()) {
                     g_cloakGraceUntil = 0;
+                    wasOnScreen = true;
                     TaskbarCloakSet(true);
                 } else if (!g_cloakGraceUntil || (LONG)(now2 - g_cloakGraceUntil) >= 0) {
                     TaskbarCloakSet(false);
+                    if (wasOnScreen) {
+                        wasOnScreen = false;
+                        // A tray that keeps the keyboard focus makes the shell expand its
+                        // taskbar again a few seconds later (the "it pops up by itself" the
+                        // user saw). Hand the focus back, then ask the shell to hide the bar.
+                        if (g_fgBeforeTray && IsWindow(g_fgBeforeTray)) {
+                            AllowSetForegroundWindow(ASFW_ANY);
+                            SetForegroundWindow(g_fgBeforeTray);
+                        }
+                        HideNativeTaskbar();
+                        g_fgBeforeTray = nullptr;
+                        DLog(L"tray: native flyout gone - focus handed back, taskbar hidden again");
+                    }
                 }
             }
             CompanionTick(now);      // attached windows: follow, fade, tray state
@@ -10135,6 +10208,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SavePosition();
             SaveSize();
             PaintAndPresent();
+            return 0;
+
+        case WM_APP_TRAY_FELL_BACK:
+            // the worker could not get the shell's flyout: keep the built-in grid usable
+            DLog(L"tray: falling back to the built-in grid");
+            if (!g_gridVisible) GridShow();
             return 0;
 
         case WM_LBUTTONUP:

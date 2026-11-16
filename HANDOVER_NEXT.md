@@ -564,6 +564,26 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 **未由人手复核**：拖组手感；光标在板面上是箭头（故意不换 size-all，避免"光标乱跳"）；
 菜单文案；`屏蔽缩放`/`屏蔽位移` 组合使用（两个都开时：拖成员=拖组、拖边=不拉伸，机器验过单开）。
 
+**修掉的 bug（2026-11-16 14:48 用户报告）：拖组时条的玻璃背景抖**
+
+- 现象：**拖组空隙**（板面）或**开屏蔽位移后拖小窗**时，条的玻璃背景出现"位移/抖动"；**直接拖条**就没有。
+- 根因：`CaptureBackdrop()` 里"拖动时的抓图边距"只认条自己的 `g_dragging`/`g_resizeEdge`：
+
+  ```cpp
+  const int M = (g_dragging || g_resizeEdge) ? g_bakeMargin : (blurRadius>0 ? 64 : 0);
+  ```
+
+  组拖动时这两者都是 false → 用户当前 profile（`glassOpacity=1 / blurRadius=0`）算出的边距是 **0 px**，
+  而拖动期间又禁止抓图 → 条一动就出快照范围、只能拿旧快照画 → 玻璃滑动/抖动。
+  直接拖条时 `g_dragging=true` → 边距 256 px → 覆盖住位移 → 不抖。
+  **不是"更新优先级"问题**，是快照边距没覆盖到"组拖动"这条路径。
+- 修法：`const bool moving = g_dragging || g_resizeEdge || GroupDragging();`
+- 证据（新增永久计数器：`cadence:` 后面那条 `… frames were painted out of a stale backdrop snapshot`）：
+  同样一次 ~420 px 的拖动——
+  **修前：20 帧用了过期快照（边距 0）；修后：1 帧（边距 256）**；
+  对照组"直接拖条 ~510 px"也是 **2 帧** —— 组拖动现在与条自身拖动同档。
+  （一次超过 256 px 的单向拖动，尾部仍会掉几帧：这是"拖动期间不抓图"的既有取舍，与修前无关。）
+
 ---
 
 ## 4. 改代码前必须知道的 11 件事

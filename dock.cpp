@@ -1009,6 +1009,10 @@ static int g_alpha = 255;
 static double g_qpcFreq = 0.0;
 static double g_statGlass = 0, g_statIcons = 0, g_statPresent = 0, g_statBake = 0;
 static int g_statPaints = 0, g_statPresents = 0, g_statBakes = 0;
+// Frames where the strip had moved out of its backdrop snapshot while a drag forbade
+// re-capturing. Non-zero means the glass is being drawn from a picture that no longer covers
+// the window - the "背景抖动" the user saw on 2026-11-16 14:48. Reported in the cadence line.
+static int g_lostSnapshot = 0;
 static void QpcInit() {
     LARGE_INTEGER f{};
     QueryPerformanceFrequency(&f);
@@ -7543,8 +7547,11 @@ static void CaptureBackdrop() {
     // wide margin while dragging, tight otherwise (see g_bakeMarginUsed)
     // A resize grows the window, so the bake has to be big enough that the next few
     // hundred pixels of growth are already inside it - otherwise every frame re-grabs.
-    const int M = (g_dragging || g_resizeEdge) ? g_bakeMargin
-                                              : (g_cfg.blurRadius > 0 ? 64 : 0);
+    // A *group* drag (board / 屏蔽位移) moves the strip exactly like its own drag does, so it
+    // must get the same margin; without it the snapshot was 0 px wide and every frame was
+    // painted from a picture that no longer covered the window ("背景抖动", 2026-11-16 14:48).
+    const bool moving = g_dragging || g_resizeEdge || GroupDragging();
+    const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
     g_bakeMarginUsed = M;
     int w = cw + 2 * M, h = ch + 2 * M;
 
@@ -8761,6 +8768,10 @@ static void RenderTick() {
             // cadence. The glass therefore keeps its last snapshot until the button is
             // released; that is a documented trade-off, not an oversight.
             bool busy = g_dragging || g_resizeEdge || GroupDragging();
+            // Instrumentation for the 2026-11-16 "背景抖动" report: if the strip leaves its
+            // snapshot while dragging, the glass is drawn from a stale picture. The margin fix
+            // is what keeps this at 0; the counter is how that stays verifiable.
+            if (busy && !covered) g_lostSnapshot++;
             if (g_cfg.captureHz > 0) {
                 UINT capMs = (UINT)(1000 / g_cfg.captureHz);
                 if (capMs < 1) capMs = 1;
@@ -8821,6 +8832,10 @@ static void RenderTick() {
                      L" %lu ms",
                      ticks, paints, g_captureCount, g_companionFollowMoves,
                      (unsigned long)span);
+                if (g_lostSnapshot)
+                    DLog(L"cadence: %d frames were painted out of a stale backdrop snapshot "
+                         L"(the drag outran the %d px bake margin)",
+                         g_lostSnapshot, g_bakeMargin);
                 // per-frame cost, measured with QPC
                 if (g_statPaints > 0) {
                     DLog(L"frame: n=%d paint=%.2fms (glass %.2f + icons %.2f) present=%.2fms"
@@ -8834,6 +8849,7 @@ static void RenderTick() {
                 g_statPaints = g_statPresents = g_statBakes = 0;
                 g_captureCount = 0;
                 g_companionFollowMoves = 0;
+                g_lostSnapshot = 0;
                 ticks = 0;
                 paints = 0;
             }

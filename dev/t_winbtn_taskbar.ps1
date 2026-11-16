@@ -1,4 +1,4 @@
-# Does the native taskbar come up during a fast "right -> left" cycle on the Windows cell?
+﻿# Does the native taskbar come up during a fast "right -> left" cycle on the Windows cell?
 #
 #   -Mode right-only       one right click (Win+X) and nothing else
 #   -Mode right-then-left  right click, wait -Gap ms, then a left click (Ctrl+Esc)
@@ -141,7 +141,7 @@ if ($strip -eq [IntPtr]::Zero -or -not [FS]::GetWindowRect($strip, [ref]$r)) {
     Write-Output "strip not found"; exit 1
 }
 $log = Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.log'
-$line = Get-Content $log -Tail 600 | Select-String -Pattern "layout: " | Select-Object -Last 1
+$line = Select-String -Path $log -Pattern "layout: " | Select-Object -Last 1
 if (-not $line -or $line.Line -notmatch "win=(-?\d+),(-?\d+)-(-?\d+),(-?\d+)") {
     Write-Output "cannot read the win cell from the layout log"; exit 1
 }
@@ -162,3 +162,4 @@ Start-Sleep -Milliseconds 400
 Write-Output "--- dock log (last 20 win button / retry lines) ---"
 Get-Content $log -Tail 200 | Select-String -Pattern "win button|tray:|falling back" | Select-Object -Last 20 |
     ForEach-Object { $_.Line }
+

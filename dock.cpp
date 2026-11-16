@@ -2582,6 +2582,11 @@ static void OpenPowerUserMenu() {
     // kept hitting while clicking left/right on this cell. Nothing here needs that expansion,
     // so tell the mod to keep the bar down for the length of the menu.
     TaskbarDenyExpansion(1200);
+    // Give the mod a moment to see it before the chord goes out. The mod reads the block on
+    // its own 20 ms tick, and the shell handles this chord within a few ms of the Win key, so
+    // without the margin the request simply arrived too late (measured 2026-11-17 00:59).
+    // The mod also reads the block directly now; this is the belt to that suspender.
+    Sleep(40);
     DLog(L"win button: right click -> win+x menu");
     SendChord(chord, 2);
     if (g_hwnd) SetTimer(g_hwnd, 6, 650, nullptr);
@@ -7210,20 +7215,38 @@ static bool SettleFlyout(const PanelCtx& ctx, int ms) {
 static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
+    // Closing: while the flyout is in front of the user it *owns* the keyboard focus, so a
+    // plain Space toggles it shut. Going through Win+B first is what broke closing - it moved
+    // the focus away and the Space went nowhere, so the dock fell back to the grid (measured
+    // 2026-11-17 01:0x: with the flyout open, a plain Space closed it and nothing else did).
+    {
+        HWND fg = GetForegroundWindow();
+        if (OverflowFlyoutOnScreen() && IsOverflowFlyoutWindow(fg)) {
+            DLog(L"tray: native flyout - close with Space (the flyout owns the focus)");
+            keybd_event(VK_SPACE, 0, 0, 0);
+            Sleep(50);
+            keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
+            for (int i = 0; i < 25; i++) {
+                Sleep(20);
+                HWND f = FindOverflowFlyout();
+                if (!f || !IsWindowVisible(f)) {
+                    DLog(L"tray: native flyout - closed by Space");
+                    return true;
+                }
+            }
+            DLog(L"tray: native flyout - Space did not close it, trying Win+B");
+        }
+    }
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     RECT before{};
     if (!GetWindowRect(tray, &before)) return false;
     const bool alreadyUp = (before.top + before.bottom) / 2 < screenH;
 
-    // Ask the mod to cloak the taskbar *before* Win+B raises it: that way it is never drawn,
-    // and cloaking is visual only, so the tray still takes the keyboard focus.
-    g_cloakGraceUntil = GetTickCount() + 1500;
-    TaskbarCloakForce();
-    // Make sure a "keep the taskbar down" request from a previous Win+X is not still live:
-    // Win+B is a real Win press and the mod's own permission covers the rise (measured: the
-    // bar is up 200-450 ms later). We deliberately do *not* hand out an extra permission
-    // here - doing that made the shell expand the bar before its tray-focus step and the
-    // flyout stopped opening (measured 2026-11-17 00:38, "focus=elsewhere").
+    // No cloak yet: cloaking the taskbar takes the keyboard focus away from it, and Win+B is
+    // exactly a request for that focus (measured 2026-11-17 01:1x: with the cloak on, Win+B
+    // left the foreground where it was; without it the focus arrived and Space opened the
+    // flyout). The cloak is requested as soon as the flyout is actually on screen, which is
+    // when the bar has to stop being drawn.
     TaskbarDenyExpansion(0);
 
     keybd_event(VK_LWIN, 0, 0, 0);
@@ -7234,6 +7257,11 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     Sleep(40);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
 
+    // What Win+B has to achieve is the *keyboard focus* on the tray, not an expanded bar.
+    // Waiting for the bar rect was wrong: with the mod keeping the taskbar down the bar often
+    // never moves, yet the focus does arrive and Space opens the flyout just fine (measured
+    // 2026-11-17 01:0x: fg=Shell_TrayWnd with the bar still at y=1078, Space -> flyout
+    // visible). That wait is what made this path fail half the time and fall back to the grid.
     bool up = alreadyUp;
     for (int i = 0; i < 25 && !up; i++) {
         Sleep(20);
@@ -7241,14 +7269,23 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
         if (!GetWindowRect(tray, &tr)) continue;
         if ((tr.top + tr.bottom) / 2 < screenH) up = true;
     }
-    if (!up) {
-        DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
-        return false;
+    bool focus = false;
+    for (int i = 0; i < 40 && !focus; i++) {
+        if (GetForegroundWindow() == tray) { focus = true; break; }
+        Sleep(10);
+    }
+    DLog(L"tray: native flyout - bar %s, focus=%s",
+         up ? L"up" : L"still down", focus ? L"tray" : L"elsewhere");
+    if (!focus && !up) {
+        // Keep going anyway: Win+B is unreliable on this build (measured 2026-11-17: the
+        // same chord sometimes gives the tray the focus and sometimes does nothing at all,
+        // with or without the mod, with or without a cloak), and a Space that goes nowhere
+        // costs nothing. The caller falls back to the mouse path / the grid when no flyout
+        // window shows up, so this is only a "maybe" step.
+        DLog(L"tray: native flyout - Win+B gave neither the focus nor the bar, pressing Space anyway");
     }
     // wait until the tray really owns the focus, then activate the chevron
     for (int i = 0; i < 30 && GetForegroundWindow() != tray; i++) Sleep(10);
-    DLog(L"tray: native flyout - taskbar up, focus=%s",
-         GetForegroundWindow() == tray ? L"tray" : L"elsewhere");
     keybd_event(VK_SPACE, 0, 0, 0);
     Sleep(50);
     keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
@@ -7263,6 +7300,10 @@ static bool NativeTrayPageMouse(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
     TaskbarDenyExpansion(0);           // a live Win+X deny must not block this Win press
+    // This path raises the real taskbar and clicks its chevron, so the bar must not be drawn:
+    // cloak it before the Win press goes out.
+    g_cloakGraceUntil = GetTickCount() + 2500;
+    TaskbarCloakForce();
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(30);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
@@ -7338,10 +7379,6 @@ static void NativeTrayToggle() {
     g_trayJobCtx.strip = dr;
     g_trayJobCtx.chev = ChevronRect(dr);
     g_fgBeforeTray = GetForegroundWindow();
-    // cloak right now, before the worker starts: a quick second click must not squeeze
-    // between the last release and this request
-    g_cloakGraceUntil = GetTickCount() + 2500;
-    TaskbarCloakForce();
     DLog(L"tray: native flyout toggle (wasOpen=%d flyout=%p)", (int)g_trayJobWasOpen,
          (void*)flyout);
     if (!g_trayJobThread) {

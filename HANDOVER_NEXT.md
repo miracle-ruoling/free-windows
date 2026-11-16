@@ -9,12 +9,13 @@
 > 5. `PLAN_COMPONENTS.md`（**下一步的全部内容**：H2 设置按组件重构的决策 + H3 玻璃共享快照设计）
 > 6. 需要时再看：本文 §3.11–§3.13（组/浮窗几何、设置面板结构）、`PLAN_GROUP.md`、`PLAN_COMPANION.md`
 > `HANDOVER_TODO_GLASS_LAG.md` 只当历史查，不要重读 §1–§4.9。
-> **待用户做的一件事**：`Taskbar hidden until Win` **1.0.2** 已写好在磁盘上
-> （`windhawk/local@taskbar-hidden-until-win.wh.cpp`，已同步到 `C:\ProgramData\Windhawk\ModsSource\`，
-> 本机用 Windhawk 自带的 clang 编过、只带既有两条 warning），需要他在 Windhawk UI 里 **Compile** 一次。
-> 这一版修的是 **§3.17**："快速左右键点 Win 按钮 ⇒ 任务栏露头"的真因（Win+X 会真的把任务栏抬起来 +
-> 展开许可死锁 + cloak 掩盖"已经站起来"的栏），以及 1.0.1 自己引入的 **cloak 死锁**
-> （cloaked 的任务栏 shell 收不回去 ⇒ 按 Win 什么都不发生、托盘的 Win+B 路径失效）。
+> **待用户做的一件事**：**可选** Compile 一次 `Taskbar hidden until Win` **1.0.3**
+> （`windhawk/local@taskbar-hidden-until-win.wh.cpp`，已同步到 `C:\ProgramData\Windhawk\ModsSource\`）。
+> 1.0.3 只把共享块（deny/allow）的读取从"20ms 缓存"改成"每次直读"，纯稳健性；
+> **现在装的 1.0.2 + dock 侧 40ms 余量已经能挡住 Win+X**，不编也不影响主 bug 的修复。
+> 主 bug 结论在 **§3.17**：Win+X 会真的把任务栏抬起来 + 展开许可死锁 + cloak 掩盖"已经站起来"的栏。
+> **下一轮第一件事**：`^` 的 native flyout 现在会退回自绘宫格（`Win+B` 在这台机器上当前完全不生效，
+> 与 mod 无关，实测见 §3.17），先杀 `StartMenuExperienceHost` + `SearchHost` 再复测。
 
 > 写于 2026-11-15 23:40，2026-11-16 18:3x 更新（R1–R4、G1–G3 全部完成；
 > **下一步的计划写在 `PLAN_COMPONENTS.md`：两个 bug 修复 + 设置按组件重构**）。
@@ -907,6 +908,30 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
     `allow` 字段留在协议里，暂时没人写。
 - **教训**：任何"先遮住、等条件满足再放开"的补偿机制，都要问一句**"那个条件会不会永远不满足"**。
 
+**1.0.2 实测（2026-11-17 01:0x–01:1x）**
+
+- **主 bug 已修并验过**：`dev/t_winbtn_taskbar.ps1 -Mode cycle -Gap 180 -Cycles 10`（8 秒内 20 次左右交替）
+  → 任务栏全程 `y=1078`，**一次都没抬**；`t_winbtn_repro.ps1` C 段 `minY=1078 riseAt=-1`。
+- **deny 的时序坑（真正的坑）**：dock 在发和弦前 1 ms 写 deny，而 mod 当时每 20 ms 才读一次共享块
+  ⇒ **请求迟到**，右键照旧把栏顶上去了（`01:0` 那轮 C 段 `riseAt=166ms`）。
+  外部写 deny 后等 300 ms 再发 Win+X 是**能挡住**的（`t_deny_winx.ps1`），这就把原因钉死了。
+  修法：dock 写完 deny 后 `Sleep(40)`；mod 1.0.3 里 `MouseAllowedToShow()` 改成**直读共享块**（不再吃缓存）。
+- **托盘 `^`（native flyout）当前不可靠，但不是这次改坏的**（`dev/t_winb_space.ps1` / `t_allow_winb.ps1`）：
+  - `Win+B` 现在**什么都不做**：既不把键盘焦点交给 `Shell_TrayWnd`，也不抬任务栏，
+    而且**跟 mod 的许可无关**（我直接往共享块写 `allow=+20s` 也一样无效）；
+  - 它**曾经好使**（00:37:48 `focus=tray`，01:0x 我手搓的探针也成过一次），所以是 shell 侧的状态问题
+    （§3.15 的老经验：**先杀 `StartMenuExperienceHost` + `SearchHost`**，别先怀疑 dock）；
+  - 现状：`^` 会走 `keyboard(MISSING) → mouse(MISSING) → 自绘宫格`，功能不丢但体验退步。
+    → **下一轮第一件事：重启 shell 那三个宿主，再跑 `dev/t_tray_rounds.ps1 -Rounds 4`**。
+- **顺手修好的两条**（都有实测支持）：
+  - **关闭托盘浮窗**：浮窗开着时它**自己持有键盘焦点**，直接发 `Space` 就能关掉；
+    原来先发 `Win+B` 反而把焦点挪走、`Space` 打空（`t_tray_close.ps1`：开着时 `Space` → `vis=False`，
+    `Win+B`+`Space` → 无效）。现在 `NativeTrayPageKeyboard()` 开头就走这条分支。
+  - **`HomePowerUserMenu` 之后接左键**：deny 生效后 Win+X 的菜单照样弹（anchor mod kind=4 摆位），
+    没有再出现"菜单出来但任务栏站着"。
+- **1.0.3（源码已就绪，Compile 可选）**：只把 deny/allow 的读取从"20 ms 缓存"改成"每次直读"，
+  纯稳健性。不 Compile 也能用 —— dock 侧那 40 ms 余量已经够。
+
 ---
 
 ## 4. 改代码前必须知道的 12 件事
@@ -995,7 +1020,13 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_tray_stuck.ps1`** | 【§3.17】用一次托盘浮窗，再逐步看任务栏（开浮窗 → 关 → 求隐藏 → 按 Win ×2），验证"展开+cloaked 残留"还在不在 |
 | **`t_winbtn_gapsweep.ps1`** | 【§3.17】扫"右键→左键"的间隔（120/200/300/450/700/1000ms），每轮报 `minY/maxY/riseAt` 和前台窗口类（判断 Start 有没有真的开） |
 | `t_winbtn_permission.ps1 -Mode baseline\|after-winx\|after-left-latched` | 【§3.17】"悬停下边界"是不是能把栏顶起来（判定展开许可有没有被死锁）。**注意**：Win+X 弹窗开着时悬停不一定产生 unhide 请求，阴性结果不能当结论 |
-| `t_winbtn_taskbar.ps1 -Mode right-only\|right-then-left\|left-only\|cycle` | 【§3.17】按方案注入点击、10ms 采样任务栏 rect 的最早版本（被 `t_winbtn_repro.ps1` 取代，留着看细节） |
+| `t_winbtn_taskbar.ps1 -Mode right-only\|right-then-left\|left-only\|cycle` | 【§3.17】按方案注入点击、10ms 采样任务栏 rect 的最早版本（被 `t_winbtn_repro.ps1` 取代，留着看细节；**`-Mode cycle` 是最终验收用的那一条**） |
+| **`t_win_hover_toggle.ps1`** | 【§3.17】不碰 dock：悬停下边界 5 秒（必须不动）+ 连按两次 Win（必须"藏/显"）+ Esc |
+| **`t_deny_probe.ps1` / `t_deny_winx.ps1`** | 【§3.17】自己往共享块写 `deny`，验证"mod 到底读不读这个块"以及"deny 生效时 Win+X 抬不抬栏" |
+| **`t_allow_winb.ps1` / `t_winb_probe.ps1` / `t_winb_space.ps1`** | 【§3.17】`Win+B` 到底给了谁焦点、要不要任务栏先升起来才能 `Space` 打开浮窗（结论：不用；但 `Win+B` 本身会失效，见 §3.17） |
+| **`t_tray_close.ps1`** | 【§3.17】浮窗开着时用 `Space` / `Win+B`+`Space` 关它（结论：纯 `Space` 就行） |
+| **`t_tray_rounds.ps1 -Rounds N`** | 【§3.17】连开连关 N 轮 `^`，统计 native flyout 成功/退回宫格的次数（下一轮复测就用它） |
+| **`t_cloak_focus.ps1`** | 【§3.17】cloak 与 `Win+B` 焦点的关系探针（**注意**：dock 会把自己的 cloak 请求清掉，别用它读状态） |
 | `t_win_probe5/6.ps1` + `shotdiff.py` | 【本轮】"开始菜单窗口搬不动"的探针：probe5 移动面板窗口并前后截图，`shotdiff.py a.png b.png` 出 `changed=N` 与包围盒（实测 `changed=0 of 2073600`） |
 | `t_winx.ps1 [-Move]` | 【本轮】Win+X 菜单的探针：新出现的窗口类/矩形，以及 `SetWindowPos` 后矩形是否真的变（这台机器：不变） |
 | `t_winx_anchor.ps1` | 【本轮】右键首格 → 打印 Win+X 弹窗实际 rect、`kind=4` 锚点、期望落点（现在应完全一致） |

@@ -4429,9 +4429,12 @@ static void CompanionFollowTo(int stripX, int stripY) {
     // A group scale moves *and* resizes every member itself (GroupScaleTo); translating here on
     // top of that would shift everything a second time.
     if (GroupScaling()) return;
+    // NOTE: a *group drag* must NOT bail out here. Group 1's drag only drives the strip
+    // (`g_cfg` + `g_dragMovePending`) and this function is what carries the companion and the
+    // frame along - returning early left the strip moving alone (bug 2026-11-16 15:36).
+    // A group without the strip moves its own members absolutely and never reaches here.
     // Only the default group follows the strip - the others are independent (G2).
     Group& dg = DefaultGroup();
-    if (dg.drag.active) return;      // a group drag owns every rectangle right now
     // The frame is pure derived geometry, so a group-wide move is just a translation - and it
     // has to happen on this path (not on the 16 ms housekeeping gate) for the same reason the
     // companions do: the frame must land in the strip's composition, not a frame later.

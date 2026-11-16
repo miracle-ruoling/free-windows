@@ -9,7 +9,7 @@
 #   * the ini gets the new positions (so a restart keeps them).
 #
 #   .\t_groupdrag.ps1 [-Dx 200] [-Dy 120] [-Inset 20]
-param([int]$Dx = 200, [int]$Dy = 120, [int]$Inset = 20, [int]$Margin = 40, [int]$Steps = 20, [int]$StepMs = 16)
+param([int]$Dx = 200, [int]$Dy = 120, [int]$Inset = 20, [int]$Margin = 40, [int]$Steps = 20, [int]$StepMs = 16, [switch]$Gap)
 Add-Type -Language CSharp @"
 using System; using System.Runtime.InteropServices; using System.Text; using System.Threading;
 public class GD {
@@ -38,12 +38,11 @@ public class GD {
       StringBuilder b = new StringBuilder(160); GetClassName(h, b, 160);
       if (b.ToString() != cls) return true;
       if (first == IntPtr.Zero) first = h;
-      if (Show(h)) { visible = h; return false; }
+      if (IsVisible(h)) { visible = h; return false; }
       return true; }, IntPtr.Zero);
     return visible != IntPtr.Zero ? visible : first;
   }
-  static bool Show(IntPtr h) { return IsWindowVisibleNative(h); }
-  [DllImport("user32.dll", EntryPoint = "IsWindowVisible")] static extern bool IsWindowVisibleNative(IntPtr h);
+
   public static IntPtr ThreadCapture(IntPtr h) {
     uint tid = GetWindowThreadProcessId(h, IntPtr.Zero);
     GUITHREADINFO gi = new GUITHREADINFO();
@@ -59,19 +58,23 @@ public class GD {
   static string R(RECT r) { return r.Left + "," + r.Top + "-" + r.Right + "," + r.Bottom +
                                    " (" + (r.Right - r.Left) + "x" + (r.Bottom - r.Top) + ")"; }
   public static string Run(IntPtr strip, IntPtr comp, IntPtr box, int dx, int dy, int inset,
-                           int margin, int steps, int stepMs) {
+                           int margin, int steps, int stepMs, bool gap) {
     RECT s0; GetWindowRect(strip, out s0);
     SetCursorPos((s0.Left + s0.Right) / 2, (s0.Top + s0.Bottom) / 2);
     Thread.Sleep(600);
+    // G2: several group windows exist and are hidden until used - pick the visible one now
+    box = Find("DockGroupBoxWindow");
     RECT b0, c0; GetWindowRect(box, out b0); GetWindowRect(comp, out c0);
     if (!IsVisible(box)) return "frame not visible - pointer not on the strip?";
-    if (b0.Right - b0.Left < 2 * margin + 20)
+    if (!gap && b0.Right - b0.Left < 2 * margin + 20)
       return "frame too small for this test: " + R(b0) + " - set [group] margin=" + margin +
              " and restart";
 
     // grab point: `inset` px inside the left edge, half height -> outside the ring (<=10 px)
     // and outside every member (the margin band is empty by construction)
-    int gx = b0.Left + inset, gy = (b0.Top + b0.Bottom) / 2;
+    // `gap` mode: the empty board between the strip and the companion (works with margin=8)
+    int gx = gap ? (s0.Right + 2) : (b0.Left + inset);
+    int gy = gap ? ((s0.Top + s0.Bottom) / 2) : ((b0.Top + b0.Bottom) / 2);
     POINT probe; probe.X = gx; probe.Y = gy;
     var sb = new StringBuilder();
     sb.AppendFormat("before: frame {0} | strip {1} | companion {2}\n", R(b0), R(s0), R(c0));
@@ -121,4 +124,4 @@ $strip = [GD]::Find('DockStripWindow'); $comp = [GD]::Find('DockTrayBarWindow');
 if ($strip -eq [IntPtr]::Zero -or $comp -eq [IntPtr]::Zero -or $box -eq [IntPtr]::Zero) {
     Write-Output 'missing window'; exit 1
 }
-Write-Output ([GD]::Run($strip, $comp, $box, $Dx, $Dy, $Inset, $Margin, $Steps, $StepMs))
+Write-Output ([GD]::Run($strip, $comp, $box, $Dx, $Dy, $Inset, $Margin, $Steps, $StepMs, [bool]$Gap))

@@ -117,25 +117,28 @@ kind=1 的 `Place()`，并给两个 switch 加 `default:` 兜住。
 - **(c) 一律双击**：对所有图标发两次 —— 最省事，但会破坏"单击打开菜单/切换"的程序（第二次点击会把菜单关掉），
   **不推荐**。
 
-#### 结论与实现（2026-11-16 20:0x，**H1.2 已完成并端到端验证**）
+#### 结论与实现（2026-11-16 20:0x 做完，22:0x 改成"全部双击"）
 
-用户拍板：**(a) 为主 + (b) 作为可选开关**，实现如下。
+用户拍板：**(a) 为主 + (b) 作为可选开关**；随后用户又决定**不用给名单，全部双击**
+（"本来在宫格里面的 app 左键弹出之后再左键就不会有反馈"）⇒ `[tray] doubleClick` 的**默认值就是 `*`**。
 
 | 项 | 实现 | 证据（`dock.log`） |
 |---|---|---|
-| 名单 | `[tray] doubleClick=<exe 名或全路径>;`（`,` `;` 换行都能分隔，大小写不敏感），命中时把 down/up **发两遍** | `tray: left x2 click -> ... (c:\...\traytest.exe)` + `tray: '...' is on the double click list -> the pair is posted twice` |
-| 两遍的节奏 | 第一遍 down → ~70ms up → 立刻第二遍 down → ~70ms up（`g_upPendingRepeat` 在 `FlushPendingUp()` 里续排，总时长 ~140ms，远小于系统双击时间 500ms） | `left click up (after 94 ms)` → `left click down again (double click)` → `left click up (after 78 ms)` |
-| 自动重试（`[tray] autoDoubleClick=1`，默认 0） | 点完记下"前台 hwnd + 该 pid 的可见非最小化顶层窗口数"；**400ms** 后都**没变**才补发一对；只对左键、只补一次 | 该补时：`tray: auto double click - no reaction, sending a second click pair`；不该补时：`tray: auto double click not needed (fg moved=1, windows 1 -> 1)` |
-| 日志 | `left` / `left x2` 区分开；另外启动时打一条 `tray: double click list = [...] autoDoubleClick=N` 和 `tray: cell N (rR,cC) '<tip>' (<exe>) twice=N`（**排障时直接知道点哪格**） | 见上；`cell 11 (r2,c3) 'traytest (double click only)' ... twice=1` |
-| 诊断 | 新探针 `dev/traytest.exe`（`dev/traytest.cpp` + `dev/build_traytest.ps1`）—— 一个**只在双击时开窗**的假托盘程序，图标是品红色圆盘，方便在宫格里找 | — |
-| 探针 | `dev/t_traydouble.ps1 -Exe traytest.exe -Window TrayTestWindow`：从日志里读该程序的格子 → 点它 → 报告目标窗口状态 | 见下 |
+| 取值 | `[tray] doubleClick=` 支持：`*`（默认，全部）/ `<exe>[,<exe>]`（只这些）/ `-<exe>`（**例外，永不双击**，可以和 `*` 混用）；`,` `;` 换行都能分隔，大小写不敏感 | `tray: double click all=1 list=[] except=[] autoDoubleClick=0`；每个格子 `twice=1` |
+| 两遍的节奏 | 第一遍 down → ~70ms up → 立刻第二遍 down → ~70ms up（`g_upPendingRepeat` 在 `FlushPendingUp()` 里续排，总时长 ~140ms，远小于系统双击时间 500ms） | `left click up (after 78 ms)` → `left click down again (double click)` → `left click up (after 78 ms)` |
+| 为什么"多一次"是安全的 | 我们是 **PostMessage 到该 app 的托盘回调窗口**（不是合成鼠标事件），所以第二次点击**不可能**落进它刚弹出的菜单里；对"点了有反馈"的 app，第二次点击通常真的什么都不做（用户原话） | — |
+| 自动重试（`[tray] autoDoubleClick=1`，默认 0） | 只在没命中双击规则时用：点完记下"前台 hwnd + 该 pid 的可见非最小化顶层窗口数"，**400ms** 后都没变才补发一对；只左键、只补一次 | 该补时：`tray: auto double click - no reaction, sending a second click pair`；不该补时：`tray: auto double click not needed (fg moved=1, windows 1 -> 1)` |
+| 日志 | `left` / `left x2` 区分开；另打 `tray: cell N (rR,cC) '<tip>' (<exe>) twice=N`（**排障时直接知道点哪格**、哪一格被判成双击） | `cell 12 (r3,c0) 'traytest ...' twice=1` |
+| 诊断 | `dev/traytest.exe`（`traytest.cpp` + `build_traytest.ps1`）：**只在双击时开窗**的假托盘程序，品红图标便于在宫格里找 | — |
+| 探针 | `dev/t_traydouble.ps1 -Exe traytest.exe -Window TrayTestWindow`：从 `layout:`/`grid:`/`cell` 三行日志推出坐标 → 点 → 报告目标窗口状态（**不要 `FindWindow`，它看不见 dock 的窗口，用 `EnumWindows`**） | — |
 
-**实测（一次完整闭环）**：`t_traydouble.ps1` → 点前 `TrayTestWindow vis=False`，点后
-`vis=True txt='traytest: DOUBLE CLICK WORKED'`。**反面对照**：点不在名单里的
-`联想电脑管家` / `deepseek harness.exe`，日志里都只有**一对** `left click` + `left click up`。
+**实测**：`doubleClick=*` 下点 `traytest` 的格子（它不在任何名单里）→ 日志 `left x2 click` + 两对 down/up，
+窗口从 `vis=False` 变成 `vis=True txt='traytest: DOUBLE CLICK WORKED'`。
+真实程序：点 `联想电脑管家` → 主窗口出现并**保持**（+400ms / +2.6s 前台都是 `LenovoPcManagerMainFrame`），
+没有被第二次点击关掉。
 
-**未由人手复核**：真实"要双击"的程序（用户自己的那几个）没试；`autoDoubleClick=1` 在
-"程序反应慢"的情况下会不会误补一对（现在是 400ms 的判据，可 `-` 改）。
+**已知风险（留给以后出现时处理，不用现在改）**：个别 app 的托盘单击是"开关"（点一次开、再点一次关），
+那一对下发后可能出现"开了又关"。真遇到时把那个 exe 写进例外：`[tray] doubleClick=*;-qq.exe`。
 
 ---
 

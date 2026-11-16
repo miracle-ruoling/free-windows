@@ -164,11 +164,17 @@ static std::wstring g_iniPath;
 static std::wstring g_pinDir;
 
 // ---- tray double click (H1.2, user 2026-11-16)
-// A few apps only open their window on a *double* click in the real notification area, so
-// the single click we forward does nothing for them. [tray] doubleClick= lists them (exe
-// name or full path, ';'/',' separated); [tray] autoDoubleClick=1 additionally retries
-// once when the first click demonstrably did nothing. See ForwardTrayClick().
-static std::vector<std::wstring> g_trayDoubleClick;   // lower case exe name or full path
+// Some apps only open their window on a *double* click in the real notification area, and
+// the user decided that "every tray click is sent twice" is the simplest rule (a second
+// click on a tray icon normally does nothing). [tray] doubleClick= takes:
+//   *            -> every icon (this is the default, see LoadConfig)
+//   <exe>[,<exe>] -> only those (exe name or full path)
+//   -<exe>       -> exception: never send it twice (works with '*' too)
+// [tray] autoDoubleClick=1 is the fallback for the opposite case: send one click, and only
+// send a second pair when the app demonstrably did nothing (~400 ms).
+static bool g_trayDoubleClickAll = false;
+static std::vector<std::wstring> g_trayDoubleClick;        // lower case exe name or full path
+static std::vector<std::wstring> g_trayDoubleClickExcept;  // never doubled
 static int g_trayAutoDoubleClick = 0;
 
 static void Trim(std::wstring& s) {
@@ -316,22 +322,34 @@ static void LoadConfig() {
     if (g_cfg.thumbDelay < 0) g_cfg.thumbDelay = 0;
     if (g_cfg.fadeEnd <= g_cfg.fadeStart) g_cfg.fadeEnd = g_cfg.fadeStart + 1;
 
-    // [tray] doubleClick=<exe1>,<exe2>  /  [tray] autoDoubleClick=0|1   (see ForwardTrayClick)
+    // [tray] doubleClick=*|<exe,...>|-<exe>,...   /  [tray] autoDoubleClick=0|1
     {
         std::vector<wchar_t> lb(2048, 0);
-        GetPrivateProfileStringW(L"tray", L"doubleClick", L"", lb.data(), (DWORD)lb.size(),
+        GetPrivateProfileStringW(L"tray", L"doubleClick", L"*", lb.data(), (DWORD)lb.size(),
                                  g_iniPath.c_str());
         std::wstring list = lb.data();
+        g_trayDoubleClickAll = false;
         g_trayDoubleClick.clear();
+        g_trayDoubleClickExcept.clear();
         std::wstring cur;
         for (size_t i = 0; i <= list.size(); i++) {
             const wchar_t ch = i < list.size() ? list[i] : L';';
             if (ch == L';' || ch == L',' || ch == L'\r' || ch == L'\n') {
                 Trim(cur);
                 if (!cur.empty()) {
-                    std::wstring t = cur;
-                    for (auto& c : t) c = (wchar_t)towlower(c);
-                    g_trayDoubleClick.push_back(t);
+                    bool except = false;
+                    if (cur[0] == L'-') {
+                        except = true;
+                        cur.erase(0, 1);
+                        Trim(cur);
+                    }
+                    if (cur == L"*" || cur == L"all") {
+                        g_trayDoubleClickAll = true;
+                    } else if (!cur.empty()) {
+                        for (auto& c : cur) c = (wchar_t)towlower(c);
+                        (except ? g_trayDoubleClickExcept : g_trayDoubleClick)
+                            .push_back(cur);
+                    }
                 }
                 cur.clear();
             } else {
@@ -339,9 +357,6 @@ static void LoadConfig() {
             }
         }
         g_trayAutoDoubleClick = GetInt(L"tray", L"autoDoubleClick", 0) ? 1 : 0;
-        if (!g_trayDoubleClick.empty() || g_trayAutoDoubleClick)
-            DLog(L"tray: double click list has %zu entr(ies), autoDoubleClick=%d",
-                 g_trayDoubleClick.size(), g_trayAutoDoubleClick);
     }
 }
 
@@ -5556,7 +5571,11 @@ static bool BuildTrayFromBridge() {
             logged = true;
             std::wstring list;
             for (const auto& t : g_trayDoubleClick) list += (list.empty() ? L"" : L",") + t;
-            DLog(L"tray: double click list = [%s] autoDoubleClick=%d", list.c_str(),
+            std::wstring except;
+            for (const auto& t : g_trayDoubleClickExcept)
+                except += (except.empty() ? L"" : L",") + t;
+            DLog(L"tray: double click all=%d list=[%s] except=[%s] autoDoubleClick=%d",
+                 (int)g_trayDoubleClickAll, list.c_str(), except.c_str(),
                  g_trayAutoDoubleClick);
             int n = (int)g_tray.size();
             int cols = (int)ceil(sqrt((double)n));
@@ -6280,14 +6299,19 @@ static int CountAppWindows(DWORD pid) {
     return ctx.n;
 }
 
-// Is this app on the double click list? Entries match the full path or the exe name.
+// Is this app sent two click pairs? Exceptions win, then "*" (all), then the name list.
 static bool TrayWantsDoubleClick(const TrayEntry& e) {
-    if (g_trayDoubleClick.empty() || e.exe.empty()) return false;
+    if (e.exe.empty()) return false;
     std::wstring base = e.exe;
     const size_t sl = base.find_last_of(L'\\');
     if (sl != std::wstring::npos) base = base.substr(sl + 1);
+    auto matches = [&](const std::wstring& t) { return t == e.exe || t == base; };
+    for (const auto& t : g_trayDoubleClickExcept) {
+        if (matches(t)) return false;
+    }
+    if (g_trayDoubleClickAll) return true;
     for (const auto& t : g_trayDoubleClick) {
-        if (t == e.exe || t == base) return true;
+        if (matches(t)) return true;
     }
     return false;
 }

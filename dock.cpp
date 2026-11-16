@@ -6972,9 +6972,71 @@ static void ClickScreenPoint(int x, int y) {
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
 }
 
-// Bring the taskbar up (Win), click its chevron, put the taskbar back down. Returns true
-// when the click was actually sent.
-static bool NativeTrayPage() {
+// Bring the taskbar up and toggle the overflow flyout, then put the taskbar back down.
+//
+// Win+B is "focus the notification area": unlike a plain Win press it does **not** open the
+// Start menu, and the shell puts the keyboard focus on the "show hidden icons" chevron, so a
+// single Space opens the flyout (measured by the user 2026-11-16 23:0x, then again here).
+// It also needs no screen coordinates, which makes it far less brittle than clicking the
+// chevron. Falls back to "Win + click the chevron" if the taskbar never shows up.
+static bool NativeTrayPageKeyboard() {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray) return false;
+    keybd_event(VK_LWIN, 0, 0, 0);
+    Sleep(40);
+    keybd_event('B', 0, 0, 0);
+    Sleep(40);
+    keybd_event('B', 0, KEYEVENTF_KEYUP, 0);
+    Sleep(40);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    bool up = false;
+    for (int i = 0; i < 20; i++) {
+        Sleep(30);
+        RECT tr{};
+        if (!GetWindowRect(tray, &tr)) continue;
+        if ((tr.top + tr.bottom) / 2 < screenH) {
+            up = true;
+            break;
+        }
+    }
+    if (!up) {
+        DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
+        return false;
+    }
+    keybd_event(VK_SPACE, 0, 0, 0);
+    Sleep(50);
+    keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
+    Sleep(200);
+    // Hiding the taskbar: the shell obeys TrayUI's hide timer - except while the keyboard
+    // focus is inside the tray, which is exactly the case here, so it may refuse. Try it,
+    // and report what actually happened instead of guessing (see PLAN_COMPONENTS.md §3.5).
+    HideNativeTaskbar();
+    Sleep(250);
+    RECT tr{};
+    const bool stillUp = GetWindowRect(tray, &tr) && (tr.top + tr.bottom) / 2 < screenH;
+    HWND flyout = FindOverflowFlyout();
+    DLog(L"tray: native flyout - keyboard path done, taskbar %s, flyout %s", stillUp ? L"STILL UP" : L"hidden",
+         (flyout && IsWindowVisible(flyout)) ? L"open" : L"closed");
+    if (stillUp) {
+        // The tray owns the keyboard focus, which is what makes TrayUI ignore its own hide
+        // timer. Pushing the window off screen ourselves does not touch the focus, so the
+        // flyout stays; log whether the shell lets it stick (it decides whether the
+        // taskbar-hidden-until-win mod has to learn a "hide now" request - §3.5).
+        SetWindowPos(tray, nullptr, tr.left, screenH, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        Sleep(200);
+        RECT tr2{};
+        const bool stillUp2 = GetWindowRect(tray, &tr2) && (tr2.top + tr2.bottom) / 2 < screenH;
+        DLog(L"tray: native flyout - forced the taskbar off screen, it is %s",
+             stillUp2 ? L"still up (the shell snapped it back)" : L"gone");
+    }
+    return true;
+}
+
+// Old path, kept as a fallback: Win press (which also opens Start - the flash) + a real
+// click on the chevron.
+static bool NativeTrayPageMouse() {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
     keybd_event(VK_LWIN, 0, 0, 0);
@@ -6998,6 +7060,11 @@ static bool NativeTrayPage() {
     }
     DLog(L"tray: native flyout - the taskbar never came up, nothing clicked");
     return false;
+}
+
+static bool NativeTrayPage() {
+    if (NativeTrayPageKeyboard()) return true;
+    return NativeTrayPageMouse();
 }
 
 static void NativeTrayToggle() {

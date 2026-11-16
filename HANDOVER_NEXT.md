@@ -72,7 +72,8 @@
 | ini `[group]` | `enabled=1 / margin=8 / lineAlpha=183 / lineWidth=1 / radius=22 / blockResize=1 / blockMove=1`（后四项是用户自己调的：线更亮更圆，**两个屏蔽开关都开着** → 拖任何成员都是拖整组，测试时注意） |
 | ini `[traybar]` | 位置/尺寸 + `enabled/follow/hasPos` + **`group=N`**（1=默认组，0=独立，N=第 N 组）+ 样式覆盖 `radius=-1 / pad=-1 / gap=13`（-1 = 继承 `[dock]`）；**改完要重启 dock** |
 | ini `[group.N]` | G2 起每组一节（组 1 仍是 `[group]`），由组菜单/面板直接读写 |
-| Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost。**开始菜单那个 bug 的第一嫌疑就是它**（`PLAN_COMPONENTS.md` §1.1） |
+| Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
+| **Windhawk 全局排除（必需）** | `HKLM\SOFTWARE\Windhawk\Engine\Settings\Exclude` 里**必须有 `SearchHost.exe`**。否则 `windhawk.dll` 会被注入 SearchHost，**Windows 搜索面板整体出不来**（点开始菜单的搜索框/按任意键 → 开始面板直接被换掉然后什么都没有；`Win+S` 也空白）。上游 issue #389 / #560，详见 §3.15 |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
 最近提交（倒序）：`（计划）PLAN_COMPONENTS.md` → `bafff34` G3 设置面板 → `f393f4a` 修组拖动只动条 →
@@ -719,34 +720,30 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ### 3.15 H1（2026-11-16 19:0x–20:0x）：开始菜单搜索框 = **不是我们的 bug**；托盘双击 = **已做完并验证**
 
-**H1.1 开始菜单输入（结论：与 dock 无关，指向 Windhawk 注入 SearchHost / 上游已知问题）**
+**H1.1 开始菜单输入（结论：**不是 dock、也不是我们的 mod —— 是 Windhawk 引擎注入 SearchHost；已修好**）**
 
-实测（新探针 `dev/t_start_typing.ps1`，独立会话里跑了一轮完整的排除法）：
+最终链条（详见 `PLAN_COMPONENTS.md` §1.1 的表）：
 
-- **外部脚本发 Ctrl+Esc**、**外部脚本发 Win 键**、**dock 首格** 三种打开方式，症状完全一样；
-  **dock 被整个杀掉**、**换一个全新的 Start 宿主**（杀 `StartMenuExperienceHost`）、
-  **mod 读不到锚点**（`have=0`，改写退化成 identity）之后**照样坏**。⇒ 排除了 dock 的
-  `SendChord`/`PublishAnchors`/`HideNativeTaskbar`、焦点抢夺、以及"任务栏被隐藏"（任务栏在屏上时也坏）。
-- 真正发生的事：打开后前台窗口是 **`SearchHost.exe` 的 `Windows.UI.Core.CoreWindow`（标题"搜索"）**，
-  UIA 焦点是它里面的 `RichEditBox`（name='搜索框'）；可见面板是 SMEH 的 `CoreWindow`（0,0 1920x1020）。
-  重启 SearchHost 后重放：窗口先是 **460,82**（正常），**按下一个键就跳到 `32767,82`**（=0x7FFF，
-  shell 的"藏起来"坐标），面板随之消失；点搜索框同样。⇒ 是 shell 的"开始面板 → 搜索面板"交接把
-  搜索窗口摆到屏幕外，不是"菜单被关掉"。
-- 面板里的**非交互区**点一下不会关菜单 ⇒ 指针输入本身没问题。
-- 模块实测：`SearchHost.exe` 里有 `windhawk.dll`、**没有**我们的 `local@dock-flyout-anchor_*.dll`
-  （SMEH/explorer/ShellHost 才有）。上游 ramensoftware/windhawk **#389 / #560** 正是这个族：
-  "Windhawk 装上后 SearchHost 的搜索框失灵，排除 SearchHost.exe 就恢复，甚至所有 mod 都关也可能坏"。
-- **待用户做的一步**（我没有管理员权限）：Windhawk 全局高级选项排除 `SearchHost.exe` → 我跑探针。
-- **A/B 第一步结果（2026-11-16 20:5x，用户把 mod 整个禁用、四个进程里的 mod DLL 全部卸载）：仍然坏。**
-  本地验证 mod 确实没在跑：开始面板位置从 `546..1355`（mod 的 dock 位置）回到 `553..1365`（原生居中）。
-  更决定性的是：**`Win+S` 根本不出东西** —— 前台是停在 `32767,82` 的 `SearchHost` 窗口，屏幕上什么都没有。
-  ⇒ 是"搜索界面整体不可用"，跟开始菜单那条路、跟我们的 mod 都无关。
-  下一步：在 Windhawk 全局高级选项里排除 `SearchHost.exe`，重启该进程，再跑 `dev/t_start_typing.ps1`。
-- **顺手发现的真 bug（我们的 mod 里，当前配置没跑）**：`dock-flyout-anchor` 给
-  `StartMenuHorizontalAlignment`/`StartMenuVerticalAlignment` 加了 `dock` 值，但
-  `CoreWindowUI::SetWindowPos_Hook` 的 **SearchHost 分支两个 switch 没有 `case dock`**（~1144–1229 行），
-  `xNew/yNew` **未初始化**就被 `SetWindowPos` 用掉。一旦把 `SearchHost.exe` 加进 `@include` 就会把搜索
-  窗口丢到随机坐标（和实测的 32767 同型）。**这条无论如何要补**（`case dock` 用 `DockAnchor` kind=1）。
+1. 三种打开方式（外部 Ctrl+Esc / 外部 Win / dock 首格）症状一致；dock 被杀、换全新 Start 宿主、
+   mod 读不到锚点之后**照样坏** ⇒ 与 dock 无关。
+2. 真正发生的事：搜索窗口（`SearchHost.exe` 的 `Windows.UI.Core.CoreWindow`，标题"搜索"）
+   被留在 **`32767,82`**（shell 的"藏起来"坐标）。按任意键/点搜索框 = 请求"切到搜索面板"，
+   面板出不来，开始面板就被换掉了 ⇒ 用户看到"菜单消失"。`Win+S` 同样一片空白。
+3. **禁用 `Dock Flyout Anchor` 后仍然坏**（面板位置确实回到原生的 `553..1365`）⇒ 不是 mod 的 XAML 改写。
+4. 在 Windhawk 全局高级选项里**排除 `SearchHost.exe`** 后，现象变了（`Win` 有时要按很多次、
+   搜索框没光标、按字母既不输入也不收起 = shell 状态机卡住），**但杀掉 `StartMenuExperienceHost` +
+   `SearchHost` 之后彻底好了**：`Win` → 开始菜单；按字母 → **搜索面板正常出现、字母进去了**
+   （截图 `dev/ab2_2_typed_q.png`）；`SearchHost` 窗口停在 `460,82`（不再是 32767）。
+
+⇒ **环境前置条件：Windhawk 必须全局排除 `SearchHost.exe`**（已写进 §2 的表）。
+⇒ 以后再遇到"开始菜单/搜索怪怪的"，第一件事是**杀 `StartMenuExperienceHost` + `SearchHost`**，
+不要先怀疑 dock。
+⇒ 我们的 mod **不需要**任何修改就能恢复；`@include` 里也不要加 `SearchHost.exe`。
+
+**仍然要补的（防御性，当前代码路径进不去）**：`CoreWindowUI::SetWindowPos_Hook` 的 SearchHost 分支
+两个 switch 缺 `case dock` → `xNew/yNew` 未初始化就被 `SetWindowPos` 用掉。哪天有人把
+`SearchHost.exe` 加回 `@include`，它会把搜索窗口丢到随机坐标（正是 32767 那种现象）。
+补法：`case dock:` 走 `DockAnchor` kind=1 的 `Place()`，并给两个 switch 加 `default:`。
 
 **H1.2 托盘双击（已做完，端到端验证过）**
 

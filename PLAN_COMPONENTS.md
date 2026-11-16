@@ -66,21 +66,40 @@
 就会跑），它会把搜索窗口丢到随机坐标上——**和实测到的 32767 是同一种症状**。这条无论如何都要补
 （`case dock` = 用 `DockAnchor` 里 kind=1 的锚点，和开始面板同一套 `Place()`）。
 
-**A/B 结果（2026-11-16 20:5x，用户把 `Dock Flyout Anchor` 整个禁用，四个进程里的 mod DLL 全部卸载）**
+**最终结论（2026-11-16 21:4x，已修好并验证）**
 
-- **仍然坏**：外部 Ctrl+Esc 打开后按一个键，开始面板照样消失（相对"关着"的截图只差 4.1 万像素
-  = 屏幕已经回到桌面状态）；点搜索框也一样。
-- **面板位置确实回到了原生**（x 553..1365，mod 开着时是 546..1355），说明 mod 真的没在起作用。
-- 决定性的一条：**`Win+S` 在这台机器上根本不出东西** —— 前台是 `SearchHost` 那个停在 `32767,82` 的窗口，
-  屏幕上什么都没有。⇒ **搜索界面的整体不可用**，跟开始菜单那条路无关，也跟我们的 mod 无关。
+根因：**Windhawk 引擎本身被注入 `SearchHost.exe`**（不是我们的 mod —— 我们的 mod 的 `@include`
+里从来没有 SearchHost）。上游 ramensoftware/windhawk **#389 / #560** 就是这个："装上 Windhawk 后
+搜索框失灵、连 `Win+S` 都不行；把 `SearchHost.exe` 加进排除列表就恢复，甚至所有 mod 都关掉也可能坏"。
+本机复现链条完整：
 
-⇒ 结论：**不是 `dock-flyout-anchor` 的 XAML 改写**。剩下的唯一嫌疑是 Windhawk 本身注入
-`SearchHost.exe`（上游 #389/#560 的机制），下一步就是**在 Windhawk 全局高级选项里排除
-`SearchHost.exe` 并重启该进程**。
+| 步 | 动作 | 结果 |
+|---|---|---|
+| 1 | 禁用 `Dock Flyout Anchor`（四个进程里的 mod DLL 全部卸载，面板位置从 dock 的 `546..1355` 回到原生 `553..1365`） | **仍然坏** |
+| 2 | Windhawk 全局高级选项排除 `SearchHost.exe`（注册表 `HKLM\SOFTWARE\Windhawk\Engine\Settings\Exclude=SearchHost.exe`，实测新 SearchHost 里已无 `windhawk.dll`） | 现象**变了**但没好（见下） |
+| 3 | 杀掉 `SearchHost` + `StartMenuExperienceHost` 让它们重启 | **好了** |
 
-**（无论结论如何都要补的那条）** `CoreWindowUI::SetWindowPos_Hook` 的 SearchHost 分支两个 switch
-缺 `case dock`（→ `xNew/yNew` 未初始化）：一旦把 `SearchHost.exe` 加进 `@include`，
-它会把搜索窗口丢到随机坐标。补法：`case dock:` 走 `DockAnchor` kind=1 的 `Place()`。
+最终状态（实测）：`Win` → 开始菜单（SMEH 的 `开始` 窗口，0,0 1920x1020，未 cloak）+
+`SearchHost` 的 `搜索` 窗口停在 **460,82**（不再是 32767）；按一个字母 → **搜索面板正常出现**、
+字母进去了（截图 `dev/ab2_2_typed_q.png`：搜到 QQ / Web / 设置项）。UIA 焦点仍是那个
+`RichEditBox`（name='搜索框'）。
+
+⇒ **开始菜单里"搜索框点了/按任意键菜单就没了"其实是正常行为**（Win11 的开始菜单搜索框会把
+开始面板换成搜索面板）；坏掉的是**搜索面板本身出不来**（搜索窗口被留在 `32767` 屏幕外）。
+修正后一切正常。
+
+**环境前置条件（写进交接文档，以后换机器/重装要照做）**：
+Windhawk → Settings → Advanced → **Processes → Exclude 里必须有 `SearchHost.exe`**。
+
+**"卡住"的另一种表现（第 2 步后出现，第 3 步解决）**：`Win` 要按很多次才弹、搜索框没有光标、
+按字母既不输入也不收起 —— 那是 shell 的 Start/Search 状态机卡在"以为已经开着"。
+**处理办法就是杀掉 `StartMenuExperienceHost` + `SearchHost`**，不用重启 explorer。
+
+**顺手发现的真 bug（我们的 mod 里，当前配置永远不会跑）**：`CoreWindowUI::SetWindowPos_Hook` 的
+SearchHost 分支两个 switch 缺 `case dock` → `xNew/yNew` 未初始化就被 `SetWindowPos` 用掉。
+因为 `SearchHost.exe` 必须留在排除列表里，这段代码进不去；但**如果哪天有人把它加回 `@include`，
+它会把搜索窗口丢到随机坐标（正好就是 32767 那种现象）**。补法：`case dock:` 走 `DockAnchor`
+kind=1 的 `Place()`，并给两个 switch 加 `default:` 兜住。
 
 **验收**：首格召出的开始菜单里，①按任意字母能直接进搜索框；②点搜索框能聚焦并继续输入；
 ③按 Win 召出的同一条路径也一样；④任务栏仍然不会滑出来（§3.2 的既有约束不能退化）。

@@ -2567,11 +2567,21 @@ static void RememberTaskbars() {
              (void*)g_barSeen[0]);
 }
 
+static void TaskbarDenyExpansion(DWORD ms);      // see "taskbar ctl" below
+static void TaskbarAllowExpansion(DWORD ms);
+
 static void OpenPowerUserMenu() {
     const BYTE chord[] = {VK_LWIN, 'X'};
     // Arm the anchor first: the menu window is created shortly after the keystroke and the
     // mod uses this timestamp to tell it apart from every other XAML popup.
     ArmWinXAnchor();
+    // This chord *is* a Win press, and the shell reacts to it by expanding its taskbar so it
+    // can anchor the menu to the Start button (measured 2026-11-17 00:28: y 1078 -> 1020,
+    // starting 213 ms after the click). It then refuses to retract the bar while its popup is
+    // open, which is the "the taskbar pops out and stays until I click elsewhere" the user
+    // kept hitting while clicking left/right on this cell. Nothing here needs that expansion,
+    // so tell the mod to keep the bar down for the length of the menu.
+    TaskbarDenyExpansion(1200);
     DLog(L"win button: right click -> win+x menu");
     SendChord(chord, 2);
     if (g_hwnd) SetTimer(g_hwnd, 6, 650, nullptr);
@@ -2760,6 +2770,24 @@ struct TaskbarCtlShm {
     unsigned int version;
     unsigned int cloakUntilMs;   // GetTickCount() deadline; 0 = nothing to do
     unsigned int pad;
+    // ---- extension ('DTC2'), added 2026-11-17 ------------------------------------------
+    // "Who wants the taskbar to be expanded right now". The mod treats a Win press as
+    // "let it rise once", which is right for a real Win press but wrong for the two Win
+    // presses *we* synthesise:
+    //   allowUntilMs - we do want the rise (the tray flyout needs the shell to raise the
+    //                  bar; it stays invisible because of the cloak);
+    //   denyUntilMs  - we are opening Win+X and nothing may rise. Without this, the shell
+    //                  expands the bar to anchor its Win+X menu (measured 2026-11-17
+    //                  00:28: +213 ms after the click, y 1078 -> 1020) and then refuses
+    //                  to retract it while its popup is open, so the bar sits on screen
+    //                  "until you click elsewhere" - the bug the user kept seeing while
+    //                  clicking left/right on the Windows cell.
+    // Old mods ignore these two fields (they only read the first 16 bytes), and a page
+    // mapping is always page sized, so mixing versions is safe.
+    unsigned int extMagic;       // 'DTC2'
+    unsigned int extVersion;
+    unsigned int allowUntilMs;   // the taskbar may expand until this deadline
+    unsigned int denyUntilMs;    // the taskbar must stay down until this deadline
 };
 static HANDLE g_taskbarCtlMap = nullptr;
 static TaskbarCtlShm* g_taskbarCtl = nullptr;
@@ -2784,7 +2812,32 @@ static void TaskbarCtlEnsure() {
     g_taskbarCtl->magic = 0x31435444;      // 'DTC1'
     g_taskbarCtl->version = 1;
     g_taskbarCtl->cloakUntilMs = 0;
+    g_taskbarCtl->extMagic = 0x32435444;   // 'DTC2'
+    g_taskbarCtl->extVersion = 1;
+    g_taskbarCtl->allowUntilMs = 0;
+    g_taskbarCtl->denyUntilMs = 0;
     DLog(L"taskbar ctl: block ready (mod must implement it to take effect)");
+}
+
+// "The taskbar may rise" (the tray flyout needs it; the cloak keeps it invisible).
+static void TaskbarAllowExpansion(DWORD ms) {
+    TaskbarCtlEnsure();
+    if (!g_taskbarCtl) return;
+    const DWORD now = GetTickCount();
+    g_taskbarCtl->allowUntilMs = ms ? now + ms : 0;
+    if (g_taskbarCtl->denyUntilMs) g_taskbarCtl->denyUntilMs = 0;
+    DLog(L"taskbar ctl: expansion allowed for %lu ms", (unsigned long)ms);
+}
+
+// "The taskbar must stay down" - used around our own Win+X chord, because the shell
+// expands the bar to anchor that menu and then refuses to retract it.
+static void TaskbarDenyExpansion(DWORD ms) {
+    TaskbarCtlEnsure();
+    if (!g_taskbarCtl) return;
+    const DWORD now = GetTickCount();
+    g_taskbarCtl->denyUntilMs = ms ? now + ms : 0;
+    g_taskbarCtl->allowUntilMs = 0;
+    DLog(L"taskbar ctl: expansion denied for %lu ms", (unsigned long)ms);
 }
 
 static DWORD g_cloakLastWrite = 0;
@@ -7166,6 +7219,10 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     // and cloaking is visual only, so the tray still takes the keyboard focus.
     g_cloakGraceUntil = GetTickCount() + 1500;
     TaskbarCloakForce();
+    // ... and tell the mod that this rise is wanted: the Win press inside Win+B is ours, and
+    // the mod no longer lets *any* Win press raise the bar unconditionally (see the
+    // allow/deny pair in the taskbar control block).
+    TaskbarAllowExpansion(2500);
 
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
@@ -7182,6 +7239,7 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
         if (!GetWindowRect(tray, &tr)) continue;
         if ((tr.top + tr.bottom) / 2 < screenH) up = true;
     }
+    TaskbarAllowExpansion(0);      // the rise is done; everything else must stay down
     if (!up) {
         DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
         return false;
@@ -7203,6 +7261,7 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
 static bool NativeTrayPageMouse(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
+    TaskbarAllowExpansion(2000);       // this Win press is ours (see NativeTrayPageKeyboard)
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(30);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
@@ -7212,6 +7271,7 @@ static bool NativeTrayPageMouse(const PanelCtx& ctx) {
         RECT tr{};
         if (!GetWindowRect(tray, &tr)) continue;
         if ((tr.top + tr.bottom) / 2 >= screenH) continue;      // still off screen
+        TaskbarAllowExpansion(0);
         POINT pt{};
         if (!TrayChevronPoint(&pt)) continue;
         DLog(L"tray: native flyout - taskbar up (%ld,%ld-%ld,%ld), clicking its chevron at "

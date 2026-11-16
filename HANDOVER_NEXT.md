@@ -9,9 +9,11 @@
 > 5. `PLAN_COMPONENTS.md`（**下一步的全部内容**：H2 设置按组件重构的决策 + H3 玻璃共享快照设计）
 > 6. 需要时再看：本文 §3.11–§3.13（组/浮窗几何、设置面板结构）、`PLAN_GROUP.md`、`PLAN_COMPANION.md`
 > `HANDOVER_TODO_GLASS_LAG.md` 只当历史查，不要重读 §1–§4.9。
-> **待用户做的一件事**：`Taskbar hidden until Win` 的源码已更新（撤销展开许可挪到 100ms 门内），
-> 需要他在 Windhawk UI 里 **Compile** 一次才生效。源码两份：`windhawk/local@taskbar-hidden-until-win.wh.cpp`
-> （仓库）和 `C:\ProgramData\Windhawk\ModsSource\`（运行时那份，已同步）。
+> **待用户做的一件事**：`Taskbar hidden until Win` **1.0.1** 已写好在磁盘上
+> （`windhawk/local@taskbar-hidden-until-win.wh.cpp`，已同步到 `C:\ProgramData\Windhawk\ModsSource\`，
+> 本机用 Windhawk 自带的 clang 编过、只带既有两条 warning），需要他在 Windhawk UI 里 **Compile** 一次。
+> 这一版修的是 **§3.17**："快速左右键点 Win 按钮 ⇒ 任务栏露头"的真因（Win+X 会真的把任务栏抬起来 +
+> 展开许可死锁 + cloak 掩盖"已经站起来"的栏）。
 
 > 写于 2026-11-15 23:40，2026-11-16 18:3x 更新（R1–R4、G1–G3 全部完成；
 > **下一步的计划写在 `PLAN_COMPONENTS.md`：两个 bug 修复 + 设置按组件重构**）。
@@ -831,6 +833,59 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ---
 
+### 3.17 "任务栏偶发露头"的真因（2026-11-17 00:3x，**mod 已改，等 Compile**）
+
+**上一节那个"展开许可 `g_allowOpen`"的猜测只对了一小半。实测是一条完全不同的链**（
+`dev/t_winbtn_repro.ps1`，干净测量，时钟全程没人动键鼠）：
+
+| 步 | 动作 | 任务栏 |
+|---|---|---|
+| A | 干净状态：右键 Win 格 → 250ms 后左键 | 全程 `y=1078`，**不动** |
+| B | 用一次托盘浮窗（`^` 开 + `^` 关） | `y=1078`，不动 |
+| C | **只按一次右键 Win 格（= Win+X）** | **+213 ms 从 1078 抬到 1020，然后一直立着**（1.5s 后仍 1020，`cloaked=0` = 用户真的看得见） |
+
+而同一时刻 dock 每 350ms 都在求它收起来（`win button: taskbar still on screen - asked again` ×7），
+**shell 完全不理**。⇒ 真因：
+
+1. **Win+X 这一下本身就是一次真 Win 按下**，shell 为了让菜单贴着开始按钮，会把任务栏**展开**
+   （不只是"可能滑上来"，实测 213ms 就上来了）。这是 `TrayUI::Unhide` / `ShouldTaskbarBeExpanded`
+   的**正常路径**，旧 mod 的"Win 按下 ⇒ 允许一次展开"正好为它开门。
+2. 任务栏一站起来，**只要 Win+X 的弹窗还开着，shell 就不收回**（它自己的隐藏定时器被忽略），
+   于是"露一下 / 不自动收起，直到点别处"。用户"快速左右键循环"= 其中每一下右键都在赌这次会不会展开。
+3. 与"左键 Ctrl+Esc"无关（A 再证）。左键只在**许可被死锁**（见下）时才让开始菜单把任务栏顶上来。
+
+**顺手发现的两个真 bug（与复现无关也得修）**
+
+- `g_allowOpen` 是个 bool，**只在"看到任务栏在屏幕上"时才清**。于是任何"不展开任务栏的 Win 按下"
+  （Win+X / Win+D，以及 dock 自己合成的 Win+X、Win+B）都会把许可**永久焊死**；之后任何请求
+  （悬停、Ctrl+Esc、弹窗锚定）都能把栏顶上来。
+- 托盘浮窗用完之后 shell 会把任务栏留在**展开（y=1020）但被 cloak 遮住**的状态（实测 00:20 持续了 6 分钟）。
+  这时按 Win，旧 mod 直接**解 cloak** → 一条本来就立着的任务栏**当场现形**；这也是"露头"的一条来源。
+
+**改法（两边都要，语义是"谁需要它站起来"）**
+
+- 共享块 `Local\DockTaskbarCtl_v1` 加了扩展（`'DTC2'`，老 mod 只读前 16 字节所以兼容）：
+  `allowUntilMs`（dock 需要一次"升起"，但用 cloak 遮住 = 托盘浮窗）/ `denyUntilMs`（dock 自己按 Win+X，
+  **谁都不许站**）。dock 写、mod 每 20ms 读一次缓存（hook 里只读内存，不开映射）。
+- mod：`MouseAllowedToShow()` = deny ⇒ false；allow ⇒ true；Win 按着 ⇒ true；否则 `AllowValid()`
+  （**带截止时间**，按下 1200ms / 松手后若还没站起来只留 400ms / 站起来立刻撤）。
+- mod：按 Win 时如果栏是"cloaked 且真的在屏幕上"，**先要它收起来、不立刻解 cloak**，
+  等真下屏了 `CloakTick()` 再解（否则就是上面那条"当场现形"）。
+- dock：`OpenPowerUserMenu()` 先写 `deny=1200ms` 再发 Win+X；托盘两条路径先写 `allow`（升起来后清零）。
+
+**验证（写在这里，Compile 之后照着做）**
+
+1. `dev/t_taskbarctl_dump.ps1`：右键 Win 格时能看到 `deny=+1200 → 0` 倒计时（已验，dock 侧 OK）。
+2. `dev/t_winbtn_repro.ps1`：C 段现在必须是 **`minY=1078 maxY=1078 riseAt=-1`**
+   （改前 `minY=1020 riseAt=213ms`）。这是这次修改的判据。
+3. `dev/t_tray_stuck.ps1`：托盘浮窗流程照旧（浮窗能开、能摆到 `^` 下面），第 5 步按 Win 时
+   先 `y=1078` 再让开始菜单把栏带上来（旧行为是"原地现形"）。
+4. 可能被 deny 影响的地方：**Win+X 菜单本身还能不能弹**（我们是靠 anchor mod kind=4 自己摆它的）。
+   如果菜单不出来了，把 dock 的 `TaskbarDenyExpansion(1200)` 换成 `TaskbarCloakForce()`
+   （让栏照样展开、只是不可见），其余不用动。
+
+---
+
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -911,6 +966,13 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |
 | **`t_wingrid.ps1 [-KeepOpen]`** | 【本轮】按 `layout:` 的 `chevron=` 点开宫格并报告落点（旧的 `t_gridplace.ps1` 按老公式算位置，已不准） |
 | **`loggrep.ps1 -Pattern <正则> -Last N`** | 【本轮】日志正经 grep。`logtail.ps1` 只给最后 25 行、而且**不认 `-Lines`**，别用它判断"有无某条日志" |
+| **`t_winbtn_repro.ps1 [-SkipClean]`** | 【§3.17 主力判据】干净测量"任务栏到底站没站起来"：A 段干净右键+左键、B 段用一次托盘浮窗、C 段只按一次右键；每步打印 `y=1078/1020` + `cloaked` + 用户空闲时长（有人在用就自己标红）。判据：C 段必须 `minY=1078 riseAt=-1` |
+| **`t_taskbar_state.ps1 [-Hide] [-Watch N]`** | 【§3.17】`Shell_TrayWnd` 的 rect / vis / cloaked（DPI-aware）。`-Hide` = 给它发 TrayUI 的隐藏定时器；`-Watch` 打印每次变化 |
+| **`t_taskbarctl_dump.ps1 [-Watch N]`** | 【§3.17】读 `Local\DockTaskbarCtl_v1`：`magic/ver/cloak/allow/deny`，含"还有多少毫秒到期" |
+| **`t_tray_stuck.ps1`** | 【§3.17】用一次托盘浮窗，再逐步看任务栏（开浮窗 → 关 → 求隐藏 → 按 Win ×2），验证"展开+cloaked 残留"还在不在 |
+| **`t_winbtn_gapsweep.ps1`** | 【§3.17】扫"右键→左键"的间隔（120/200/300/450/700/1000ms），每轮报 `minY/maxY/riseAt` 和前台窗口类（判断 Start 有没有真的开） |
+| `t_winbtn_permission.ps1 -Mode baseline\|after-winx\|after-left-latched` | 【§3.17】"悬停下边界"是不是能把栏顶起来（判定展开许可有没有被死锁）。**注意**：Win+X 弹窗开着时悬停不一定产生 unhide 请求，阴性结果不能当结论 |
+| `t_winbtn_taskbar.ps1 -Mode right-only\|right-then-left\|left-only\|cycle` | 【§3.17】按方案注入点击、10ms 采样任务栏 rect 的最早版本（被 `t_winbtn_repro.ps1` 取代，留着看细节） |
 | `t_win_probe5/6.ps1` + `shotdiff.py` | 【本轮】"开始菜单窗口搬不动"的探针：probe5 移动面板窗口并前后截图，`shotdiff.py a.png b.png` 出 `changed=N` 与包围盒（实测 `changed=0 of 2073600`） |
 | `t_winx.ps1 [-Move]` | 【本轮】Win+X 菜单的探针：新出现的窗口类/矩形，以及 `SetWindowPos` 后矩形是否真的变（这台机器：不变） |
 | `t_winx_anchor.ps1` | 【本轮】右键首格 → 打印 Win+X 弹窗实际 rect、`kind=4` 锚点、期望落点（现在应完全一致） |

@@ -6266,9 +6266,18 @@ static HWND g_upPendingWnd = nullptr;
 static unsigned g_upPendingMsg = 0;
 static unsigned g_upPendingUid = 0;
 static DWORD g_upPendingAt = 0;
-static UINT g_upPendingButton = WM_RBUTTONUP;   // which UP to deliver (left or right click)
-static UINT g_upPendingDown = WM_LBUTTONDOWN;   // its matching DOWN (used by the repeat below)
-static int g_upPendingRepeat = 0;               // more down/up pairs to post (double click)
+static UINT g_upPendingButton = WM_RBUTTONUP;   // which UP the sequence ends with
+// The click is posted as a short *sequence* instead of one pair, because every app picks a
+// different part of it:
+//   single click only        -> reacts to WM_LBUTTONUP
+//   "needs a double click"   -> reacts to WM_LBUTTONDBLCLK (WinForms' NotifyIcon.DoubleClick
+//                               and friends); posted messages never produce one by themselves
+// A real double click is DOWN, UP, DBLCLK, UP - that is what we post now, and both kinds of
+// app react to it (measured: WorkBuddy Manager only opens on DBLCLK, Lenovo PC Manager opens
+// on either). [tray] doubleClick= picks how long the sequence is.
+static UINT g_postQueue[4] = {};
+static int g_postLen = 0;
+static int g_postPos = 0;
 
 // ---- auto double click: did the app react to the click we just forwarded? -----------
 // Only used when [tray] autoDoubleClick=1. "Reacted" = the foreground moved, or the app
@@ -6316,29 +6325,29 @@ static bool TrayWantsDoubleClick(const TrayEntry& e) {
     return false;
 }
 
+// Post the next message of the queued sequence (see g_postQueue above). One message per
+// ~70 ms tick, so the app sees a real press duration and a real double-click spacing.
 static void FlushPendingUp(DWORD now) {
     if (!g_upPendingWnd || (LONG)(now - g_upPendingAt) < 0) return;
+    const UINT msg = g_postQueue[g_postPos++];
     if (IsWindow(g_upPendingWnd))
-        PostMessageW(g_upPendingWnd, g_upPendingMsg, (WPARAM)g_upPendingUid, g_upPendingButton);
-    DLog(L"tray: %s click up -> %p (after %lu ms)",
-         g_upPendingButton == WM_LBUTTONUP ? L"left" : L"right", (void*)g_upPendingWnd,
-         (unsigned long)(now - (g_upPendingAt - 70)));
-    if (g_upPendingRepeat > 0) {
-        // second half of a double click: same pair again, same ~70 ms of press duration
-        g_upPendingRepeat--;
-        if (IsWindow(g_upPendingWnd)) {
-            PostMessageW(g_upPendingWnd, g_upPendingMsg, (WPARAM)g_upPendingUid, g_upPendingDown);
-            DLog(L"tray: %s click down again (double click) -> %p",
-                 g_upPendingButton == WM_LBUTTONUP ? L"left" : L"right", (void*)g_upPendingWnd);
-            g_upPendingAt = now + 70;
-            return;
-        }
+        PostMessageW(g_upPendingWnd, g_upPendingMsg, (WPARAM)g_upPendingUid, msg);
+    const wchar_t* name = msg == WM_LBUTTONDOWN   ? L"left down"
+                          : msg == WM_LBUTTONUP   ? L"left up"
+                          : msg == WM_LBUTTONDBLCLK ? L"left double-click"
+                          : msg == WM_RBUTTONDOWN ? L"right down"
+                                                  : L"right up";
+    DLog(L"tray: %s -> %p (step %d/%d)", name, (void*)g_upPendingWnd, g_postPos, g_postLen);
+    if (g_postPos < g_postLen) {
+        g_upPendingAt = now + 70;
+    } else {
+        g_upPendingWnd = nullptr;
+        g_postLen = g_postPos = 0;
     }
-    g_upPendingWnd = nullptr;
 }
 
 // Runs from the same 30 ms watch as FlushPendingUp: ~400 ms after the click, if the app
-// showed no sign of having done anything, send one more click pair (once, left only).
+// showed no sign of having done anything, send the double-click sequence once more.
 static void TrayAutoDoubleTick(DWORD now) {
     if (!g_trayDblAt || (LONG)(now - g_trayDblAt) < 0) return;
     g_trayDblAt = 0;
@@ -6349,14 +6358,18 @@ static void TrayAutoDoubleTick(DWORD now) {
              (int)foregroundMoved, g_trayDblWindows, windowsNow);
         return;
     }
-    DLog(L"tray: auto double click - no reaction, sending a second click pair");
+    DLog(L"tray: auto double click - no reaction, sending the double click sequence again");
     if (g_trayDblWnd && IsWindow(g_trayDblWnd)) {
         PostMessageW(g_trayDblWnd, g_trayDblMsg, (WPARAM)g_trayDblUid, WM_LBUTTONDOWN);
         g_upPendingWnd = g_trayDblWnd;
         g_upPendingMsg = g_trayDblMsg;
         g_upPendingUid = g_trayDblUid;
         g_upPendingButton = WM_LBUTTONUP;
-        g_upPendingDown = WM_LBUTTONDOWN;
+        g_postQueue[0] = WM_LBUTTONUP;
+        g_postQueue[1] = WM_LBUTTONDBLCLK;
+        g_postQueue[2] = WM_LBUTTONUP;
+        g_postLen = 3;
+        g_postPos = 0;
         g_upPendingAt = now + 70;
     }
 }
@@ -6382,8 +6395,9 @@ static bool ForwardTrayClick(const TrayEntry& e, UINT downMsg, UINT upMsg, const
     AllowSetForegroundWindow(ASFW_ANY);
     wchar_t cls[64]{};
     GetClassNameW(owner, cls, 64);
-    // Configured double click: post the pair twice (some apps only open on a double click).
-    // The second pair is queued behind the first one inside FlushPendingUp().
+    // Two shapes are possible (see g_postQueue): a plain click (DOWN/UP) for right clicks and
+    // for apps listed as exceptions, and the double-click sequence (DOWN/UP/DBLCLK/UP) for
+    // everything else. The DBLCLK step is what "needs a double click" apps actually watch for.
     const bool twice = TrayWantsDoubleClick(e) && downMsg == WM_LBUTTONDOWN;
     if (!twice && g_trayAutoDoubleClick && downMsg == WM_LBUTTONDOWN) {
         // remember what "nothing happened" looks like, for one look ~400 ms later
@@ -6401,15 +6415,22 @@ static bool ForwardTrayClick(const TrayEntry& e, UINT downMsg, UINT upMsg, const
     g_upPendingMsg = e.callbackMsg;
     g_upPendingUid = e.ownerUid;
     g_upPendingButton = upMsg;
-    g_upPendingDown = downMsg;
-    g_upPendingRepeat = twice ? 1 : 0;
+    g_postPos = 0;
+    if (twice) {
+        g_postQueue[0] = WM_LBUTTONUP;
+        g_postQueue[1] = WM_LBUTTONDBLCLK;
+        g_postQueue[2] = WM_LBUTTONUP;
+        g_postLen = 3;
+    } else {
+        g_postQueue[0] = upMsg;
+        g_postLen = 1;
+    }
     g_upPendingAt = GetTickCount() + 70;
     DLog(L"tray: %s click -> %p msg=0x%X uid=%u '%s' (%s) cls=%s post=%d err=%lu",
          twice ? L"left x2" : what, (void*)owner, e.callbackMsg, e.ownerUid, e.tip.c_str(),
          e.exe.c_str(), cls, (int)okDown, (unsigned long)err);
     if (twice)
-        DLog(L"tray: '%s' is on the double click list -> the pair is posted twice",
-             e.tip.c_str());
+        DLog(L"tray: '%s' gets the double click sequence (down/up/dblclk/up)", e.tip.c_str());
     return okDown != FALSE;
 }
 
@@ -6644,8 +6665,9 @@ static void TrayMenuTick() {
             g_upPendingMsg = g_retryMsg;
             g_upPendingUid = g_retryUid;
             g_upPendingButton = WM_RBUTTONUP;
-            g_upPendingDown = WM_RBUTTONDOWN;
-            g_upPendingRepeat = 0;
+            g_postQueue[0] = WM_RBUTTONUP;
+            g_postLen = 1;
+            g_postPos = 0;
             g_upPendingAt = GetTickCount() + 70;
             return;
         }
@@ -7225,8 +7247,9 @@ static LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                         g_upPendingMsg = e.callbackMsg;
                         g_upPendingUid = e.ownerUid;
                         g_upPendingButton = WM_RBUTTONUP;
-                        g_upPendingDown = WM_RBUTTONDOWN;
-                        g_upPendingRepeat = 0;
+                        g_postQueue[0] = WM_RBUTTONUP;
+                        g_postLen = 1;
+                        g_postPos = 0;
                         g_upPendingAt = GetTickCount() + 70;
                         g_menuRetried = false;
                         g_retryWnd = owner;

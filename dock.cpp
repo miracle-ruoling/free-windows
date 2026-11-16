@@ -9731,19 +9731,24 @@ static void RenderTick() {
                     wasOnScreen = true;
                     TaskbarCloakSet(true);
                 } else if (!g_cloakGraceUntil || (LONG)(now2 - g_cloakGraceUntil) >= 0) {
-                    TaskbarCloakSet(false);
                     if (wasOnScreen) {
                         wasOnScreen = false;
                         // A tray that keeps the keyboard focus makes the shell expand its
                         // taskbar again a few seconds later (the "it pops up by itself" the
-                        // user saw). Hand the focus back, then ask the shell to hide the bar.
+                        // user saw). Hand the focus back and ask the shell to hide the bar -
+                        // but keep the cloak on for a moment, otherwise the bar becomes
+                        // visible for the length of that hide animation.
                         if (g_fgBeforeTray && IsWindow(g_fgBeforeTray)) {
                             AllowSetForegroundWindow(ASFW_ANY);
                             SetForegroundWindow(g_fgBeforeTray);
                         }
                         HideNativeTaskbar();
+                        g_cloakGraceUntil = now2 + 500;
+                        TaskbarCloakSet(true);
                         g_fgBeforeTray = nullptr;
                         DLog(L"tray: native flyout gone - focus handed back, taskbar hidden again");
+                    } else {
+                        TaskbarCloakSet(false);
                     }
                 }
             }

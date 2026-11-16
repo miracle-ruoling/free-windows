@@ -177,6 +177,15 @@ static std::vector<std::wstring> g_trayDoubleClick;        // lower case exe nam
 static std::vector<std::wstring> g_trayDoubleClickExcept;  // never doubled
 static int g_trayAutoDoubleClick = 0;
 
+// [tray] native: 1 (default) = the "^" slot opens and moves the shell's own overflow flyout
+// (see NativeTrayToggle); 0 = the self-drawn grid. Kept as a switch so the old behaviour is
+// one ini edit away.
+static int g_trayNative = 1;
+
+static HWND FindOverflowFlyout();   // defined next to NativeTrayToggle()
+static bool IsOverflowFlyoutWindow(HWND h);
+static void NativeTrayPark();
+
 static void Trim(std::wstring& s) {
     while (!s.empty() && (s.back() == L'\r' || s.back() == L' ' || s.back() == L'\t')) s.pop_back();
     size_t i = 0;
@@ -357,6 +366,7 @@ static void LoadConfig() {
             }
         }
         g_trayAutoDoubleClick = GetInt(L"tray", L"autoDoubleClick", 0) ? 1 : 0;
+        g_trayNative = GetInt(L"tray", L"native", 1) ? 1 : 0;
     }
 }
 
@@ -2553,6 +2563,20 @@ static int DistanceToWindow() {
             int dg = dist(gr);
             if (dg < d) d = dg;
             if (d <= guard) d = 0;
+        }
+    }
+    // Same for the shell's overflow flyout once we have moved it next to the chevron: the
+    // user works in it, so the strip has to stay up while the cursor is over it.
+    {
+        HWND flyout = g_trayNative ? FindOverflowFlyout() : nullptr;
+        if (flyout && IsWindowVisible(flyout)) {
+            RECT fr{};
+            if (GetWindowRect(flyout, &fr) && fr.left > -30000) {
+                int guard = 16;
+                int df = dist(fr);
+                if (df < d) d = df;
+                if (d <= guard) d = 0;
+            }
         }
     }
     return d;
@@ -6580,10 +6604,17 @@ static void PressWatchTick() {
              r ? L"right" : L"left", (void*)under, cls);
         return;
     }
+    if (IsOverflowFlyoutWindow(under)) {
+        // the shell's own tray flyout, which we merely moved: it handles its own clicks
+        DLog(L"press: %s on the native tray flyout %p - the shell decides",
+             r ? L"right" : L"left", (void*)under);
+        return;
+    }
     DLog(L"%s click outside the panel+menu at %ld,%ld over %p cls=%s",
          r ? L"right" : L"left", (long)p.x, (long)p.y, (void*)under, cls);
     if (g_menuOpen) CloseMenuNow(L"click outside");
     if (g_gridVisible) GridHide(L"click outside");
+    NativeTrayPark();
 }
 
 // Focus loss: the panel never holds focus itself, so "we lost it" means the foreground
@@ -6786,7 +6817,7 @@ static void TrayMenuTick() {
 //     (horizontal strip)
 // A strip that is bigger than the free space wins over the overlap rule, never over the
 // screen rule.
-static void GridPlacement(const RECT& dr, int* outX, int* outY) {
+static void PanelPlacement(const RECT& dr, int w, int h, int* outX, int* outY) {
     RECT wa{};
     MONITORINFO mi{sizeof(mi)};
     HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -6813,38 +6844,40 @@ static void GridPlacement(const RECT& dr, int* outX, int* outY) {
     int x = 0, y = 0;
     if (vertical) {
         int right = dr.right + gap;
-        int left = dr.left - gap - g_gridW;
-        bool fitsRight = right + g_gridW <= wa.right;
+        int left = dr.left - gap - w;
+        bool fitsRight = right + w <= wa.right;
         bool fitsLeft = left >= wa.left;
         if (fitsRight) x = right;
         else if (fitsLeft) x = left;
         else x = (wa.right - dr.right >= dr.left - wa.left) ? right : left;
-        y = chev.bottom - g_gridH;       // grow upwards from the button
+        y = chev.bottom - h;             // grow upwards from the button
     } else {
         int below = dr.bottom + gap;
-        int above = dr.top - gap - g_gridH;
-        bool fitsBelow = below + g_gridH <= wa.bottom;
+        int above = dr.top - gap - h;
+        bool fitsBelow = below + h <= wa.bottom;
         bool fitsAbove = above >= wa.top;
         if (fitsBelow) y = below;
         else if (fitsAbove) y = above;
         else y = (wa.bottom - dr.bottom >= dr.top - wa.top) ? below : above;
-        x = chev.right - g_gridW;        // end at the button's outer edge
+        x = chev.right - w;              // end at the button's outer edge
     }
 
     // hard rule: never hang over the work area
-    if (x + g_gridW > wa.right) x = wa.right - g_gridW;
-    if (y + g_gridH > wa.bottom) y = wa.bottom - g_gridH;
+    if (x + w > wa.right) x = wa.right - w;
+    if (y + h > wa.bottom) y = wa.bottom - h;
     if (x < wa.left) x = wa.left;
     if (y < wa.top) y = wa.top;
     *outX = x;
     *outY = y;
-    DLog(L"grid: place strip=%ld,%ld-%ld,%ld chevron=%ld,%ld-%ld,%ld -> %d,%d (%dx%d) "
+    DLog(L"panel: place strip=%ld,%ld-%ld,%ld chevron=%ld,%ld-%ld,%ld -> %d,%d (%dx%d) "
          L"work=%ld,%ld-%ld,%ld",
          dr.left, dr.top, dr.right, dr.bottom, chev.left, chev.top, chev.right, chev.bottom, x,
-         y, g_gridW, g_gridH, wa.left, wa.top, wa.right, wa.bottom);
+         y, w, h, wa.left, wa.top, wa.right, wa.bottom);
 }
 
-static void GridShow() {
+static void GridPlacement(const RECT& dr, int* outX, int* outY) {
+    PanelPlacement(dr, g_gridW, g_gridH, outX, outY);
+}static void GridShow() {
     if (!g_gridWnd) {
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = GridProc;
@@ -6891,8 +6924,138 @@ static void GridShow() {
          (int)g_tray.size());
 }
 
-// ---------------------------------------------------------------- app "tasks" menu
-// A native taskbar right-click menu shows the app's own tasks (VSCode's "New Window",
+// ---------------------------------------------------------------- native tray flyout
+// [tray] native=1 (default): the "^" slot opens the *shell's own* overflow flyout (the
+// "hidden icons" popup) and we only move it under the button. Whatever the user does next
+// - double click, right-click menu, an app that hooks the mouse - is the shell's business,
+// so nothing has to be emulated. Measured 2026-11-16: Windhawk (which ignores every posted
+// message) opens fine from the moved flyout, because the click is a real one.
+//
+// The flyout has to be opened by clicking the taskbar's own "^", and taskbar-hidden-until-win
+// only lets the taskbar onto the screen for a Win press - that is the flash the user accepted.
+// Once it is up, the flyout is an independent top level window: hiding the taskbar again
+// leaves it where we put it.
+
+static HWND FindOverflowFlyout() {
+    HWND found = nullptr;
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            wchar_t cls[64]{};
+            if (!GetClassNameW(h, cls, 64)) return TRUE;
+            if (_wcsicmp(cls, L"TopLevelWindowForOverflowXamlIsland") != 0) return TRUE;
+            *(HWND*)lp = h;
+            return FALSE;
+        },
+        (LPARAM)&found);
+    return found;
+}
+
+// The "show hidden icons" chevron sits at the left edge of the notification area.
+static bool TrayChevronPoint(POINT* out) {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray) return false;
+    HWND notify = FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr);
+    if (!notify) return false;
+    RECT r{};
+    if (!GetWindowRect(notify, &r)) return false;
+    if (r.right <= r.left) return false;
+    out->x = r.left + 13;
+    out->y = (r.top + r.bottom) / 2;
+    return true;
+}
+
+static void ClickScreenPoint(int x, int y) {
+    SetCursorPos(x, y);
+    Sleep(40);
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    Sleep(60);
+    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+}
+
+// Bring the taskbar up (Win), click its chevron, put the taskbar back down. Returns true
+// when the click was actually sent.
+static bool NativeTrayPage() {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray) return false;
+    keybd_event(VK_LWIN, 0, 0, 0);
+    Sleep(30);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    for (int i = 0; i < 16; i++) {
+        Sleep(30);
+        RECT tr{};
+        if (!GetWindowRect(tray, &tr)) continue;
+        if ((tr.top + tr.bottom) / 2 >= screenH) continue;      // still off screen
+        POINT pt{};
+        if (!TrayChevronPoint(&pt)) continue;
+        DLog(L"tray: native flyout - taskbar up (%ld,%ld-%ld,%ld), clicking its chevron at "
+             L"%ld,%ld", (long)tr.left, (long)tr.top, (long)tr.right, (long)tr.bottom,
+             (long)pt.x, (long)pt.y);
+        ClickScreenPoint(pt.x, pt.y);
+        Sleep(180);
+        HideNativeTaskbar();      // the flyout does not need it any more
+        return true;
+    }
+    DLog(L"tray: native flyout - the taskbar never came up, nothing clicked");
+    return false;
+}
+
+static void NativeTrayToggle() {
+    HWND flyout = FindOverflowFlyout();
+    const bool wasOpen = flyout && IsWindowVisible(flyout);
+    DLog(L"tray: native flyout toggle (wasOpen=%d flyout=%p)", (int)wasOpen, (void*)flyout);
+    if (!NativeTrayPage()) {
+        if (!wasOpen) GridShow();          // cannot get at it: keep the built-in grid working
+        return;
+    }
+    if (wasOpen) return;                   // the click just closed it
+    for (int i = 0; i < 12; i++) {
+        Sleep(40);
+        flyout = FindOverflowFlyout();
+        if (flyout && IsWindowVisible(flyout)) break;
+    }
+    if (!flyout || !IsWindowVisible(flyout)) {
+        DLog(L"tray: native flyout did not appear - falling back to the grid");
+        GridShow();
+        return;
+    }
+    RECT fr{};
+    if (!GetWindowRect(flyout, &fr)) return;
+    RECT dr{};
+    GetWindowRect(g_hwnd, &dr);
+    int x = 0, y = 0;
+    PanelPlacement(dr, (int)(fr.right - fr.left), (int)(fr.bottom - fr.top), &x, &y);
+    SetWindowPos(flyout, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    DLog(L"tray: native flyout %p moved %ld,%ld -> %d,%d (%ldx%ld)", (void*)flyout,
+         (long)fr.left, (long)fr.top, x, y, (long)(fr.right - fr.left),
+         (long)(fr.bottom - fr.top));
+}
+
+// The shell does not dismiss the flyout on an outside click once it has been moved away from
+// the taskbar (measured), and our own "^" toggle expects "visible == open", so park it off
+// screen instead of trying to close it: the next "^" click then closes it for real.
+static void NativeTrayPark() {
+    if (!g_trayNative) return;
+    HWND flyout = FindOverflowFlyout();
+    if (!flyout || !IsWindowVisible(flyout)) return;
+    RECT fr{};
+    if (!GetWindowRect(flyout, &fr)) return;
+    if (fr.top > 2000) return;                 // already parked
+    SetWindowPos(flyout, nullptr, 0, 2000, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    DLog(L"tray: native flyout %p parked off screen (was %ld,%ld)", (void*)flyout,
+         (long)fr.left, (long)fr.top);
+}
+
+static bool IsOverflowFlyoutWindow(HWND h) {
+    if (!h || !g_trayNative) return false;
+    HWND root = GetAncestor(h, GA_ROOT);
+    if (!root) root = h;
+    HWND flyout = FindOverflowFlyout();
+    return flyout && root == flyout;
+}
+
+// ---------------------------------------------------------------- app "tasks" menu// A native taskbar right-click menu shows the app's own tasks (VSCode's "New Window",
 // Windows Terminal's profiles, Edge's "New window/InPrivate"...). Windows has no public
 // API to *ask* the shell for another app's jump list, so read what the shell itself
 // keeps on disk:
@@ -9832,7 +9995,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     OpenStartMenu();     // the Windows button opens the shell's Start menu
                 } else if (g_pressSlot >= 0 && g_pressSlot < (int)g_slots.size() &&
                            g_slots[g_pressSlot].item == kSlotChevron) {
-                    GridShow();          // the chevron toggles the grid panel
+                    // The chevron toggles the tray: by default that is the shell's own
+                    // overflow flyout, which we only move next to the button ([tray] native).
+                    if (g_trayNative) {
+                        if (g_gridVisible) GridHide(L"native tray flyout opened");
+                        NativeTrayToggle();
+                    } else {
+                        GridShow();      // the built-in grid panel
+                    }
                 } else if (g_pressHwnd && IsWindow(g_pressHwnd)) {
                     // we are about to give this app the foreground: that is not "focus
                     // went to a third party", so remember it as friendly

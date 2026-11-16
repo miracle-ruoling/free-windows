@@ -405,6 +405,21 @@ cadence: 160 repaints / 160 captures in 10000 ms      (refreshHz=144, captureHz=
 **未由人手复核**：真实手感（闪动幅度、浮窗落点是否顺手、`^` 连点两次的节奏）；
 如果某个 app 的图标在浮窗里点开后 shell 自动关浮窗（本机测到的是**不关**），那 `NativeTrayPark` 就永远轮不到。
 
+**2026-11-16 23:2x 的两个修正（用户实测后）**
+
+1. **"浮窗先在原生位置出现、过一会儿才跳过来"**：是我自己的延迟（按完 Space 先 sleep 200+250ms 才去摆）。
+   改成 `SettleFlyout(500)`：从按下 Space 起每 15ms 找一次，**一出现就搬**，并在它滑入动画期间**持续钉住**
+   （shell 会在动画结束时自己再定位一次，只搬一下会被它拉回去）。
+2. **任务栏收不回去**：实测链条 ——
+   - `WM_TIMER 2`（TrayUI 自己的 hide 定时器）在浮窗开着时**被忽略**；
+   - 我们自己 `SetWindowPos` 把任务栏挪走**会被 shell 弹回**；
+   - `DwmSetWindowAttribute(DWMWA_CLOAK)` 从别的进程调用**被拒**（`0x80070005`）；
+   - **`ShowWindow(Shell_TrayWnd, SW_HIDE)` 可以**（`ok=True`，浮窗完全不受影响）。
+   ⇒ 现在：浮窗一出现就把任务栏 `SW_HIDE`，并在 16ms 的 housekeeping 里**自愈**（shell 若重新显示就再藏）；
+   浮窗消失（点掉 / 被 `NativeTrayPark` 挪走）时 `NativeTrayRestoreTaskbar()` 把任务栏
+   `SW_SHOWNA` 回来并放回屏幕外的隐藏位（`screenH-2`），这样之后按 Win 仍然能把任务栏叫出来。
+   **不需要改 mod**。
+
 ---
 
 ## 6. 探针/工具（沿用现有）

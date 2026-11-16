@@ -35,8 +35,10 @@
      修完同条件隐藏比例 71.7% → 0%。见 §3.9 末尾。
   5. **R4**：音量滚轮（音格上每格 ±2%）、`[traybar] radius/pad/gap` 每窗口样式覆盖、小窗右键菜单
      （跟随/重置尺寸/显示组框/Dock 设置）。用户砍掉了 wifi 格数与电量档位（三态与 tooltip 已够）。见 §3.10。
-- **下一步待办**：没有排定的轮次了 —— R1–R4 全部完成。候补（要用户点头才做）：
-  设置面板里给新键加行（`[group]`/`[traybar]` 目前只能改 ini + 重启）、框边悬停高亮、组内更多附属窗口。
+  6. **G1 组实体化**：成员列表抽象 + **板面**（不可见但可点）+ 拖组 + **组菜单**（`显示边框线`/
+     `屏蔽缩放`/`屏蔽位移`/`Dock 设置…`）；`enabled` 语义改成"只控制那圈线"。见 §3.11、`PLAN_GROUP.md`。
+- **下一步待办**：**G2 多组**（新建/删除组、把窗口拖进拖出、`[group.N]`）；之后 **G3 每窗口设置**
+  （设置面板按窗口分页、独立窗口的样式/淡入淡出）。两者都要用户点头才动工。
 
 ---
 
@@ -65,7 +67,7 @@
 | 条 | 实测 `x=842 y=184 w=716 h=92`（用户会自己摆，别当固定值；`layout:` 行给的是 client 坐标） |
 | 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
-| ini `[group]` | `enabled=1 / margin=8 / lineAlpha=64 / lineWidth=1 / radius=12`（R2 组框 + R3 缩放把手；**margin 同时是抓取环宽度**，调成 0 = 关掉组缩放；**改完要重启 dock**） |
+| ini `[group]` | `enabled=1`（**只控制那圈线**）/ `blockResize=0` / `blockMove=0` / `margin=8` / `lineAlpha=64` / `lineWidth=1` / `radius=12`（G1 起 `margin` 同时是缩放抓取环宽度，也是"板面可抓区域"的宽度；改完要重启 dock） |
 | ini `[traybar]` | 位置/尺寸 + `enabled/follow/hasPos`；**R4 新增样式覆盖** `radius / pad / gap`（不写或 -1 = 继承 `[dock]`；**改完要重启 dock**） |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
@@ -518,6 +520,52 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ---
 
+### 3.11 G1 组实体化（2026-11-16 14:2x–14:3x）
+
+**语义（用户原话 + 7 个拍板，详见 `PLAN_GROUP.md`）**
+- 组内空白按住拖动 = 移动整组；空白右键 = 组菜单；`显示组框` 搬进组菜单并改名 `显示边框线`。
+- `屏蔽缩放` / `屏蔽位移` 两个独立开关（当前都关）：前者让成员不再响应自身拉伸（光标也不再变），
+  后者让"按住成员拖动"变成移动整组。**组自身的缩放/移动不受影响**；**图标拖动仍是重排**。
+- 拍板：板面**完全不可见**只接鼠标；拖组 = 按住移动 ≥4px；成员热区保持现状（用户坚持）；
+  本轮只做 G1；ini 结构不变；`显示边框线` 关掉后**组仍然存在**（只是不画线）。
+
+**实现落点（`dock.cpp`）**
+
+| 项 | 关键点 |
+|---|---|
+| 成员列表 | `GroupMember{ HWND, Companion* }` + `GroupMembers(out)`（条在前，`comp==nullptr` 就是条）；`GroupBoxMembers/Rect`、组缩放的"逐成员最小尺寸/逐成员落点"全部改成遍历它 —— G2 加组/加小窗不用再动几何代码 |
+| 板面 | `GroupBoxPaintBoard()`：整块填 **alpha 1**（premultiplied white，0.4%），圆角外的像素清零；**alpha 1 实测能接真实按下**（`WindowFromPoint` 也认） |
+| 命中 | `WM_NCHITTEST` → `HTCLIENT`；但**我们自己的 UI 在场时让位**：`g_popupOpen‖g_menuOpen‖g_setWnd‖g_gridVisible` → `HTTRANSPARENT` |
+| 拖组 | `GroupDrag` 状态机：按下记 `grab = cursor - (g_cfg.x,g_cfg.y)`，移动 ≥4px 后 `g_cfg + g_dragMovePending` → **复用条的拖动通道**，条/小窗/框在 `Present()` 的同一次合成里落下（§3.7 的纪律，零重复几何） |
+| 两个开关 | `GroupBlockResize()` 让条与小窗的 `EdgeAt()` 短路（含 `WM_SETCURSOR`）；`GroupBlockMove()` 在成员的 press→drag 转移处改调 `GroupDragBegin()`。两者立即生效并写回 ini |
+| 组菜单 | `GroupShowMenu()`：`✓显示边框线` / `✓屏蔽缩放` / `✓屏蔽位移` / `Dock 设置…`；小窗菜单里的 `显示组框` 已删除 |
+| `enabled` 新语义 | 只是"画不画那圈线"；窗口**永远创建**（板面/拖组/右键/环都在）。线开关走 `GroupBoxRepaint()`（几何没变、只换像素） |
+| z 序 | **不再**在显示时 `SetWindowPos(HWND_TOPMOST)` 提框窗口（提了会压住先弹出的 shell 弹窗）；它创建时就是 topmost，后来的弹窗自然在它之上 |
+
+**证据（`dev/`）**
+- `t_groupdrag.ps1`（临时 `margin=40` 才有地方抓）：抓点 `543,206` → `DockGroupBoxWindow`；拖 +200,+120 →
+  条 +200,+120、小窗 +200,+120、框 +200,+120 且尺寸不变、`frame == members + 40: True`。
+- 命中边界：框内 3px 缝 `1357,60` → `DockGroupBoxWindow`；框外 6px / 25px → `Chrome`（穿透仍在）。
+- `t_groupmenu.ps1`：菜单项执行后日志 `group: menu -> line=0/1`、`blockResize=1/0`、`blockMove=1/0`；
+  **边框线像素实测**：线开时 y=5 处 `152,153,160`（sum 465），线关时同点 `118,119,129`（sum 366）= 只剩板面那 0.4%。
+- `屏蔽缩放` A/B：同一位置按小窗左边缘拖 −40 → 开：移动（1614→1580，宽 308 不变）；关：拉伸（274→308，`resize start edge=1`）。
+- `屏蔽位移`：拖小窗 +100,+50 → 条 +100,+50、小窗 +100,+50、相对偏移不变（762,8）；日志 `drag redirected to the group (blockMove)`。
+- 拖组帧率/开销：拖组期间 `cadence:` 里 `companion moves` 与 `repaints` 同步上升，`captures` 被抑制
+  （`busy` 里加了 `GroupDragging()`，玻璃档拖动不会每帧抓图）。
+- `显示边框线=0` 时板面仍可点（`DockGroupBoxWindow`）—— 符合"组还在只是不画线"。
+
+**坑 / 几何现实**
+- **紧凑布局里没有"空白"可抓**：你这套布局条占 563–1356、小窗 1359–1621，中间只隔 3px，剩下的就是 8px margin，
+  而 margin 又是缩放抓取环（9px）——所以默认 margin=8 时"板面"几乎不存在。想用板面拖整组，要么把
+  `[group] margin` 调大（40 就有 30px 的环内空白），要么开 `屏蔽位移` 之后直接拖条/小窗（这才是紧凑布局的正解）。
+- **小窗圆角外是透明像素**：按在小窗的圆角"缺口"上会抓到板面（= 拖整组），不是抓小窗。这是 layered 命中的必然。
+- 测试探针必须"先把光标停在条上"再移到板面：组隐藏时那个点是别人的窗口。
+
+**未由人手复核**：拖组手感；光标在板面上是箭头（故意不换 size-all，避免"光标乱跳"）；
+菜单文案；`屏蔽缩放`/`屏蔽位移` 组合使用（两个都开时：拖成员=拖组、拖边=不拉伸，机器验过单开）。
+
+---
+
 ## 4. 改代码前必须知道的 11 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -583,6 +631,9 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_wheel.ps1 -X -Y -Notches`** | 【R4】在某个屏幕点注入滚轮（正数向上）。先去把光标停在条上再移过去，否则小窗是隐藏的、滚轮会发给下面的窗口 |
 | **`t_rclick.ps1 -X -Y`** | 【R4】先扫过条再右键某个点，**故意把菜单留着不关**（另一个进程截图用），再用 Esc 关 |
 | **`t_compmenu.ps1 -X -Y -PickX -PickY`** | 【R4】右键开小窗菜单 + 点某一项，前后打印框的可见性（验证"菜单命令真的执行了"）。**别叫它 `t_menupick.ps1`——那个名字早就被 App 菜单探针占了** |
+| **`t_groupdrag.ps1 [-Dx -Dy -Inset -Margin -Steps -StepMs]`** | 【G1】先在条上预热，再按框内板面拖 N 像素：打印条/小窗/框的位移与 `frame == members + margin`。**默认要看 `margin=40`**，否则紧凑布局里没有空白可抓 |
+| **`t_groupmenu.ps1 [-Item 1..4] [-X -Y]`** | 【G1】右键框（默认按框线左端）→ 点第 N 项 → 打印帧矩形并回读日志里的 `group: menu ->` |
+| **`t_zorder.ps1`** | 【G1】把几个类名在 z 序里的相对位置打出来（`ControlCenterWindow` 这类 shell XAML 窗口 EnumWindows 看不到，只能靠 `WindowFromPoint` 判） |
 | **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |
 | **`t_winbtn.ps1 -Button left\|right`** | 【本轮】从 `layout:` 日志读首格矩形 → 真鼠标点一下 → 打印任务栏/弹窗状态 + 截图 |

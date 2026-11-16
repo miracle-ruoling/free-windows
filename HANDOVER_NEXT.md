@@ -7,10 +7,12 @@
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
-> **新对话第一件事（5 分钟）**：读本文 §0 → **§3.14「下一步」** → `PLAN_COMPONENTS.md` 全文 →
-> §4（改代码前必须知道的 12 件事）。需要改设置面板时再看 §3.13（G3 面板结构），
+> **新对话第一件事（5 分钟）**：读本文 §0 → **§3.15（最新进度：H1.1 的结论 + H1.2 已完成）** →
+> `PLAN_COMPONENTS.md` 全文 → §4（改代码前必须知道的 12 件事）。需要改设置面板时再看 §3.13（G3 面板结构），
 > 需要碰组/浮窗几何时看 §3.11–§3.12。
-> **然后按 `PLAN_COMPONENTS.md` 的 H1 开工（两个 bug），H1 之前先问用户 §7 的 6 个问题。**
+> **接下来**：①用户做完 Windhawk 的两个 A/B 后，用 `dev/t_start_typing.ps1` 给 H1.1 定案（并补 mod 里
+> 那两个缺 `case dock` 的 switch）；②然后进 H2（设置按组件重构，用户已把 6 个决策全部拍板，见
+> `PLAN_COMPONENTS.md` §7）。
 
 ---
 
@@ -712,6 +714,56 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 **开工前先问用户 `PLAN_COMPONENTS.md` §7 的 6 个问题**（双击方案 / 条的淡出距离归哪页 / 组设置归哪 /
 图片入口 / 颜色范围 / "外观"这个开关到底全局还是每窗）。
+
+---
+
+### 3.15 H1（2026-11-16 19:0x–20:0x）：开始菜单搜索框 = **不是我们的 bug**；托盘双击 = **已做完并验证**
+
+**H1.1 开始菜单输入（结论：与 dock 无关，指向 Windhawk 注入 SearchHost / 上游已知问题）**
+
+实测（新探针 `dev/t_start_typing.ps1`，独立会话里跑了一轮完整的排除法）：
+
+- **外部脚本发 Ctrl+Esc**、**外部脚本发 Win 键**、**dock 首格** 三种打开方式，症状完全一样；
+  **dock 被整个杀掉**、**换一个全新的 Start 宿主**（杀 `StartMenuExperienceHost`）、
+  **mod 读不到锚点**（`have=0`，改写退化成 identity）之后**照样坏**。⇒ 排除了 dock 的
+  `SendChord`/`PublishAnchors`/`HideNativeTaskbar`、焦点抢夺、以及"任务栏被隐藏"（任务栏在屏上时也坏）。
+- 真正发生的事：打开后前台窗口是 **`SearchHost.exe` 的 `Windows.UI.Core.CoreWindow`（标题"搜索"）**，
+  UIA 焦点是它里面的 `RichEditBox`（name='搜索框'）；可见面板是 SMEH 的 `CoreWindow`（0,0 1920x1020）。
+  重启 SearchHost 后重放：窗口先是 **460,82**（正常），**按下一个键就跳到 `32767,82`**（=0x7FFF，
+  shell 的"藏起来"坐标），面板随之消失；点搜索框同样。⇒ 是 shell 的"开始面板 → 搜索面板"交接把
+  搜索窗口摆到屏幕外，不是"菜单被关掉"。
+- 面板里的**非交互区**点一下不会关菜单 ⇒ 指针输入本身没问题。
+- 模块实测：`SearchHost.exe` 里有 `windhawk.dll`、**没有**我们的 `local@dock-flyout-anchor_*.dll`
+  （SMEH/explorer/ShellHost 才有）。上游 ramensoftware/windhawk **#389 / #560** 正是这个族：
+  "Windhawk 装上后 SearchHost 的搜索框失灵，排除 SearchHost.exe 就恢复，甚至所有 mod 都关也可能坏"。
+- **待用户做的一步**（我没有管理员权限）：①Windhawk 里临时禁用 `Dock Flyout Anchor` → 我跑探针；
+  ②Windhawk 全局高级选项排除 `SearchHost.exe` → 我跑探针。用户已同意做这两步。
+- **顺手发现的真 bug（我们的 mod 里，当前配置没跑）**：`dock-flyout-anchor` 给
+  `StartMenuHorizontalAlignment`/`StartMenuVerticalAlignment` 加了 `dock` 值，但
+  `CoreWindowUI::SetWindowPos_Hook` 的 **SearchHost 分支两个 switch 没有 `case dock`**（~1144–1229 行），
+  `xNew/yNew` **未初始化**就被 `SetWindowPos` 用掉。一旦把 `SearchHost.exe` 加进 `@include` 就会把搜索
+  窗口丢到随机坐标（和实测的 32767 同型）。**这条无论如何要补**（`case dock` 用 `DockAnchor` kind=1）。
+
+**H1.2 托盘双击（已做完，端到端验证过）**
+
+- ini：`[tray] doubleClick=<exe 名或全路径>`（`,`/`;`/换行分隔，大小写不敏感）、
+  `[tray] autoDoubleClick=0|1`（默认 0）。
+- 命中名单 → down/up **发两遍**（第一遍 up 后 70ms 再发第二遍，总 ~140ms）；
+  `autoDoubleClick=1` → 400ms 后"前台没变 + 该 pid 没有新的可见顶层窗口"才补一对（只补一次、只左键）。
+- 日志：`left` / `left x2` 区分；启动时 `tray: double click list = [...] autoDoubleClick=N` +
+  `tray: cell N (rR,cC) '<tip>' (<exe>) twice=N`（**排障时直接知道点哪格**）。
+- 证据：新探针 `dev/traytest.exe`（`traytest.cpp` + `build_traytest.ps1`，只在双击时开窗的假托盘程序，
+  品红图标便于定位）+ `dev/t_traydouble.ps1`（从日志读格子 → 点 → 报告）：
+  点前 `vis=False` → 点后 `vis=True txt='traytest: DOUBLE CLICK WORKED'`；
+  **反面对照**（联想电脑管家 / deepseek harness，都不在名单里）都只有**一对** down/up；
+  自动重试的"不该补"分支也实测到了：`tray: auto double click not needed (fg moved=1, windows 1 -> 1)`。
+- **未由人手复核**：用户自己那几个"要双击"的真实程序；`autoDoubleClick` 在"程序反应慢"时会不会
+  误补一对（判据 400ms）。
+
+**另外**：顺手量了玻璃的现状成本（对 H3 有用）：条 921x242 的烘焙图，
+`paint=26.27ms (glass 25.63) / bake=25.33ms`，`160 repaints / 160 captures in 10s`。
+⇒ **一个玻璃窗口 ≈ 半个核**；H3 必须"每次 tick 一个预算 + 轮转"，不能每窗各抓一份（详见
+`PLAN_COMPONENTS.md` §3.3）。
 
 ---
 

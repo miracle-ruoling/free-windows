@@ -163,6 +163,14 @@ static Config g_cfg;
 static std::wstring g_iniPath;
 static std::wstring g_pinDir;
 
+// ---- tray double click (H1.2, user 2026-11-16)
+// A few apps only open their window on a *double* click in the real notification area, so
+// the single click we forward does nothing for them. [tray] doubleClick= lists them (exe
+// name or full path, ';'/',' separated); [tray] autoDoubleClick=1 additionally retries
+// once when the first click demonstrably did nothing. See ForwardTrayClick().
+static std::vector<std::wstring> g_trayDoubleClick;   // lower case exe name or full path
+static int g_trayAutoDoubleClick = 0;
+
 static void Trim(std::wstring& s) {
     while (!s.empty() && (s.back() == L'\r' || s.back() == L' ' || s.back() == L'\t')) s.pop_back();
     size_t i = 0;
@@ -308,6 +316,33 @@ static void LoadConfig() {
     if (g_cfg.thumbDelay < 0) g_cfg.thumbDelay = 0;
     if (g_cfg.fadeEnd <= g_cfg.fadeStart) g_cfg.fadeEnd = g_cfg.fadeStart + 1;
 
+    // [tray] doubleClick=<exe1>,<exe2>  /  [tray] autoDoubleClick=0|1   (see ForwardTrayClick)
+    {
+        std::vector<wchar_t> lb(2048, 0);
+        GetPrivateProfileStringW(L"tray", L"doubleClick", L"", lb.data(), (DWORD)lb.size(),
+                                 g_iniPath.c_str());
+        std::wstring list = lb.data();
+        g_trayDoubleClick.clear();
+        std::wstring cur;
+        for (size_t i = 0; i <= list.size(); i++) {
+            const wchar_t ch = i < list.size() ? list[i] : L';';
+            if (ch == L';' || ch == L',' || ch == L'\r' || ch == L'\n') {
+                Trim(cur);
+                if (!cur.empty()) {
+                    std::wstring t = cur;
+                    for (auto& c : t) c = (wchar_t)towlower(c);
+                    g_trayDoubleClick.push_back(t);
+                }
+                cur.clear();
+            } else {
+                cur.push_back(ch);
+            }
+        }
+        g_trayAutoDoubleClick = GetInt(L"tray", L"autoDoubleClick", 0) ? 1 : 0;
+        if (!g_trayDoubleClick.empty() || g_trayAutoDoubleClick)
+            DLog(L"tray: double click list has %zu entr(ies), autoDoubleClick=%d",
+                 g_trayDoubleClick.size(), g_trayAutoDoubleClick);
+    }
 }
 
 static void SavePosition() {
@@ -4953,6 +4988,8 @@ struct TrayEntry {
 };
 static std::vector<TrayEntry> g_tray;
 
+static bool TrayWantsDoubleClick(const TrayEntry& e);   // defined next to ForwardTrayClick
+
 // Layout must match windhawk/tray-icons-bridge.wh.cpp exactly.
 struct TrayBridgeEntry {
     unsigned long long hwnd;
@@ -5511,6 +5548,27 @@ static bool BuildTrayFromBridge() {
               [](const TrayEntry& a, const TrayEntry& b) { return a.tip < b.tip; });
     DLog(L"tray: %d icons from the bridge (live tray, full native set)",
          (int)g_tray.size());
+    // The [tray] double click settings are parsed in LoadConfig(), which runs before the log
+    // file is open - so report them here, where the grid's contents are decided.
+    {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::wstring list;
+            for (const auto& t : g_trayDoubleClick) list += (list.empty() ? L"" : L",") + t;
+            DLog(L"tray: double click list = [%s] autoDoubleClick=%d", list.c_str(),
+                 g_trayAutoDoubleClick);
+            int n = (int)g_tray.size();
+            int cols = (int)ceil(sqrt((double)n));
+            if (cols < 3) cols = 3;
+            if (cols > 8) cols = 8;
+            DLog(L"tray: grid order %d cells, %d columns", n, cols);
+            for (int i = 0; i < n; i++)
+                DLog(L"tray: cell %d (r%d,c%d) '%s' (%s) twice=%d", i, i / cols, i % cols,
+                     g_tray[i].tip.c_str(), g_tray[i].exe.c_str(),
+                     (int)TrayWantsDoubleClick(g_tray[i]));
+        }
+    }
     return !g_tray.empty();
 }
 
@@ -6190,6 +6248,49 @@ static unsigned g_upPendingMsg = 0;
 static unsigned g_upPendingUid = 0;
 static DWORD g_upPendingAt = 0;
 static UINT g_upPendingButton = WM_RBUTTONUP;   // which UP to deliver (left or right click)
+static UINT g_upPendingDown = WM_LBUTTONDOWN;   // its matching DOWN (used by the repeat below)
+static int g_upPendingRepeat = 0;               // more down/up pairs to post (double click)
+
+// ---- auto double click: did the app react to the click we just forwarded? -----------
+// Only used when [tray] autoDoubleClick=1. "Reacted" = the foreground moved, or the app
+// put another visible, non-minimised top-level window on screen. Both are cheap to check
+// and they are what the double-click-only apps do when the second click lands.
+static DWORD g_trayDblAt = 0;          // when to look (0 = not watching)
+static DWORD g_trayDblPid = 0;
+static HWND g_trayDblFg = nullptr;
+static int g_trayDblWindows = 0;       // visible non-minimised top-level windows before
+static HWND g_trayDblWnd = nullptr;    // where the extra pair goes
+static unsigned g_trayDblMsg = 0;
+static unsigned g_trayDblUid = 0;
+
+static int CountAppWindows(DWORD pid) {
+    struct Ctx {
+        DWORD pid;
+        int n;
+    } ctx{pid, 0};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto* c = (Ctx*)lp;
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p == c->pid && IsWindowVisible(h) && !IsIconic(h)) c->n++;
+            return TRUE;
+        },
+        (LPARAM)&ctx);
+    return ctx.n;
+}
+
+// Is this app on the double click list? Entries match the full path or the exe name.
+static bool TrayWantsDoubleClick(const TrayEntry& e) {
+    if (g_trayDoubleClick.empty() || e.exe.empty()) return false;
+    std::wstring base = e.exe;
+    const size_t sl = base.find_last_of(L'\\');
+    if (sl != std::wstring::npos) base = base.substr(sl + 1);
+    for (const auto& t : g_trayDoubleClick) {
+        if (t == e.exe || t == base) return true;
+    }
+    return false;
+}
 
 static void FlushPendingUp(DWORD now) {
     if (!g_upPendingWnd || (LONG)(now - g_upPendingAt) < 0) return;
@@ -6198,7 +6299,42 @@ static void FlushPendingUp(DWORD now) {
     DLog(L"tray: %s click up -> %p (after %lu ms)",
          g_upPendingButton == WM_LBUTTONUP ? L"left" : L"right", (void*)g_upPendingWnd,
          (unsigned long)(now - (g_upPendingAt - 70)));
+    if (g_upPendingRepeat > 0) {
+        // second half of a double click: same pair again, same ~70 ms of press duration
+        g_upPendingRepeat--;
+        if (IsWindow(g_upPendingWnd)) {
+            PostMessageW(g_upPendingWnd, g_upPendingMsg, (WPARAM)g_upPendingUid, g_upPendingDown);
+            DLog(L"tray: %s click down again (double click) -> %p",
+                 g_upPendingButton == WM_LBUTTONUP ? L"left" : L"right", (void*)g_upPendingWnd);
+            g_upPendingAt = now + 70;
+            return;
+        }
+    }
     g_upPendingWnd = nullptr;
+}
+
+// Runs from the same 30 ms watch as FlushPendingUp: ~400 ms after the click, if the app
+// showed no sign of having done anything, send one more click pair (once, left only).
+static void TrayAutoDoubleTick(DWORD now) {
+    if (!g_trayDblAt || (LONG)(now - g_trayDblAt) < 0) return;
+    g_trayDblAt = 0;
+    const bool foregroundMoved = GetForegroundWindow() != g_trayDblFg;
+    const int windowsNow = CountAppWindows(g_trayDblPid);
+    if (foregroundMoved || windowsNow > g_trayDblWindows) {
+        DLog(L"tray: auto double click not needed (fg moved=%d, windows %d -> %d)",
+             (int)foregroundMoved, g_trayDblWindows, windowsNow);
+        return;
+    }
+    DLog(L"tray: auto double click - no reaction, sending a second click pair");
+    if (g_trayDblWnd && IsWindow(g_trayDblWnd)) {
+        PostMessageW(g_trayDblWnd, g_trayDblMsg, (WPARAM)g_trayDblUid, WM_LBUTTONDOWN);
+        g_upPendingWnd = g_trayDblWnd;
+        g_upPendingMsg = g_trayDblMsg;
+        g_upPendingUid = g_trayDblUid;
+        g_upPendingButton = WM_LBUTTONUP;
+        g_upPendingDown = WM_LBUTTONDOWN;
+        g_upPendingAt = now + 70;
+    }
 }
 
 // Forward a click on a tray icon to the app that owns the icon - the same thing the
@@ -6222,16 +6358,34 @@ static bool ForwardTrayClick(const TrayEntry& e, UINT downMsg, UINT upMsg, const
     AllowSetForegroundWindow(ASFW_ANY);
     wchar_t cls[64]{};
     GetClassNameW(owner, cls, 64);
+    // Configured double click: post the pair twice (some apps only open on a double click).
+    // The second pair is queued behind the first one inside FlushPendingUp().
+    const bool twice = TrayWantsDoubleClick(e) && downMsg == WM_LBUTTONDOWN;
+    if (!twice && g_trayAutoDoubleClick && downMsg == WM_LBUTTONDOWN) {
+        // remember what "nothing happened" looks like, for one look ~400 ms later
+        g_trayDblAt = GetTickCount() + 400;
+        g_trayDblPid = pid;
+        g_trayDblFg = GetForegroundWindow();
+        g_trayDblWindows = CountAppWindows(pid);
+        g_trayDblWnd = owner;
+        g_trayDblMsg = e.callbackMsg;
+        g_trayDblUid = e.ownerUid;
+    }
     BOOL okDown = PostMessageW(owner, e.callbackMsg, (WPARAM)e.ownerUid, downMsg);
     DWORD err = okDown ? 0 : GetLastError();
     g_upPendingWnd = owner;
     g_upPendingMsg = e.callbackMsg;
     g_upPendingUid = e.ownerUid;
     g_upPendingButton = upMsg;
+    g_upPendingDown = downMsg;
+    g_upPendingRepeat = twice ? 1 : 0;
     g_upPendingAt = GetTickCount() + 70;
     DLog(L"tray: %s click -> %p msg=0x%X uid=%u '%s' (%s) cls=%s post=%d err=%lu",
-         what, (void*)owner, e.callbackMsg, e.ownerUid, e.tip.c_str(), e.exe.c_str(), cls,
-         (int)okDown, (unsigned long)err);
+         twice ? L"left x2" : what, (void*)owner, e.callbackMsg, e.ownerUid, e.tip.c_str(),
+         e.exe.c_str(), cls, (int)okDown, (unsigned long)err);
+    if (twice)
+        DLog(L"tray: '%s' is on the double click list -> the pair is posted twice",
+             e.tip.c_str());
     return okDown != FALSE;
 }
 
@@ -6466,6 +6620,8 @@ static void TrayMenuTick() {
             g_upPendingMsg = g_retryMsg;
             g_upPendingUid = g_retryUid;
             g_upPendingButton = WM_RBUTTONUP;
+            g_upPendingDown = WM_RBUTTONDOWN;
+            g_upPendingRepeat = 0;
             g_upPendingAt = GetTickCount() + 70;
             return;
         }
@@ -7045,6 +7201,8 @@ static LRESULT CALLBACK GridProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                         g_upPendingMsg = e.callbackMsg;
                         g_upPendingUid = e.ownerUid;
                         g_upPendingButton = WM_RBUTTONUP;
+                        g_upPendingDown = WM_RBUTTONDOWN;
+                        g_upPendingRepeat = 0;
                         g_upPendingAt = GetTickCount() + 70;
                         g_menuRetried = false;
                         g_retryWnd = owner;
@@ -9140,6 +9298,7 @@ static void RenderTick() {
             TrayMenuTick();
             LaunchWatchTick();
             FlushPendingUp(now);
+            TrayAutoDoubleTick(now);
             CompanionTick(now);      // attached windows: follow, fade, tray state
             QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();

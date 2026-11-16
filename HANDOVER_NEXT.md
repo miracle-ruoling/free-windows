@@ -736,8 +736,12 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 - 模块实测：`SearchHost.exe` 里有 `windhawk.dll`、**没有**我们的 `local@dock-flyout-anchor_*.dll`
   （SMEH/explorer/ShellHost 才有）。上游 ramensoftware/windhawk **#389 / #560** 正是这个族：
   "Windhawk 装上后 SearchHost 的搜索框失灵，排除 SearchHost.exe 就恢复，甚至所有 mod 都关也可能坏"。
-- **待用户做的一步**（我没有管理员权限）：①Windhawk 里临时禁用 `Dock Flyout Anchor` → 我跑探针；
-  ②Windhawk 全局高级选项排除 `SearchHost.exe` → 我跑探针。用户已同意做这两步。
+- **待用户做的一步**（我没有管理员权限）：Windhawk 全局高级选项排除 `SearchHost.exe` → 我跑探针。
+- **A/B 第一步结果（2026-11-16 20:5x，用户把 mod 整个禁用、四个进程里的 mod DLL 全部卸载）：仍然坏。**
+  本地验证 mod 确实没在跑：开始面板位置从 `546..1355`（mod 的 dock 位置）回到 `553..1365`（原生居中）。
+  更决定性的是：**`Win+S` 根本不出东西** —— 前台是停在 `32767,82` 的 `SearchHost` 窗口，屏幕上什么都没有。
+  ⇒ 是"搜索界面整体不可用"，跟开始菜单那条路、跟我们的 mod 都无关。
+  下一步：在 Windhawk 全局高级选项里排除 `SearchHost.exe`，重启该进程，再跑 `dev/t_start_typing.ps1`。
 - **顺手发现的真 bug（我们的 mod 里，当前配置没跑）**：`dock-flyout-anchor` 给
   `StartMenuHorizontalAlignment`/`StartMenuVerticalAlignment` 加了 `dock` 值，但
   `CoreWindowUI::SetWindowPos_Hook` 的 **SearchHost 分支两个 switch 没有 `case dock`**（~1144–1229 行），

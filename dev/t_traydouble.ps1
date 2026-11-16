@@ -53,14 +53,14 @@ public class TD {
 $log = Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.log'
 
 function GridRect {
-    $line = Get-Content $log -Tail 800 | Select-String -Pattern 'grid: \d+x\d+ at \d+,\d+' | Select-Object -Last 1
+    $line = Get-Content $log -Tail 4000 | Select-String -Pattern 'grid: \d+x\d+ at \d+,\d+' | Select-Object -Last 1
     if (-not $line) { return $null }
     [void]($line.Line -match 'grid: (\d+)x(\d+) at (\d+),(\d+)')
     return @([int]$Matches[3], [int]$Matches[4])
 }
 function FindCell([string]$exe) {
     $esc = [regex]::Escape($exe)
-    $line = Get-Content $log -Tail 800 |
+    $line = Get-Content $log -Tail 4000 |
             Select-String -Pattern "\(r(\d+),c(\d+)\).*$esc.*twice=1" | Select-Object -Last 1
     if (-not $line) { return $null }
     if ($line.Line -match '\(r(\d+),c(\d+)\)') { return @([int]$Matches[1], [int]$Matches[2]) }
@@ -71,7 +71,7 @@ function ChevronPoint {
     if ($strip -eq [IntPtr]::Zero) { Write-Host "  (strip window not found)"; return $null }
     $r = New-Object TD+RECT
     [void][TD]::GetWindowRect($strip, [ref]$r)
-    $line = Get-Content $log -Tail 800 | Select-String -Pattern 'layout: ' | Select-Object -Last 1
+    $line = Get-Content $log -Tail 4000 | Select-String -Pattern 'layout: ' | Select-Object -Last 1
     if (-not $line -or $line.Line -notmatch 'chevron=(-?\d+),(-?\d+)-(-?\d+),(-?\d+)') {
         Write-Host "  (no chevron= in the last layout line)"; return $null
     }

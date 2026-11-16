@@ -362,6 +362,35 @@ cadence: 160 repaints / 160 captures in 10000 ms      (refreshHz=144, captureHz=
 - 玻璃层**关** + 背景"透过背后" = 就是现在的**全透明档**（`glassOpacity=0 && tintStrength=0`）吗？
   如果是，旧的"透明档"概念可以并入这个模型。
 
+### 3.5 用户提议（2026-11-16 22:2x）：点击宫格时把**原生托盘**搬到宫格按钮下方，直接点真图标
+
+**想法**：既然我们已经能把 shell 弹窗搬位置（`dock-flyout-anchor`），那把原生任务栏/托盘挪到宫格下面、
+在真图标位置发一次**真鼠标点击**，就能一次性解决"要双击的 app / 有鼠标钩子的 app / 要坐标的菜单"。
+**方向是对的**（合成消息永远有 app 不认），但**这台机器的 Windows 拿不到托盘图标的坐标**，实测如下：
+
+| 查什么 | 结果 |
+|---|---|
+| `Shell_TrayWnd` 的 UIA 树（`TreeScope_Descendants`，全部类型） | 只有 **3 个 Pane**：`TrayNotifyWnd`(1570,1020 350x60)、`ReBarWindow32`、`MSTaskSwWClass`。**0 个托盘按钮** |
+| 按 Button 类型收 | **0 个**（dock 里 `TrayUiNames()` 早就因此回退到"进程集"，日志 `tray: UIA sees no tray buttons`） |
+| `TrayNotifyWnd`（托盘区本身） | UIA descendants = **0** |
+| `Windows.UI.Composition.DesktopWindowContentBridge`（XAML 岛） | 任务栏的子窗口里能看到它，但 `FindWindowEx` 按类名拿不到（h=0），UIA 也读不出东西 |
+| 溢出托盘 `TopLevelWindowForOverflowXamlIsland` | 隐藏时 descendants = **0**；要它出现得先真点任务栏上的 `^`，而那又需要任务栏真的可见 |
+| 用 `SetWindowPos` 把任务栏挪到 `0,1020` | 矩形变了、但**画不出来**（自动隐藏状态不是"位置"问题；最大化窗口仍盖住它，截图里 1020 那一带还是应用画面） |
+
+⇒ **没有"某个图标在屏幕上的位置"这个数据，就没有可点的目标**，"搬过去 + 点真图标"落不了地。
+唯一的出路是让 **`tray-icons-bridge`（注入在 explorer 里）把它自己那套 XAML 布局里的图标矩形发布出来**
+（和我们搬开始菜单用同一套手法），那是 mod 侧的一次新研究，不是几小时的活。
+
+**同时确认了"为什么消息转发永远差一口气"**：真正"需要双击"的 app 等的是 **`WM_LBUTTONDBLCLK`**
+（`PostMessage` 的 down/up 永远合成不出它）——这一条已经修进 dock（`DOWN/UP/DBLCLK/UP`）。
+但即使补上，像 `Windhawk`（`WindhawkDaemon` 窗口，三种形状全 `ok=True` 但零反应）和
+`WorkBuddy Manager`（反应是把自己 `-32000,-32000` 的隐藏小窗提到前台，主界面仍然没出来）这类
+**只认真实输入**的 app，合成消息这条路到顶了。
+
+**结论**：这条提议先**不做**，等两个前提之一出现：
+①`tray-icons-bridge` 能发布图标矩形；②退一步做"点击后毫无反应就激活/启动该 app"的兜底
+（`[tray] activateIfNoReaction=<exe,...>`，见 §7-A11）。
+
 ---
 
 ## 6. 探针/工具（沿用现有）
@@ -428,3 +457,7 @@ cadence: 160 repaints / 160 captures in 10000 ms      (refreshHz=144, captureHz=
 ①纯色还算背景之一吗（还是被玻璃层吸收掉、只留"透过背后 / 图片"两种）？
 ②玻璃层叠在图片上时要不要模糊（我建议图片背景默认 `blurRadius=0`，只叠色调）？
 ③"玻璃层关 + 透过背后" 是不是就等于现在的全透明档？（如果是，旧概念可以并入）
+
+**A11（不急，但决定"H1.2 收尾"）**：`Windhawk` / `WorkBuddy Manager` 这类"只认真实输入"的图标，
+要不要加兜底键 `[tray] activateIfNoReaction=<exe,...>`：左键点完 400ms 内 app 毫无反应 ⇒ 激活它的窗口，
+没有窗口就启动它。默认空名单（不动其他图标）。

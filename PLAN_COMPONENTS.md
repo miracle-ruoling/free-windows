@@ -379,26 +379,31 @@ cadence: 160 repaints / 160 captures in 10000 ms      (refreshHz=144, captureHz=
 | 任务栏再藏起来会不会带走它 | 不会。给任务栏 post `WM_TIMER 2`（`kTrayTimerHide`）后任务栏回到 `0,1078`，**浮窗继续显示** |
 | `Esc` / 点外面 | **不会**关它（实测两次都不关）；只在点图标后/下次重新打开时由 shell 自己处理 |
 
-**可实现的设计（待用户拍板，见 §7-A12）**
+**已实现（2026-11-16 22:5x，提交 `661fc62`）** —— `[tray] native=1`（默认）：
 
 ```
-点我们条上的 ^
-  → 合成一次 Win（taskbar-hidden-until-win 只认 Win，任务栏滑到 0,1020 + 开始菜单弹出）
-  → 真点原生 ^（TrayNotifyWnd 左端，y = 任务栏中线）→ 浮窗出现，开始菜单同时关掉
-  → 立刻把任务栏再藏回去（WM_TIMER 2），浮窗不受影响
-  → SetWindowPos 把浮窗摆到我们 ^ 的下方（左边缘对齐 + 8px 间距，和宫格同一套规则）
-  → 用户点真图标：双击 / 菜单 / 鼠标钩子 / tooltip 全部原生，我们一行转发代码都不用
+点我们条上的 ^  →  NativeTrayToggle()
+  1. 合成 Win（taskbar-hidden-until-win 只认 Win）→ 任务栏滑到 0,1020（开始菜单顺带弹出）
+  2. 等任务栏真的上屏（轮询 rect，最多 ~480ms），点它的 ^（TrayNotifyWnd.left+13, 中线）
+  3. sleep 180ms → HideNativeTaskbar()（WM_TIMER 2）→ 任务栏回去，浮窗不受影响
+  4. 找 TopLevelWindowForOverflowXamlIsland，PanelPlacement() 摆到我们 ^ 的下方
+     （右边缘对齐 ^ 的右边缘、8px 间距、夹进工作区 —— 和宫格同一套规则）
+  5. SetWindowPos(HWND_TOPMOST|SWP_NOSIZE|SWP_NOACTIVATE)
+若 4 拿不到浮窗 → 记日志并**回退到自绘宫格**（不会变哑巴）
 ```
 
-**代价 / 待确认**
-1. **每次点 `^` 会闪一下**：合成 Win 会让开始菜单和底部任务栏露 200–400ms。要消掉得让
-   `taskbar-hidden-until-win` 提供一个"借一次展开许可给 dock"的接口（改 mod，工作量中等）。
-2. **尺寸/列数由 shell 决定**（这次 293x193、5 列），不能像我们宫格那样自定义大小/顺序。
-3. 我们的自绘宫格对"托盘图标"就没用了 ⇒ 相关代码（`GridClick`/`ForwardTrayClick`/双击序列/
-   `autoDoubleClick`/`activateIfNoReaction`）可以整体退役；或者保留成一个开关。
+- **`[tray] native=0`** → 完全回到原来的自绘宫格（一键回退）。
+- 实测日志：`panel: place strip=507,31-1300,149 chevron=1179,54-1251,126 -> 958,157 (293x193)` +
+  `tray: native flyout 00000000000509A8 moved 1403,827 -> 958,157 (293x193)`；
+  在搬过去的浮窗里点 `Windhawk` → 它的真窗口从 `-32000,-32000 199x34` 变成 `335,153 1393x763` 上前台。
+- **`DistanceToWindow()` 把浮窗算成"自己"**：鼠标在浮窗里时条不会淡掉。
+- **关闭**：shell 搬走之后**不会**因为点外面而自己关（实测），所以：
+  - 我们的低层鼠标钩子里"点在我们自己的窗口/原生浮窗上 → 各自处理"，其它地方的点击 → `NativeTrayPark()`
+    把浮窗**挪到屏幕外**（`0,2000`），下次点 `^` 时 `wasOpen=1` → 走"关闭"分支，shell 状态一致；
+  - 点 `^` 且浮窗开着 → 再走一次 Win+点 ^ → 关掉。
 
-**顺带**：因为浮窗显示时 UIA 能给出每个图标的 rect，"移动任务栏 + 在图标位置发真点击"这条**也**变可行了
-（只要先让浮窗出现一次拿到坐标）。所以两种形态都能做，只是"让用户点真图标"更省事、也更符合用户的原意。
+**未由人手复核**：真实手感（闪动幅度、浮窗落点是否顺手、`^` 连点两次的节奏）；
+如果某个 app 的图标在浮窗里点开后 shell 自动关浮窗（本机测到的是**不关**），那 `NativeTrayPark` 就永远轮不到。
 
 ---
 

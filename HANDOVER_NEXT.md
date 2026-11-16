@@ -745,24 +745,21 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 `SearchHost.exe` 加回 `@include`，它会把搜索窗口丢到随机坐标（正是 32767 那种现象）。
 补法：`case dock:` 走 `DockAnchor` kind=1 的 `Place()`，并给两个 switch 加 `default:`。
 
-**H1.2 托盘双击（已做完，端到端验证过）**
+**H1.2 托盘双击（代码还在，但默认已经不用了 —— 见下面"托盘改成原生浮窗"）**
 
-- ini：`[tray] doubleClick=` **默认 `*` = 全部双击**（用户 2026-11-16 21:4x 的决定：不用给名单）。
-  也支持 `<exe>[,<exe>]`（只这些）和 `-<exe>`（例外，永不双击，可与 `*` 混用）；
-  `[tray] autoDoubleClick=0|1`（默认 0）= "没命中双击规则时才补一次"的兜底。
-- 命中 → down/up **发两遍**（第一遍 up 后 70ms 再发第二遍，总 ~140ms）；
-  自动重试 → 400ms 后"前台没变 + 该 pid 没有新的可见顶层窗口"才补一对（只补一次、只左键）。
-- **为什么"多一次"是安全的**：我们是 `PostMessage` 到该 app 的**托盘回调窗口**（不是合成鼠标事件），
-  第二次点击不可能落进它刚弹出的菜单；对"点了就有反馈"的 app，第二次通常真的没反应（用户原话）。
-- 日志：`left` / `left x2` 区分；另打 `tray: double click all=N list=[..] except=[..] autoDoubleClick=N`
-  和 `tray: cell N (rR,cC) '<tip>' (<exe>) twice=N`（**排障时直接知道点哪格**）。
-- 证据：`dev/traytest.exe`（只在双击时开窗的假托盘程序，品红图标）+ `dev/t_traydouble.ps1`：
-  `doubleClick=*` 下点它 → `left x2 click` + 两对 down/up，窗口 `vis=False` → `vis=True
-  txt='traytest: DOUBLE CLICK WORKED'`；真实程序点 `联想电脑管家` → 主窗口出现并**保持**
-  （+400ms / +2.6s 前台都是 `LenovoPcManagerMainFrame`），确认没被第二下关掉。
-- 探针坑：`FindWindow("DockStripWindow")` **看不见 dock 的窗口**（UIPI），必须用 `EnumWindows`；
-  PowerShell 里"函数里既 `Write-Output` 又 `return @()`"会把字符串混进返回值（用 `Write-Host`）。
-- **已知风险**：托盘单击是"开关"的 app 可能"开了又关"，遇到时写例外：`doubleClick=*;-xxx.exe`。
+- **2026-11-16 22:5x 起 `[tray] native=1`（默认）**：`^` 打开的是 **shell 自己的溢出托盘浮窗**
+  （`TopLevelWindowForOverflowXamlIsland`），我们只把它搬到 `^` 下面。之后一切原生：双击、右键菜单、
+  鼠标钩子。实测 `Windhawk`（发什么消息都不理它）在搬过去的浮窗里**点一下就能开**，`WorkBuddy Manager` 同理。
+  - 打开方式：合成 Win（任务栏只认 Win）→ 点原生 `^`（`TrayNotifyWnd.left+13`，任务栏中线）→
+    把任务栏藏回去（`WM_TIMER 2`，浮窗不受影响）→ `PanelPlacement()` 摆到 `^` 下方。
+  - 关闭：shell 搬走后**不会**因点外面自动关，所以我们用 `NativeTrayPark()` 把它挪到 `(0,2000)`，
+    下次点 `^` 时按"已打开"走关闭分支；点 `^` 也能直接关。
+  - 拿不到浮窗时**回退到自绘宫格**；`[tray] native=0` 可整体回退。
+  - 现场日志：`panel: place ... -> 958,157 (293x193)` + `tray: native flyout ... moved 1403,827 -> 958,157`。
+- 旧的转发机制（`[tray] doubleClick=*` 的 `DOWN/UP/DBLCLK/UP`、`autoDoubleClick`）只在
+  `native=0` 时才会用到。**注意**：真正"要双击"的 app 等的是 `WM_LBUTTONDBLCLK`（PostMessage 合成不出来），
+  所以那套只在部分 app 上有效；原生浮窗这条路没有这个问题。
+- 双击/兜底的旧记录见 `PLAN_COMPONENTS.md` §1.2。
 
 **另外**：顺手量了玻璃的现状成本（对 H3 有用）：条 921x242 的烘焙图，
 `paint=26.27ms (glass 25.63) / bake=25.33ms`，`160 repaints / 160 captures in 10s`。

@@ -6972,13 +6972,80 @@ static void ClickScreenPoint(int x, int y) {
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
 }
 
+// Hide the taskbar while the shell's overflow flyout is on screen, and give it back the
+// moment the flyout is gone. SW_HIDE works cross-process (measured) and does not disturb the
+// flyout; leaving it hidden forever would break the next Win press, hence the restore.
+static bool g_trayHiddenForFlyout = false;
+
+static void NativeTrayRestoreTaskbar() {
+    if (!g_trayHiddenForFlyout) return;
+    g_trayHiddenForFlyout = false;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray) return;
+    ShowWindow(tray, SW_SHOWNA);          // show without activating
+    RECT tr{};
+    if (GetWindowRect(tray, &tr)) {
+        const int screenH = GetSystemMetrics(SM_CYSCREEN);
+        SetWindowPos(tray, nullptr, tr.left, screenH - 2, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);   // back to the hidden slot
+    }
+    HideNativeTaskbar();
+    DLog(L"tray: native flyout - taskbar given back");
+}
+
+// Is the shell's flyout on screen right now (a parked one does not count)?
+static bool OverflowFlyoutOnScreen() {
+    if (!g_trayNative) return false;
+    HWND f = FindOverflowFlyout();
+    if (!f || !IsWindowVisible(f)) return false;
+    RECT fr{};
+    if (!GetWindowRect(f, &fr)) return false;
+    return fr.top > -1000 && fr.top < GetSystemMetrics(SM_CYSCREEN);
+}
+
+// Move the shell's flyout under our "^" and keep it there while it finishes opening: the
+// shell draws it at its own place first and re-positions it at the end of its slide-in, so a
+// single SetWindowPos right after the key press is not enough (measured: it jumped back).
+// Returns true when the flyout was found at all.
+static bool SettleFlyout(int ms) {
+    HWND flyout = nullptr;
+    int tx = 0, ty = 0, tw = 0, th = 0;
+    bool havePlan = false;
+    bool seen = false;
+    for (int elapsed = 0; elapsed < ms; elapsed += 15) {
+        if (!flyout || !IsWindow(flyout)) flyout = FindOverflowFlyout();
+        if (flyout && IsWindowVisible(flyout)) {
+            RECT fr{};
+            if (GetWindowRect(flyout, &fr)) {
+                seen = true;
+                if (!havePlan) {
+                    RECT dr{};
+                    if (GetWindowRect(g_hwnd, &dr)) {
+                        tw = (int)(fr.right - fr.left);
+                        th = (int)(fr.bottom - fr.top);
+                        PanelPlacement(dr, tw, th, &tx, &ty);
+                        havePlan = true;
+                    }
+                }
+                if (havePlan && (fr.left != tx || fr.top != ty)) {
+                    SetWindowPos(flyout, HWND_TOPMOST, tx, ty, 0, 0,
+                                 SWP_NOSIZE | SWP_NOACTIVATE);
+                    DLog(L"tray: native flyout %p moved %ld,%ld -> %d,%d (%dx%d)",
+                         (void*)flyout, (long)fr.left, (long)fr.top, tx, ty, tw, th);
+                }
+            }
+        }
+        Sleep(15);
+    }
+    return seen;
+}
+
 // Bring the taskbar up and toggle the overflow flyout, then put the taskbar back down.
 //
 // Win+B is "focus the notification area": unlike a plain Win press it does **not** open the
 // Start menu, and the shell puts the keyboard focus on the "show hidden icons" chevron, so a
-// single Space opens the flyout (measured by the user 2026-11-16 23:0x, then again here).
-// It also needs no screen coordinates, which makes it far less brittle than clicking the
-// chevron. Falls back to "Win + click the chevron" if the taskbar never shows up.
+// single Space opens the flyout (measured by the user 2026-11-16 23:0x). It also needs no
+// screen coordinates. Falls back to "Win + click the chevron" if the taskbar never shows up.
 static bool NativeTrayPageKeyboard() {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
@@ -7007,30 +7074,19 @@ static bool NativeTrayPageKeyboard() {
     keybd_event(VK_SPACE, 0, 0, 0);
     Sleep(50);
     keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
-    Sleep(200);
-    // Hiding the taskbar: the shell obeys TrayUI's hide timer - except while the keyboard
-    // focus is inside the tray, which is exactly the case here, so it may refuse. Try it,
-    // and report what actually happened instead of guessing (see PLAN_COMPONENTS.md §3.5).
-    HideNativeTaskbar();
-    Sleep(250);
-    RECT tr{};
-    const bool stillUp = GetWindowRect(tray, &tr) && (tr.top + tr.bottom) / 2 < screenH;
-    HWND flyout = FindOverflowFlyout();
-    DLog(L"tray: native flyout - keyboard path done, taskbar %s, flyout %s", stillUp ? L"STILL UP" : L"hidden",
-         (flyout && IsWindowVisible(flyout)) ? L"open" : L"closed");
-    if (stillUp) {
-        // The tray owns the keyboard focus, which is what makes TrayUI ignore its own hide
-        // timer. Pushing the window off screen ourselves does not touch the focus, so the
-        // flyout stays; log whether the shell lets it stick (it decides whether the
-        // taskbar-hidden-until-win mod has to learn a "hide now" request - §3.5).
-        SetWindowPos(tray, nullptr, tr.left, screenH, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        Sleep(200);
-        RECT tr2{};
-        const bool stillUp2 = GetWindowRect(tray, &tr2) && (tr2.top + tr2.bottom) / 2 < screenH;
-        DLog(L"tray: native flyout - forced the taskbar off screen, it is %s",
-             stillUp2 ? L"still up (the shell snapped it back)" : L"gone");
+    const bool seen = SettleFlyout(500);
+    // The shell keeps its taskbar on screen while its own popup is open and reverts any move
+    // of it (measured), but SW_HIDE is accepted and leaves the flyout alone - the taskbar
+    // just stops being drawn. It is given back as soon as the flyout goes away (see the
+    // housekeeping in RenderTick), so a later Win press still shows it.
+    HWND tray2 = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (seen && tray2) {
+        ShowWindow(tray2, SW_HIDE);
+        g_trayHiddenForFlyout = true;
+        DLog(L"tray: native flyout - taskbar hidden (SW_HIDE)");
     }
+    HideNativeTaskbar();
+    DLog(L"tray: native flyout - keyboard path done, flyout %s", seen ? L"open" : L"MISSING");
     return true;
 }
 
@@ -7054,8 +7110,10 @@ static bool NativeTrayPageMouse() {
              L"%ld,%ld", (long)tr.left, (long)tr.top, (long)tr.right, (long)tr.bottom,
              (long)pt.x, (long)pt.y);
         ClickScreenPoint(pt.x, pt.y);
-        Sleep(180);
+        Sleep(60);
+        const bool seen = SettleFlyout(400);
         HideNativeTaskbar();      // the flyout does not need it any more
+        DLog(L"tray: native flyout - mouse path done, flyout %s", seen ? L"open" : L"MISSING");
         return true;
     }
     DLog(L"tray: native flyout - the taskbar never came up, nothing clicked");
@@ -7076,26 +7134,15 @@ static void NativeTrayToggle() {
         return;
     }
     if (wasOpen) return;                   // the click just closed it
-    for (int i = 0; i < 12; i++) {
-        Sleep(40);
-        flyout = FindOverflowFlyout();
-        if (flyout && IsWindowVisible(flyout)) break;
-    }
+    // The page functions above already place the flyout (SettleFlyout); this is only the
+    // "it never showed up at all" fallback.
     if (!flyout || !IsWindowVisible(flyout)) {
-        DLog(L"tray: native flyout did not appear - falling back to the grid");
-        GridShow();
-        return;
+        flyout = FindOverflowFlyout();
+        if (!flyout || !IsWindowVisible(flyout)) {
+            DLog(L"tray: native flyout did not appear - falling back to the grid");
+            GridShow();
+        }
     }
-    RECT fr{};
-    if (!GetWindowRect(flyout, &fr)) return;
-    RECT dr{};
-    GetWindowRect(g_hwnd, &dr);
-    int x = 0, y = 0;
-    PanelPlacement(dr, (int)(fr.right - fr.left), (int)(fr.bottom - fr.top), &x, &y);
-    SetWindowPos(flyout, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-    DLog(L"tray: native flyout %p moved %ld,%ld -> %d,%d (%ldx%ld)", (void*)flyout,
-         (long)fr.left, (long)fr.top, x, y, (long)(fr.right - fr.left),
-         (long)(fr.bottom - fr.top));
 }
 
 // The shell does not dismiss the flyout on an outside click once it has been moved away from
@@ -7112,6 +7159,7 @@ static void NativeTrayPark() {
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     DLog(L"tray: native flyout %p parked off screen (was %ld,%ld)", (void*)flyout,
          (long)fr.left, (long)fr.top);
+    NativeTrayRestoreTaskbar();           // parked = gone: the taskbar comes back
 }
 
 static bool IsOverflowFlyoutWindow(HWND h) {
@@ -9576,6 +9624,21 @@ static void RenderTick() {
             LaunchWatchTick();
             FlushPendingUp(now);
             TrayAutoDoubleTick(now);
+            // The shell's tray flyout: keep its taskbar out of sight while it is on screen,
+            // and give the taskbar back as soon as the flyout is gone (parked counts as
+            // gone). Self healing: if the shell re-shows the taskbar, we hide it again.
+            {
+                if (OverflowFlyoutOnScreen()) {
+                    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+                    if (tray && IsWindowVisible(tray)) {
+                        ShowWindow(tray, SW_HIDE);
+                        g_trayHiddenForFlyout = true;
+                        DLog(L"tray: taskbar hidden while the overflow flyout is open");
+                    }
+                } else if (g_trayHiddenForFlyout) {
+                    NativeTrayRestoreTaskbar();
+                }
+            }
             CompanionTick(now);      // attached windows: follow, fade, tray state
             QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();

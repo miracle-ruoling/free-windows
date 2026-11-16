@@ -6982,14 +6982,16 @@ static void NativeTrayRestoreTaskbar() {
     g_trayHiddenForFlyout = false;
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return;
-    ShowWindow(tray, SW_SHOWNA);          // show without activating
+    // Move it to the hidden slot *while it is still hidden*, then show: showing first would
+    // make the shell animate it down from y=1020, which is exactly the "taskbar pops up and
+    // slides away" the user saw.
     RECT tr{};
     if (GetWindowRect(tray, &tr)) {
         const int screenH = GetSystemMetrics(SM_CYSCREEN);
         SetWindowPos(tray, nullptr, tr.left, screenH - 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);   // back to the hidden slot
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    HideNativeTaskbar();
+    ShowWindow(tray, SW_SHOWNA);          // show without activating, at the hidden slot
     DLog(L"tray: native flyout - taskbar given back");
 }
 
@@ -7049,6 +7051,11 @@ static bool SettleFlyout(int ms) {
 static bool NativeTrayPageKeyboard() {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    RECT before{};
+    if (!GetWindowRect(tray, &before)) return false;
+    const bool alreadyUp = (before.top + before.bottom) / 2 < screenH;
+
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
     keybd_event('B', 0, 0, 0);
@@ -7056,36 +7063,37 @@ static bool NativeTrayPageKeyboard() {
     keybd_event('B', 0, KEYEVENTF_KEYUP, 0);
     Sleep(40);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
-    const int screenH = GetSystemMetrics(SM_CYSCREEN);
-    bool up = false;
-    for (int i = 0; i < 20; i++) {
-        Sleep(30);
-        RECT tr{};
-        if (!GetWindowRect(tray, &tr)) continue;
-        if ((tr.top + tr.bottom) / 2 < screenH) {
-            up = true;
+
+    // Win+B is what hands the *keyboard focus* to the tray, and hiding the taskbar window
+    // afterwards does not take that focus away (measured). So: hide it the moment it starts
+    // to rise and the taskbar is never seen at all - no rise animation, no blink.
+    bool hidden = false;
+    if (alreadyUp) {
+        ShowWindow(tray, SW_HIDE);
+        hidden = true;
+    } else {
+        for (int i = 0; i < 45; i++) {          // up to ~450 ms for the rise to start
+            Sleep(10);
+            RECT tr{};
+            if (!GetWindowRect(tray, &tr)) continue;
+            if (tr.top == before.top) continue;  // not moving yet
+            ShowWindow(tray, SW_HIDE);
+            hidden = true;
             break;
         }
     }
-    if (!up) {
+    if (!hidden) {
         DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
         return false;
     }
+    g_trayHiddenForFlyout = true;
+    // wait until the tray really owns the focus, then activate the chevron
+    for (int i = 0; i < 30 && GetForegroundWindow() != tray; i++) Sleep(10);
+    DLog(L"tray: native flyout - taskbar hidden, focus=%s", GetForegroundWindow() == tray ? L"tray" : L"elsewhere");
     keybd_event(VK_SPACE, 0, 0, 0);
     Sleep(50);
     keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
     const bool seen = SettleFlyout(500);
-    // The shell keeps its taskbar on screen while its own popup is open and reverts any move
-    // of it (measured), but SW_HIDE is accepted and leaves the flyout alone - the taskbar
-    // just stops being drawn. It is given back as soon as the flyout goes away (see the
-    // housekeeping in RenderTick), so a later Win press still shows it.
-    HWND tray2 = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (seen && tray2) {
-        ShowWindow(tray2, SW_HIDE);
-        g_trayHiddenForFlyout = true;
-        DLog(L"tray: native flyout - taskbar hidden (SW_HIDE)");
-    }
-    HideNativeTaskbar();
     DLog(L"tray: native flyout - keyboard path done, flyout %s", seen ? L"open" : L"MISSING");
     return true;
 }

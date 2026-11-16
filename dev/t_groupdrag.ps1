@@ -31,13 +31,19 @@ public class GD {
       hwndMenuOwner, hwndMoveSize, hwndCaret; public RECT rcCaret;
   }
   public static IntPtr Find(string cls) {
-    IntPtr found = IntPtr.Zero;
+    // Several DockGroupBoxWindow exist since G2 (one per group, created up front and hidden):
+    // always prefer the visible one.
+    IntPtr first = IntPtr.Zero, visible = IntPtr.Zero;
     EnumWindows(delegate(IntPtr h, IntPtr lp) {
       StringBuilder b = new StringBuilder(160); GetClassName(h, b, 160);
-      if (b.ToString() == cls) { found = h; return false; }
+      if (b.ToString() != cls) return true;
+      if (first == IntPtr.Zero) first = h;
+      if (Show(h)) { visible = h; return false; }
       return true; }, IntPtr.Zero);
-    return found;
+    return visible != IntPtr.Zero ? visible : first;
   }
+  static bool Show(IntPtr h) { return IsWindowVisibleNative(h); }
+  [DllImport("user32.dll", EntryPoint = "IsWindowVisible")] static extern bool IsWindowVisibleNative(IntPtr h);
   public static IntPtr ThreadCapture(IntPtr h) {
     uint tid = GetWindowThreadProcessId(h, IntPtr.Zero);
     GUITHREADINFO gi = new GUITHREADINFO();

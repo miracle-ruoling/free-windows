@@ -186,7 +186,64 @@ struct GroupDrag { bool active=false; bool started=false; POINT origin{}; POINT 
 
 ---
 
-## 10. 未决/后续（G2/G3 再定）
+## 9. G2 设计（2026-11-16 15:0x，用户 5 个拍板后）
+
+| 问题 | 决定 |
+|---|---|
+| 怎么建组 | **从成员菜单**：小窗右键 → `组 ▸ 默认组 / 组 N / 移到一个新组…`。不建空组（**已实现**） |
+| 条的归属 | **条永远属于组 1（默认组）**；其他组只由附属窗口组成 |
+| 无条组的出现 | 鼠标进入该组**任一成员**（或已在框内）→ 框淡入，离开框淡出 |
+| 管理界面 | 先只用右键菜单：成员菜单管"我在哪个组"，组菜单管"解散本组"；面板留给 G3 |
+| 单成员组 | **合法**：照旧不画框（<2 成员不画），但**右键那个成员时把组菜单叠加进去**（为将来留位） |
+
+**数据结构**
+```cpp
+static const int kMaxGroups = 4;          // 固定数组：指针/索引稳定，够用
+struct Group {
+    int id = 1;                           // 1 = 默认组（含条）；ini 节：[group] / [group.N]
+    bool enabled, blockResize, blockMove; // 组设置（每组独立）
+    int margin, lineAlpha, lineWidth, radius;
+    HWND hwnd; RECT rc; int alpha, alphaTarget;   // 框窗口 + 淡入淡出
+    HDC dc; HBITMAP bmp; void* bits; int dibW, dibH, paintedW, paintedH;
+    bool shown;                           // 每组的"显隐锁存"（原来是函数内 static）
+    BoxScale scale; GroupDrag drag;       // 每组自己的手势状态
+};
+static Group g_groups[kMaxGroups];
+static int g_groupCount = 1;              // 由成员引用的最大 group id 决定
+```
+- `Group* GroupById(int)`、`Group* GroupOfWindow(HWND)`（框窗口用 `GWLP_USERDATA` 存 id）、
+  `Group* GroupOfCompanion(Companion&)`。
+- `Companion` 新增 `int groupId = 1`；**`groupId == 0` = 不属于任何组**（= 现有的 `follow=0` 独立模式）。
+- ini 兼容：`[traybar] group=N`；若没有这个键，就按旧的 `follow` 推（`follow=0 → 0`，否则 `1`）。
+  写入时两个键都写，老版本读得懂。
+
+**成员与几何**：`GroupMembers(Group&, out)` =（id==1 时加条）+ 所有 `groupId == g.id` 的附属窗口；
+`< 2` 个成员 → 该组没有框（不画、不可交互，但组还在、设置还在）。
+
+**显隐（每组独立）**
+- 组 1：沿用现在的规则（鼠标上条 → 全组淡入；离开框 → 淡出），成员 alpha 跟随组。
+- 组 N>1：成员按**距离淡出**（和现在 `follow=0` 一样，否则永远碰不到它），**框**在鼠标进入任一成员/框内时淡入。
+- `GroupScaling()/GroupDragging()` 变成"**任意**组在缩放/拖动"（可见性白名单、抓图 busy、条的不透明都靠它）。
+
+**拖动/缩放（每组）**
+- 组 1 的拖动仍然走"驱动条"那条路（`g_cfg + g_dragMovePending` → `Present()` 同一次合成）；
+  组 N>1 没有条，直接按按下时的成员矩形 + 位移绝对定位，再重算框。
+- 缩放同理：组成员逐个按比例映射；条只可能出现在组 1。
+- `CompanionFollowTo()` 只带 **`groupId == 1`** 的附属窗口和**组 1 的框**（其他组各自独立）。
+
+**菜单**
+- 成员菜单（`CompanionShowMenu`）：原有项 + `组 ▸`（默认组 ✓ / 组 2 ✓… / 移到一个新组…）+ `Dock 设置…`。
+  若它所在的组**没有框**（单成员组），追加组菜单项：`显示边框线 / 屏蔽缩放 / 屏蔽位移 / 解散本组`。
+- 组菜单（`GroupShowMenu(Group&)`）：同样的四项；非默认组多一项 `解散本组`（成员回组 1）。
+
+**风险**
+- z 序：每个组的框窗口都是 topmost；同一时刻可能有两个组的框重叠——各自独立，先显示的在下面即可（不特判）。
+- 可见性判定从"单组"变成"任意组"，所有原来的 `GroupScaling()/GroupDragging()` 调用点要逐个检查：
+  条的 alpha、抓图 busy、`cadence` 统计都不该因为别的组在动而误判（组 1 的语义要保住）。
+
+---
+
+## 10. 未决/后续（G3 再定）
 - 多组时"条"归哪个组？条能不能成为某个独立组的成员？
 - 组与组重叠时的 z 序与命中（谁在上、拖谁）。
 - 每窗口设置面板的形态（分页 / 每窗口一个小面板 / 就地编辑）。

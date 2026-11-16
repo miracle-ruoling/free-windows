@@ -37,8 +37,11 @@
      （跟随/重置尺寸/显示组框/Dock 设置）。用户砍掉了 wifi 格数与电量档位（三态与 tooltip 已够）。见 §3.10。
   6. **G1 组实体化**：成员列表抽象 + **板面**（不可见但可点）+ 拖组 + **组菜单**（`显示边框线`/
      `屏蔽缩放`/`屏蔽位移`/`Dock 设置…`）；`enabled` 语义改成"只控制那圈线"。见 §3.11、`PLAN_GROUP.md`。
-- **下一步待办**：**G2 多组**（新建/删除组、把窗口拖进拖出、`[group.N]`）；之后 **G3 每窗口设置**
-  （设置面板按窗口分页、独立窗口的样式/淡入淡出）。两者都要用户点头才动工。
+  7. **G2 多组**：`g_groups[4]`（组 1 = 默认组含条）；小窗右键 `组 ▸` 换组/新组；`解散本组`；
+     单成员组的组设置叠加进成员菜单；`[group.N]` / `[traybar] group=N`。见 §3.12。
+  8. 顺带修掉：**拖组时条的玻璃背景抖**（抓图边距漏了"组拖动"这条路径，见 §3.11 末尾）。
+- **下一步待办**：**G3 每窗口设置**（设置面板按窗口分页、独立窗口的样式/淡入淡出、跟随组只读项）。
+  另外多组要"看得见"还缺一个**第二个附属窗口**（现在只有一个，所以组 2 永远只有 1 个成员 → 永远没框）。
 
 ---
 
@@ -68,7 +71,8 @@
 | 托盘小窗 | 实测 `x=1369 y=270 202x60`、`follow=1`；ini 里是 **`[traybar]`** 一节（`enabled/x/y/w/h/hasPos/follow`） |
 | ini `[dock]` | `material=1 / lightMode=1 / glassOpacity=0 / tintStrength=0 / blurRadius=0 / refreshHz=144 / captureHz=20 / presentSync=2 / radius=77 / pad=10 / maxIcon=72 / allowResize=1`（**全透明档** → `FullyTransparent()` 为真，`ShrinkToIcons()` 会生效） |
 | ini `[group]` | `enabled=1`（**只控制那圈线**）/ `blockResize=0` / `blockMove=0` / `margin=8` / `lineAlpha=64` / `lineWidth=1` / `radius=12`（G1 起 `margin` 同时是缩放抓取环宽度，也是"板面可抓区域"的宽度；改完要重启 dock） |
-| ini `[traybar]` | 位置/尺寸 + `enabled/follow/hasPos`；**R4 新增样式覆盖** `radius / pad / gap`（不写或 -1 = 继承 `[dock]`；**改完要重启 dock**） |
+| ini `[traybar]` | 位置/尺寸 + `enabled/follow/hasPos` + **`group=N`**（G2：1=默认组，0=独立，N=第 N 组）；**R4 样式覆盖** `radius / pad / gap`（不写或 -1 = 继承 `[dock]`；**改完要重启 dock**） |
+| ini `[group.N]` | G2 起每组一节（组 1 仍是 `[group]`）：`enabled/blockResize/blockMove/margin/lineAlpha/lineWidth/radius`，由组菜单直接读写 |
 | Windhawk mod | `fly_bar/windhawk/dock-flyout-anchor.wh.cpp`（**0.2.0**，2026-11-15 23:01 编译）；`ModsSource` 里是同一份；`@include` = explorer / ShellExperienceHost / ShellHost / StartMenuExperienceHost |
 | git | 仓库在 `dock/`，`.gitignore` 覆盖产物/截图/帧转储 → **`git add -A` 就够** |
 
@@ -565,7 +569,6 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 菜单文案；`屏蔽缩放`/`屏蔽位移` 组合使用（两个都开时：拖成员=拖组、拖边=不拉伸，机器验过单开）。
 
 **修掉的 bug（2026-11-16 14:48 用户报告）：拖组时条的玻璃背景抖**
-
 - 现象：**拖组空隙**（板面）或**开屏蔽位移后拖小窗**时，条的玻璃背景出现"位移/抖动"；**直接拖条**就没有。
 - 根因：`CaptureBackdrop()` 里"拖动时的抓图边距"只认条自己的 `g_dragging`/`g_resizeEdge`：
 
@@ -586,7 +589,56 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 
 ---
 
-## 4. 改代码前必须知道的 11 件事
+### 3.12 G2 多组（2026-11-16 15:1x）
+
+**语义（用户 5 个拍板，详见 `PLAN_GROUP.md` §9）**
+- **组 = 实体**：`g_groups[kMaxGroups=4]`，每组自己的设置/框窗口/淡入淡出/手势状态。**组 1 = 默认组**（含条）。
+- **建组**：小窗右键 → `组 ▸ 默认组 / 组 2 / 组 3 / 组 4 / 移到一个新组…`；**不建空组**。
+- 组 1 的显示规则不变（鼠标上条 → 整组淡入）；**无条组**的成员按距离淡出（不然碰不到它），
+  **框**在鼠标进任一成员/框内时淡入。
+- 单成员组**合法**但**不画框**（<2 成员），它的组设置**叠加进成员的右键菜单**（用户原话）。
+- `解散本组` 只出现在 id>1 的组里；成员回组 1。
+
+**实现落点**
+| 项 | 关键点 |
+|---|---|
+| 模型 | `struct Group{id, 设置, hwnd/rc/alpha/dib, shown, scale, drag}` + `g_groups[4]` + `g_groupCount`；`GroupById/GroupOfWindow(GWLP_USERDATA)/DefaultGroup` |
+| 成员 | `GroupMembers(Group&, out)`：id==1 加条，再加所有 `groupId == g.id` 的附属窗口；`< 2` → 无框（`GroupBoxRect` 返回 false） |
+| 窗口 | **启动时把 4 个组的框窗口全建好**（隐藏）：id 稳定，菜单里新建的组和启动时存在的一模一样 |
+| 状态从 `static` 搬到 `Group` | `shown`、`BoxScale`、`GroupDrag` 都变成每组成员；`box0/strip0/comp0` → `members0[]` |
+| 跟随 | `CompanionFollowTo()` 只带 `groupId == 1` 的小窗 + **组 1 的框**（其他组各自独立） |
+| 拖动 | 组 1 仍走"驱动条 → `g_cfg + g_dragMovePending`"（同帧合成）；组 N>1 没有条，按按下时的成员矩形**绝对**定位再重算框 |
+| 缩放 | `GroupScaleTo(Group&)` 遍历 `g` 的成员（每组各自的最小尺寸/落点） |
+| 开关 | `GroupBlocksResize/Move(Companion*)`：小窗看自己那组，条看组 1 |
+| ini | `[group]` = 组 1（**兼容旧配置**），`[group.N]` = 组 N；`[traybar] group=N`（没这个键就按旧 `follow` 推：`0→0`，否则 `1`）；写入时 `group` 和 `follow` 都写 |
+| 语义 | `groupId == 0` = 不属于任何组（= 旧的 `follow=0` 独立模式） |
+
+**证据（`dev/`，本机实测）**
+- 启动：`groups: 1 in use (max 4)`、`group 1: frame 555,5 1074x109 (margin 8, line=1, blockResize=0, blockMove=0)`；
+  `t_groupbox.ps1` → `geometry matches the members + margin 8: True`。
+- 菜单：小窗右键有 `组 ▸`（截图 `compmenu_g2.png` / 子菜单 `compmenu_g2_sub.png`：`✓默认组（跟随条）/ 组 2 / 组 3 / 组 4 / 移到一个新组…`）。
+- 移到组 2：日志 `tray bar: saved 1322,3 262x79 (follow=0 group=2)`、`tray bar: group 1 -> 2`；
+  之后**拖条 → 小窗不动**（`companion 1322,3` 不变）＝ 真正独立。
+- 单成员组的菜单（截图 `compmenu_g2_single.png`）：`组 ▸ / 重置尺寸 / ─ / ✓显示边框线 / 屏蔽缩放 / 屏蔽位移 / 解散本组 / ─ / Dock 设置…`，
+  且勾选状态是**该组自己的**（组 1 的 `blockResize/blockMove=1` 时，组 2 这两项仍是未勾）。
+- `解散本组`：`tray bar: saved … (follow=1 group=1)` + `group 2: dissolved`，框与几何立刻恢复
+  （`frame 555,5-1629,114`, `geometry matches: True`），ini 回到 `follow=1 group=1`。
+- 回归：`t_followfps.ps1` 拖条时条与小窗**同步 108.3 次/秒**（`ratio 1.00`、偏移漂移 0.00px）。
+
+**坑**
+- **`DockGroupBoxWindow` 现在有 4 个**，而且平时都是隐藏的：探针/脚本里 `FindWindow` 式的查找会抓到
+  隐藏的那个（表现：`rect=0,0-10,10`、`visible=False`，看着像"框没出来"）。`dev/` 里的探针已改成
+  **优先返回可见的那个**，并在每次读之前重新找。
+- `Group` 的成员访问（`g.scale.active` 等）需要完整类型：`CursorInCompanionGroup()` 这种早于组定义的函数
+  只能用**提前声明的自由函数**（`PointerInDefaultGroup(POINT)`）。
+- 组 1 的 ini 节名保持 `[group]`（没有迁移），新组才是 `[group.N]`。
+
+**未由人手复核**：菜单里 `组 ▸` 的层级是否顺手；多个组同时存在时的观感（现在只有一个附属窗口，
+所以"组 2"永远只有 1 个成员 → 永远没框，必须再加一个附属窗口才能看到真正的多组画面）。
+
+---
+
+## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
    合成器"下一帧才应用新矩形、但 layered 位图立刻生效"→ 每次移动后的 5–7 ms 是
@@ -627,6 +679,11 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
     还有一条**派生**规则：凡是"指针在不在组里"的判定，在缩放期间都要短路成 true
     （`GroupScaling()`）——框边永远落后光标 1–2 条消息，快速拖动时按几何判会把整个组淡掉
     （2026-11-16 的 bug，见 §3.9 末尾）。
+12. **G2 之后"组"是复数**：`g_groups[4]`（组 1 = 默认组，含条）。任何"某一个组"的代码都必须带
+    `Group&` 参数；"这个附属窗口属于哪一组"看 `c.groupId`（0 = 不属于任何组）。三个易错点：
+    ①**不要再用 `g_trayBar.follow` 判"在不在组里"**（它现在只是 `groupId == 1` 的镜像）；
+    ②`DockGroupBoxWindow` 有 4 个、平时全隐藏 —— 探针必须挑**可见的**那个；
+    ③组 1 的 ini 节是 `[group]`，新组是 `[group.N]`（没有迁移代码，靠这个区分）。
 
 ---
 
@@ -653,6 +710,7 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_compmenu.ps1 -X -Y -PickX -PickY`** | 【R4】右键开小窗菜单 + 点某一项，前后打印框的可见性（验证"菜单命令真的执行了"）。**别叫它 `t_menupick.ps1`——那个名字早就被 App 菜单探针占了** |
 | **`t_groupdrag.ps1 [-Dx -Dy -Inset -Margin -Steps -StepMs]`** | 【G1】先在条上预热，再按框内板面拖 N 像素：打印条/小窗/框的位移与 `frame == members + margin`。**默认要看 `margin=40`**，否则紧凑布局里没有空白可抓 |
 | **`t_groupmenu.ps1 [-Item 1..4] [-X -Y]`** | 【G1】右键框（默认按框线左端）→ 点第 N 项 → 打印帧矩形并回读日志里的 `group: menu ->` |
+| **`t_click.ps1 -X -Y [-Double]`** | 【G2】DPI-aware 的单击（选菜单项用）。菜单项的坐标要先用截图量：本机主菜单从光标处向右下展开，第一项约 +12px、之后每项 +26px |
 | **`t_zorder.ps1`** | 【G1】把几个类名在 z 序里的相对位置打出来（`ControlCenterWindow` 这类 shell XAML 窗口 EnumWindows 看不到，只能靠 `WindowFromPoint` 判） |
 | **`tray_drag_shots.py`** | 【本轮】拖动时抓帧 + 记录 rect 的探针（模板相关性定位），用于"屏幕到底怎么动" |
 | `acrylic_test.cpp` + `buildtoy2.ps1` | DWM 磨砂可行性验证（还没用上，见 `HANDOVER.md` §3.6 末尾） |

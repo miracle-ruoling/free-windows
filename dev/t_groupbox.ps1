@@ -20,13 +20,19 @@ public class GB {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   public static IntPtr Find(string cls) {
-    IntPtr found = IntPtr.Zero;
+    // Several DockGroupBoxWindow exist since G2 (one per group, created up front and hidden):
+    // always prefer the visible one.
+    IntPtr first = IntPtr.Zero, visible = IntPtr.Zero;
     EnumWindows(delegate(IntPtr h, IntPtr lp) {
       StringBuilder b = new StringBuilder(160); GetClassName(h, b, 160);
-      if (b.ToString() == cls) { found = h; return false; }
+      if (b.ToString() != cls) return true;
+      if (first == IntPtr.Zero) first = h;
+      if (Show(h)) { visible = h; return false; }
       return true; }, IntPtr.Zero);
-    return found;
+    return visible != IntPtr.Zero ? visible : first;
   }
+  static bool Show(IntPtr h) { return IsWindowVisibleNative(h); }
+  [DllImport("user32.dll", EntryPoint = "IsWindowVisible")] static extern bool IsWindowVisibleNative(IntPtr h);
   public static string Name(IntPtr h) {
     if (h == IntPtr.Zero) return "(desktop)";
     StringBuilder b = new StringBuilder(160); GetClassName(h, b, 160);
@@ -55,6 +61,9 @@ Write-Output ("strip {0},{1}-{2},{3}  companion {4},{5}-{6},{7}" -f $sr.Left,$sr
 Write-Output ("expected frame {0},{1}-{2},{3} (margin {4})" -f $wantL,$wantT,$wantR,$wantB,$Margin)
 
 function Show-Box($label) {
+  # G2: there are kMaxGroups windows of this class and they are all hidden until the group is
+  # up - so re-pick the visible one every time instead of caching the handle found at startup.
+  $box = [GB]::Find('DockGroupBoxWindow')
   $r = New-Object GB+RECT; [void][GB]::GetWindowRect($box, [ref]$r)
   $cp = New-Object GB+POINT; [void][GB]::GetCursorPos([ref]$cp)
   Write-Output ("[{0}] cursor {1},{2} | frame visible={3} rect={4},{5}-{6},{7} size={8}x{9} | companion visible={10}" -f `

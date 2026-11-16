@@ -7219,10 +7219,12 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     // and cloaking is visual only, so the tray still takes the keyboard focus.
     g_cloakGraceUntil = GetTickCount() + 1500;
     TaskbarCloakForce();
-    // ... and tell the mod that this rise is wanted: the Win press inside Win+B is ours, and
-    // the mod no longer lets *any* Win press raise the bar unconditionally (see the
-    // allow/deny pair in the taskbar control block).
-    TaskbarAllowExpansion(2500);
+    // Make sure a "keep the taskbar down" request from a previous Win+X is not still live:
+    // Win+B is a real Win press and the mod's own permission covers the rise (measured: the
+    // bar is up 200-450 ms later). We deliberately do *not* hand out an extra permission
+    // here - doing that made the shell expand the bar before its tray-focus step and the
+    // flyout stopped opening (measured 2026-11-17 00:38, "focus=elsewhere").
+    TaskbarDenyExpansion(0);
 
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
@@ -7239,7 +7241,6 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
         if (!GetWindowRect(tray, &tr)) continue;
         if ((tr.top + tr.bottom) / 2 < screenH) up = true;
     }
-    TaskbarAllowExpansion(0);      // the rise is done; everything else must stay down
     if (!up) {
         DLog(L"tray: native flyout - Win+B did not bring the taskbar up");
         return false;
@@ -7261,7 +7262,7 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
 static bool NativeTrayPageMouse(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
-    TaskbarAllowExpansion(2000);       // this Win press is ours (see NativeTrayPageKeyboard)
+    TaskbarDenyExpansion(0);           // a live Win+X deny must not block this Win press
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(30);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
@@ -7271,7 +7272,6 @@ static bool NativeTrayPageMouse(const PanelCtx& ctx) {
         RECT tr{};
         if (!GetWindowRect(tray, &tr)) continue;
         if ((tr.top + tr.bottom) / 2 >= screenH) continue;      // still off screen
-        TaskbarAllowExpansion(0);
         POINT pt{};
         if (!TrayChevronPoint(&pt)) continue;
         DLog(L"tray: native flyout - taskbar up (%ld,%ld-%ld,%ld), clicking its chevron at "

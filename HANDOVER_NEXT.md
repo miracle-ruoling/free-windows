@@ -9,11 +9,12 @@
 > 5. `PLAN_COMPONENTS.md`（**下一步的全部内容**：H2 设置按组件重构的决策 + H3 玻璃共享快照设计）
 > 6. 需要时再看：本文 §3.11–§3.13（组/浮窗几何、设置面板结构）、`PLAN_GROUP.md`、`PLAN_COMPANION.md`
 > `HANDOVER_TODO_GLASS_LAG.md` 只当历史查，不要重读 §1–§4.9。
-> **待用户做的一件事**：`Taskbar hidden until Win` **1.0.1** 已写好在磁盘上
+> **待用户做的一件事**：`Taskbar hidden until Win` **1.0.2** 已写好在磁盘上
 > （`windhawk/local@taskbar-hidden-until-win.wh.cpp`，已同步到 `C:\ProgramData\Windhawk\ModsSource\`，
 > 本机用 Windhawk 自带的 clang 编过、只带既有两条 warning），需要他在 Windhawk UI 里 **Compile** 一次。
 > 这一版修的是 **§3.17**："快速左右键点 Win 按钮 ⇒ 任务栏露头"的真因（Win+X 会真的把任务栏抬起来 +
-> 展开许可死锁 + cloak 掩盖"已经站起来"的栏）。
+> 展开许可死锁 + cloak 掩盖"已经站起来"的栏），以及 1.0.1 自己引入的 **cloak 死锁**
+> （cloaked 的任务栏 shell 收不回去 ⇒ 按 Win 什么都不发生、托盘的 Win+B 路径失效）。
 
 > 写于 2026-11-15 23:40，2026-11-16 18:3x 更新（R1–R4、G1–G3 全部完成；
 > **下一步的计划写在 `PLAN_COMPONENTS.md`：两个 bug 修复 + 设置按组件重构**）。
@@ -883,6 +884,28 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 4. 可能被 deny 影响的地方：**Win+X 菜单本身还能不能弹**（我们是靠 anchor mod kind=4 自己摆它的）。
    如果菜单不出来了，把 dock 的 `TaskbarDenyExpansion(1200)` 换成 `TaskbarCloakForce()`
    （让栏照样展开、只是不可见），其余不用动。
+
+**1.0.1 实测结果 + 由此挖出的第二个更大的 bug（2026-11-17 00:37）**
+
+- **deny 有效**：`dev/t_winbtn_repro.ps1` 的 C 段从 `minY=1020 riseAt=213ms` 变成
+  **`minY=1078 maxY=1078 riseAt=-1`** —— 右键 Win 格再也不抬任务栏了。✅
+- 但随即暴露：**"cloak 着 + 已经展开"的任务栏是个死锁**。
+  - 实测：`SetWindowPos(Shell_TrayWnd, y=1078)` 从 dock 进程发出去被**立刻revert**（doc 早就这么写，这次复验）；
+    `WM_TIMER 2`（TrayUI 自己的隐藏定时器）在 cloak 状态下**完全无效**；
+    ⇒ **shell 收不回一条 cloaked 的任务栏**（它的收起动画根本不跑）。
+  - 而 1.0.0/1.0.1 的 `CloakTick()` 是"**等它下屏了再解 cloak**"⇒ 它永远不下屏 ⇒ **永远不解 cloak**。
+    以前这个死锁是"按 Win 时解 cloak"意外打破的——代价就是那条**已经展开的栏当场现形**（正是用户报的现象）。
+    1.0.1 把这次"解 cloak"改成"先求它隐藏" ⇒ 死锁再也打不破：
+    按 Win **什么都不发生**；`^` 的托盘 Win+B 路径也跟着废（`focus=elsewhere` → Space 打不开浮窗 →
+    退回自绘宫格）。实测 00:38 连续 6 轮全是 `focus=elsewhere` + `falling back to the built-in grid`。
+  - ⇒ **1.0.2 的改法**：`CloakTick()` 在 dock 不再要求 cloak 时**立刻解 cloak 并求它隐藏**（再 1.5s 内每 100ms 重求一次，
+    条件是 `!WinKeyDown() && !AllowValid()`，绝不跟"Win 想看栏"抢）。代价：关托盘浮窗时任务栏会
+    **正常地收起一次**（和普通自动隐藏任务栏关掉浮窗时一样），换掉"看不见但已经站起来"的死状态。
+  - 同时把 dock 托盘路径里那个 `TaskbarAllowExpansion(2500)` **撤掉**（改回只清 deny）：
+    "提前把许可给它"很可能就是让 shell 先展开、进而跳过"把键盘焦点交给托盘"那一步的原因
+    （实测 `focus=elsewhere`）。Win+B 自己那下 Win 按下已经够它升起来了（实测 200–450ms）。
+    `allow` 字段留在协议里，暂时没人写。
+- **教训**：任何"先遮住、等条件满足再放开"的补偿机制，都要问一句**"那个条件会不会永远不满足"**。
 
 ---
 

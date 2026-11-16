@@ -1,5 +1,18 @@
 # 交接：下一轮从这里开始
 
+> **阅读顺序（新会话照这个来，别从旧文档倒着翻）**
+> 1. 本文 **§0 三分钟版本**（项目是什么、什么能用、下一步做什么）
+> 2. 本文 **§3.16**（托盘=原生浮窗，本轮最新、最容易踩坑：cloak 协议、为什么不能 SW_HIDE、
+>    为什么必须工作线程、以及"任务栏偶发露头"的两个机制 + 待 Compile 的 mod 修改）
+> 3. 本文 **§3.15**（H1 两个 bug 的结论：H1.1 = Windhawk 必须排除 `SearchHost.exe`；H1.2 = 托盘双击）
+> 4. 本文 **§2 现场**（当前 ini 值、mod 版本、怎么重启）+ **§4 改代码前必须知道的 12 件事**
+> 5. `PLAN_COMPONENTS.md`（**下一步的全部内容**：H2 设置按组件重构的决策 + H3 玻璃共享快照设计）
+> 6. 需要时再看：本文 §3.11–§3.13（组/浮窗几何、设置面板结构）、`PLAN_GROUP.md`、`PLAN_COMPANION.md`
+> `HANDOVER_TODO_GLASS_LAG.md` 只当历史查，不要重读 §1–§4.9。
+> **待用户做的一件事**：`Taskbar hidden until Win` 的源码已更新（撤销展开许可挪到 100ms 门内），
+> 需要他在 Windhawk UI 里 **Compile** 一次才生效。源码两份：`windhawk/local@taskbar-hidden-until-win.wh.cpp`
+> （仓库）和 `C:\ProgramData\Windhawk\ModsSource\`（运行时那份，已同步）。
+
 > 写于 2026-11-15 23:40，2026-11-16 18:3x 更新（R1–R4、G1–G3 全部完成；
 > **下一步的计划写在 `PLAN_COMPONENTS.md`：两个 bug 修复 + 设置按组件重构**）。
 > 上一轮（图标拖动重排 + 动效 + 边界滚入）的过程在 `HANDOVER_TODO_GLASS_LAG.md` §4.10–§4.17，
@@ -797,18 +810,26 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
   `C:\ProgramData\Windhawk\ModsSource\` 里那份（**改了要用户在 Windhawk UI 里 Compile**）。
   本轮给它加了 `-ldwmapi` 和 `#include <dwmapi.h>`。
 
-**还剩下的极小概率现象（未定位，用户已接受）**：偶尔（不可复现）与本轮无关的任务栏活动
-（左键/右键条上的 Win 按钮、其它零散操作）会让任务栏露一下，**并且偶尔不自动收起，直到点别处**。
-已知的两个可信机制：
-1. **shell 会把我们的隐藏请求推迟**（开始菜单/Win+X 弹窗正在开时）：实测 `WM_TIMER 2` 被接受但
-   任务栏不降，直到弹窗关闭。⇒ 本轮加了**重试**：`HideNativeTaskbar()` 之后 2.5s 内，只要
-   `NativeTaskbarOnScreen()` 为真且不是我们的浮窗在撑，就每 350ms 再要一次（日志
-   `win button: taskbar still on screen - asked again`）。
-2. **mod 的展开许可（`g_allowOpen`）有最长 500ms 的窗口**（Watchdog 每 500ms 才撤销一次），
-   这期间"底部边缘悬停"能通过 `MouseAllowedToShow()` → 任务栏冒出来。**下一步**：把撤销移到 20ms
-   的轮询里（`Watchdog` 的其余部分保持不变），这个窗口就缩到 20ms。
-**下次排查的话**：`loggrep.ps1 -Pattern "taskbar still on screen|hid the native taskbar|via a remembered handle|native flyout"`，
-看事件前后有没有 `via a remembered handle`（说明当时枚举不到任务栏 = 已经展开）以及有没有
+**还剩下的极小概率现象（2026-11-17 00:1x 用户又复现了几次，机制基本锁定）**
+现象：与本轮无关的任务栏活动里偶尔（不可复现）任务栏露一下，偶尔还**不自动收起，直到点别处**。
+**新的复现线索（关键）**：在条上的 Win 按钮上**快速循环 左键 → 右键 → 左键** 几次就有机会触发；
+**与鼠标靠近下边界无关**（所以不是"悬停"那条）。⇒ 指向 **mod 的展开许可 `g_allowOpen`**：
+- 右键 Win 按钮 = `Win+X`，真的按了 Win ⇒ mod `g_allowOpen = true`（允许一次展开）；
+- 紧接着左键 Win 按钮 = `Ctrl+Esc` 开开始菜单 ⇒ 开始菜单本身会向 shell 请求展开，**此时许可还亮着**
+  ⇒ 任务栏被展开；而这一刻没有任何人负责把它收回去（我们只在 Win+X 那次排了 650ms 的隐藏），
+  于是它就立在那儿，直到点别处。
+- 旧代码只在 **500ms 的 Watchdog** 里撤销许可，这个窗口足够两个动作挤进去。
+
+**已实现（需要用户在 Windhawk UI 里 Compile 一次才生效）**：把"任务栏已在屏幕上 ⇒ 撤销许可"
+挪进 20ms 轮询里的 **100ms 门**（`Wh_Log`: `taskbar on screen -> expansion permission revoked (poll)`），
+窗口从 500ms 缩到 100ms；并且 `!win`（Win 还按着时不撤，避免干扰 Win+X 的和弦）。
+**注意**：那次撤销用的是 `TaskbarOnScreen()`，而它把 **cloaked 当成不在屏幕上**——所以我们的托管浮窗
+（托盘浮窗）期间不会被误撤；浮窗关掉、cloak 释放后如果任务栏还立着，下一次轮询就撤掉。
+- **兜底仍在**（dock 侧，不需要 mod）：`HideNativeTaskbar()` 之后 2.5s 内每 350ms 再要一次隐藏，
+  日志 `win button: taskbar still on screen - asked again`；这条专门对付"shell 推迟了隐藏请求"。
+
+**下次排查的话**：`dev/loggrep.ps1 -Pattern "taskbar still on screen|hid the native taskbar|via a remembered handle|native flyout|falling back"`，
+看事件前后有没有 `via a remembered handle`（= 当时枚举不到任务栏 = 已经展开）以及有没有
 `falling back to the built-in grid`。**不要在窗口线程里加 sleep**（见上表）。
 
 ---

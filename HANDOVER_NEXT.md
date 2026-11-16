@@ -932,6 +932,43 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 - **1.0.3（源码已就绪，Compile 可选）**：只把 deny/allow 的读取从"20 ms 缓存"改成"每次直读"，
   纯稳健性。不 Compile 也能用 —— dock 侧那 40 ms 余量已经够。
 
+**⚠️ 写 mod 源文件必须"无 BOM"（2026-11-17 01:2x 踩的）**
+
+用 `Set-Content -Encoding UTF8` 改这个 .wh.cpp 会写出 **UTF-8 BOM**，Windhawk 就报
+**`Couldn't find a metadata block in the source code`**（它的解析器要求 `// ==WindhawkMod==` 在第 0 字节，
+BOM 让它变成前 3 个字节）。正确写法：
+
+```powershell
+$t = [System.IO.File]::ReadAllText($p)          # 不带编码时默认 UTF8 且保留原样
+[System.IO.File]::WriteAllText($p, $t, [System.Text.UTF8Encoding]::new($false))   # 关键：$false = 不写 BOM
+```
+或者直接用仓库里的 edit/write 工具改。检查：
+`[System.IO.File]::ReadAllBytes($p)[0..2]` 必须是 `2F 2F 20`（`// `），不是 `EF BB BF`。
+
+**1.0.2 之后：托盘打开/关闭的第二次返工（2026-11-17 01:1x–01:2x，用户报"托盘弹出任务栏收起、
+托盘收起任务栏弹出"）**
+
+用户现象：点 `^` 打开托盘 → **任务栏收起**（其实是我加的 cloak 把它遮住了，因为 shell 为托盘把栏顶上去了）；
+再点 `^` 关托盘 → **任务栏弹出并且再也不收**（解 cloak 时那条本来就站着的栏现形，而 shell 在这个状态下
+不认隐藏定时器），只能**按两次 Win 让开始菜单开关一次**，栏才跟着收起。
+
+根因还是同一句话：**托盘这条路径根本不需要任务栏站起来**。实测（`dev/t_winb_space.ps1`）：
+任务栏停在 `y=1078` 时，`Space` 一样能把 shell 的托盘浮窗打开。所以：
+
+- `NativeTrayPageKeyboard()` 现在**一开始就 `TaskbarDenyExpansion(2000)`**（和 Win+X 同一招），
+  整条 Win+B + Space 序列期间任务栏**一步都不许动**；`Space` 之后立刻清 deny。
+- 于是"打开托盘"时任务栏没有站起来 → 不需要 cloak 去遮 → 关闭时也没有"已经站着的栏"要收
+  ⇒ 用户报的那两个现象一起消失。实测（`dev/t_tray_openclose.ps1`，一轮开+关+点桌面）：
+  **全程 `bar y=1078`，cloak 只在浮窗打开期间被要求（而且栏本来就在屏幕外，遮不遮都看不见）**。
+- 顺带：`Space` 会**重试 3 次**（每次 200 ms 内等浮窗出现）。因为 `Win+B` 在这台机器上时灵时不灵
+  （见下），一次不成就放弃太浪费。
+- **`Win+B` 的可靠性**：专门量过（`dev/t_winb_scan.ps1`）——带/不带 scan code 各 5 轮，**0/5** 拿到焦点；
+  直接往共享块写 `allow=+20s` 也没用（`dev/t_allow_winb.ps1`）⇒ **跟 mod / cloak / 许可都无关**。
+  它 00:37 和 01:16 各成功过一次，怀疑与"用户当时正在动键鼠"有关（注入的 Win 和弦会被物理输入搅掉，
+  `HANDOVER.md` §3.2 记过同样的事）。**下一轮复测请让用户别碰键鼠**，再跑
+  `dev/t_tray_rounds.ps1 -Rounds 5`；如果那时仍然 0/5，就改用"直接 `ShowWindow(SW_SHOWNOACTIVATE)`
+  那个浮窗窗口"（不必按 Win+B），代价是"点外面自动关"要自己实现。
+
 ---
 
 ## 4. 改代码前必须知道的 12 件事
@@ -1027,6 +1064,8 @@ if (now - lastWatch >= 16) { ... CompanionTick(now); ... }   // 跟随被关在 
 | **`t_tray_close.ps1`** | 【§3.17】浮窗开着时用 `Space` / `Win+B`+`Space` 关它（结论：纯 `Space` 就行） |
 | **`t_tray_rounds.ps1 -Rounds N`** | 【§3.17】连开连关 N 轮 `^`，统计 native flyout 成功/退回宫格的次数（下一轮复测就用它） |
 | **`t_cloak_focus.ps1`** | 【§3.17】cloak 与 `Win+B` 焦点的关系探针（**注意**：dock 会把自己的 cloak 请求清掉，别用它读状态） |
+| **`t_tray_openclose.ps1`** | 【§3.17】用户报的"托盘开→任务栏收起 / 托盘关→任务栏弹出"那一轮的完整走查：Win×2 归一 → `^` 开 → `^` 关 → 点桌面，每步打印 bar/cloak/浮窗 |
+| **`t_winb_scan.ps1 [-NoScan]`** | 【§3.17】`Win+B` 给不给托盘焦点：带/不带 scan code 各 N 轮，输出成功率 |
 | `t_win_probe5/6.ps1` + `shotdiff.py` | 【本轮】"开始菜单窗口搬不动"的探针：probe5 移动面板窗口并前后截图，`shotdiff.py a.png b.png` 出 `changed=N` 与包围盒（实测 `changed=0 of 2073600`） |
 | `t_winx.ps1 [-Move]` | 【本轮】Win+X 菜单的探针：新出现的窗口类/矩形，以及 `SetWindowPos` 后矩形是否真的变（这台机器：不变） |
 | `t_winx_anchor.ps1` | 【本轮】右键首格 → 打印 Win+X 弹窗实际 rect、`kind=4` 锚点、期望落点（现在应完全一致） |

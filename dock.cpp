@@ -7242,12 +7242,15 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     if (!GetWindowRect(tray, &before)) return false;
     const bool alreadyUp = (before.top + before.bottom) / 2 < screenH;
 
-    // No cloak yet: cloaking the taskbar takes the keyboard focus away from it, and Win+B is
-    // exactly a request for that focus (measured 2026-11-17 01:1x: with the cloak on, Win+B
-    // left the foreground where it was; without it the focus arrived and Space opened the
-    // flyout). The cloak is requested as soon as the flyout is actually on screen, which is
-    // when the bar has to stop being drawn.
-    TaskbarDenyExpansion(0);
+    // No cloak, and **no rise either**: this whole path only needs the tray to take the
+    // keyboard focus, and Space opens the flyout with the bar still sitting off screen
+    // (measured 2026-11-17 01:0x). Letting the shell expand the bar here is what produced the
+    // user's "tray opens / taskbar hides, tray closes / taskbar appears and then sits there":
+    // the bar was expanded for the flyout, the cloak hid it while the flyout was up, and when
+    // the flyout closed the cloak had to be released - at which point an already expanded bar
+    // became visible, and the shell will not retract it (its hide timer is ignored in that
+    // state; only a Start open+close cycle puts it back down).
+    TaskbarDenyExpansion(2000);
 
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(40);
@@ -7286,10 +7289,24 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     }
     // wait until the tray really owns the focus, then activate the chevron
     for (int i = 0; i < 30 && GetForegroundWindow() != tray; i++) Sleep(10);
-    keybd_event(VK_SPACE, 0, 0, 0);
-    Sleep(50);
-    keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
-    const bool seen = SettleFlyout(ctx, 500);
+    // Space is free to repeat: if the tray took the focus late, an earlier press went nowhere.
+    // Win+B itself is unreliable on this build (measured 2026-11-17: the same chord gave the
+    // tray the focus 1 time out of 5, unaffected by scan codes, by the mod's permission or by
+    // the cloak), so keep poking instead of giving up after one press.
+    bool seen = false;
+    for (int attempt = 0; attempt < 3 && !seen; attempt++) {
+        keybd_event(VK_SPACE, 0, 0, 0);
+        Sleep(50);
+        keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
+        for (int i = 0; i < 10 && !seen; i++) {
+            Sleep(20);
+            HWND f = FindOverflowFlyout();
+            seen = f && IsWindowVisible(f);
+        }
+        if (!seen) DLog(L"tray: native flyout - Space attempt %d did not open it", attempt + 1);
+    }
+    TaskbarDenyExpansion(0);           // the chord is done; a Win press may show the bar again
+    if (seen) SettleFlyout(ctx, 400);
     DLog(L"tray: native flyout - keyboard path done, flyout %s", seen ? L"open" : L"MISSING");
     return true;
 }

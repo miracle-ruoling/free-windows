@@ -2855,7 +2855,8 @@ static void TaskbarDenyClear(const wchar_t* why = nullptr) {
     if (!g_taskbarCtl) return;
     if (!g_taskbarCtl->denyUntilMs) return;
     g_taskbarCtl->denyUntilMs = 0;
-    DLog(L"taskbar ctl: deny cleared%s%s", why ? L" (" : L"", why ? why : L"");
+    if (why) DLog(L"taskbar ctl: deny cleared (%s)", why);
+    else DLog(L"taskbar ctl: deny cleared");
 }
 
 static DWORD g_cloakLastWrite = 0;
@@ -7371,8 +7372,12 @@ static DWORD WINAPI TrayJobProc(LPVOID) {
         }
     }
     if (!ok || (!wasOpen && !OverflowFlyoutOnScreen())) {
-        DLog(L"tray: native flyout unavailable - asking for the built-in grid");
-        PostMessageW(g_hwnd, WM_APP_TRAY_FELL_BACK, 0, 0);
+        // No built-in-grid fallback on purpose (user 2026-11-17): the shell's flyout is the real
+        // thing and it only ever needs a moment longer than we are willing to wait. Showing our
+        // own grid instead costs another second and then fights the shell for the next click,
+        // so waiting (or pressing Win and clicking the tray by hand) is simply better.
+        // `[tray] native=0` is still the explicit way to get the grid.
+        DLog(L"tray: native flyout did not show up - no grid fallback, leaving it to the user");
     }
     InterlockedExchange(&g_trayJobBusy, 0);
     return 0;

@@ -1009,6 +1009,33 @@ $t = [System.IO.File]::ReadAllText($p)          # 不带编码时默认 UTF8 且
 - Win+X 菜单摆到位后**几秒会被 shell 挪回原生位置**（anchor mod 的 armed 窗口过期）。
 - 托盘 `^` 偶发不弹出（`Win+B` 把键盘焦点交给托盘这一步在 shell 侧不稳定）；现在**不再兜底**，等下一次点击或手动按 Win。
 
+**卡顿怎么查出来的（2026-11-17 16:5x，第二轮）**
+
+第一轮我只是把 WLAN 查询搬到工作线程，用户反馈"还在、且没变短"。于是**不再猜，先量**：在
+`TrayStateRefresh` / `CompanionVisibilityTick` / `CompanionTick` 的 state+visibility /
+companion 的 hover 重绘 / `CompanionPresent` 五处加了"只在慢的时候才打一行"的计时日志（`slow: ...`），
+再用探针把光标"停在条上 → 离开 4 秒让它淡出 → 分 10 步滑进小窗"复现。结果一目了然：
+
+`
+slow: companion fade present 6.0 ms      ← 每一帧淡入都在 DwmFlush（144Hz 一帧 7ms）
+slow: companion fade present 4.5 ms
+slow: companion fade present 5.8 ms      ... 一次淡入 8–10 行
+slow: tray state refresh 11.8 ms (volume 11.8)   ← 音量 COM getter 偶尔 12ms，也在这条路径上
+`
+
+**真凶是 CompanionPresent() 里的 DwmFlush()**：原来条件是
+`presentSync==2 && (dragging || resizing || alpha != alphaTarget)`，而「透明度在变」并不改变几何，
+根本不需要等合成 —— 但它每帧都等，于是 120ms 的淡入把 UI 线程（连同 `WH_MOUSE_LL`）**连续卡 8–10 次**。
+现在只对 `dragging || resizing` 做 flush。同时把**音量/电量也搬到同一个工作线程**（自带 MTA 公寓和自己的
+`IAudioEndpointVolume`，因为接口指针不能跨公寓用），UI 线程只剩"加锁拷一份快照"。
+
+**还剩的那点**：每次小窗出现仍有一次 `companion visibility tick` 3.8–7.1 ms（ShowWindow + 两次
+z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了，因为 wifi 信号每采样都会抖 1-2%，
+那会让隐藏状态下每 3 秒白重画一次，5–15ms）。一帧的量级，属于可接受范围。
+
+**给以后的人**：slow: ... 这些日志阈值是 3/4ms，平时不出现；**一旦出现就是"指针会卡"的直接证据**，
+照它点名的那一行去查，不要再凭猜。探针：`dev/t_tray_watch.ps1`（开/关浮窗并采样）+
+把光标"停条上 → 离开 4s → 分步滑进小窗"的脚本（见本节上面的命令）。
 **顺带修掉的卡顿（2026-11-17 16:4x，用户报"鼠标从外面滑进三图标小窗时边界卡顿"）**
 - 根因：`CompanionVisibilityTick()` 在"隐藏→可见"那一刻会 `c.stateAt = 0; c.netAt = 0` 强制刷新，而
   `QueryNetwork()` 是 `WlanOpenHandle/EnumInterfaces/QueryInterface`（RPC 进 WLAN 服务，几十毫秒）**跑在 UI 线程**上

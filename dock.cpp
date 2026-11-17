@@ -65,6 +65,21 @@ static HICON HiResIconForPath(const std::wstring& path);
 static void SetPixelPremul(int x, int y, DWORD argb);
 static void DLog(const wchar_t* fmt, ...);
 static HBITMAP g_bakeBmp;
+
+// Profiling helper for "why did the pointer hitch?" (see HANDOVER_NEXT.md §3.19). It is only
+// used by the "slow: ..." log lines, which fire only when something is unexpectedly slow, so
+// the cost of the calls themselves is irrelevant.
+static double NowMs() {
+    static LONGLONG freq = 0;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)freq;
+}
 static bool g_bakeDirty = true;
 static bool g_bakeValid = false;      // g_bakeBits holds a real capture
 static void* g_bakeBits;
@@ -3210,6 +3225,13 @@ struct NetSnapshot {
     int kind = 0;                     // 0 = none, 1 = WLAN, 2 = ethernet
     int quality = 0;
     wchar_t name[96] = L"";
+    // The audio endpoint getter is an RPC into the audio service too (measured 11.8 ms once, on
+    // the very frame the companion appeared), so volume and battery are sampled here as well and
+    // the UI thread only copies them.
+    int volPercent = -1;
+    bool muted = false;
+    int batPercent = -1;
+    bool charging = false;
 };
 static NetSnapshot g_netSnapshot;
 static unsigned g_netVersion = 0;         // bumped by the worker whenever it publishes
@@ -3272,7 +3294,53 @@ static void QueryNetworkInto(NetSnapshot* out) {
     }
 }
 
+// The audio endpoint and the battery are queried on the worker as well. The worker has its own
+// COM apartment and its own endpoint objects on purpose: an interface pointer is only valid
+// inside the apartment that created it, and the dock's UI thread never calls CoInitialize, so
+// sharing g_vol with this thread would be a marshal error waiting to happen.
+static IMMDeviceEnumerator* g_volEnumW = nullptr;
+static IAudioEndpointVolume* g_volW = nullptr;
+
+static bool WorkerVolumeReady() {
+    if (!g_volEnumW) {
+        CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                         __uuidof(IMMDeviceEnumerator), (void**)&g_volEnumW);
+    }
+    if (g_volEnumW && !g_volW) {
+        IMMDevice* device = nullptr;
+        if (SUCCEEDED(g_volEnumW->GetDefaultAudioEndpoint(eRender, eConsole, &device)) && device) {
+            device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&g_volW);
+            device->Release();
+        }
+    }
+    return g_volW != nullptr;
+}
+
+static void QueryVolumeInto(int* percent, bool* muted) {
+    if (!WorkerVolumeReady()) return;
+    float scalar = 0;
+    BOOL mute = FALSE;
+    if (SUCCEEDED(g_volW->GetMasterVolumeLevelScalar(&scalar))) {
+        int pct = (int)(scalar * 100.0f + 0.5f);
+        *percent = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    }
+    if (SUCCEEDED(g_volW->GetMute(&mute))) *muted = mute != FALSE;
+}
+
+static void QueryPowerInto(int* percent, bool* charging) {
+    SYSTEM_POWER_STATUS st{};
+    if (!GetSystemPowerStatus(&st)) return;
+    if (st.BatteryLifePercent == 255) {
+        *percent = -1;
+        *charging = false;
+        return;
+    }
+    *percent = st.BatteryLifePercent;
+    *charging = (st.ACLineStatus == 1);
+}
+
 static DWORD WINAPI NetQueryProc(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     NetSnapshot prev;
     for (;;) {
         HANDLE waits[2] = {g_netQuit, g_netWake};
@@ -3281,6 +3349,8 @@ static DWORD WINAPI NetQueryProc(LPVOID) {
         NetSnapshot s;
         const DWORD t0 = GetTickCount();
         QueryNetworkInto(&s);
+        QueryVolumeInto(&s.volPercent, &s.muted);
+        QueryPowerInto(&s.batPercent, &s.charging);
         const DWORD spent = GetTickCount() - t0;
         EnterCriticalSection(&g_netLock);
         g_netSnapshot = s;
@@ -3332,6 +3402,10 @@ static void QueryNetworkFromSnapshot() {
     g_trayState.netKind = s.kind;
     g_trayState.netQuality = s.quality;
     wcscpy_s(g_trayState.netName, s.name);
+    if (s.volPercent >= 0) g_trayState.volPercent = s.volPercent;
+    g_trayState.muted = s.muted;
+    g_trayState.batPercent = s.batPercent;
+    g_trayState.charging = s.charging;
 }
 
 // True when the worker has published a newer network answer than the one being painted.
@@ -3350,20 +3424,10 @@ static void TrayStateRefresh(DWORD now) {
     // that query runs on its own thread (NetQueryProc); here we only copy its last answer and
     // ask for a new one every few seconds, so nothing on this path can block.
     if (g_trayBar.alpha <= 0 && g_trayBar.stateAt) {
-        // Hidden: the expensive part is skipped, but a fresh answer from the network worker is
-        // still adopted (and baked into the DIB) so the icon is right the instant the window
-        // appears - otherwise it showed "not connected" for a frame or two on the first hover.
-        if (NetVersionFresh()) {
-            const TrayState was = g_trayState;
-            QueryNetworkFromSnapshot();
-            if (memcmp(&was, &g_trayState, sizeof(TrayState)) != 0) {
-                DLog(L"tray bar (hidden): net=%d(q=%d '%s') vol=%d mute=%d bat=%d chg=%d",
-                     g_trayState.netKind, g_trayState.netQuality, g_trayState.netName,
-                     g_trayState.volPercent, (int)g_trayState.muted, g_trayState.batPercent,
-                     (int)g_trayState.charging);
-            }
-            if (g_trayBar.hwnd) TrayRepaint(g_trayBar);
-        }
+        // Hidden: only take the worker's answer (no repaint). The wifi signal wobbles by a few
+        // percent every sample, and repainting the DIB here cost 5-15 ms every three seconds
+        // while nobody was looking - the pixels are rebuilt on the show transition instead.
+        QueryNetworkFromSnapshot();
         return;
     }
 
@@ -3374,9 +3438,17 @@ static void TrayStateRefresh(DWORD now) {
     g_trayBar.stateAt = now;
 
     TrayState before = g_trayState;
-    QueryVolume();
-    QueryPower();
+    const double t0 = NowMs();
+    // Everything here is a lock-and-copy of the worker's last answer; the only UI-thread query
+    // left is the one-time "we have no volume value yet" case (the worker needs a moment after
+    // start-up), and that is exactly what used to cost 11.8 ms on the show transition.
+    if (g_trayState.volPercent < 0 || g_trayState.batPercent == -100) {
+        QueryVolume();
+        QueryPower();
+    }
     QueryNetworkFromSnapshot();
+    const double t1 = NowMs();
+    if (t1 - t0 >= 3.0) DLog(L"slow: tray state refresh %.1f ms", t1 - t0);
     if (networkDue) {
         g_trayBar.netAt = now;
         NetQueryNudge();          // the answer arrives on the worker thread; no blocking here
@@ -3632,7 +3704,13 @@ static void CompanionPresent(Companion& c) {
     // Same reason as Present(): when the window geometry changes in the same step as the
     // pixels, wait for a composition first, otherwise the new content shows at the old
     // place for a few milliseconds (the "glass slides" bug).
-    if (g_cfg.presentSync == 2 && (c.dragging || c.resizing || c.alpha != c.alphaTarget)) {
+    //
+    // ⛔ Only for *geometry* changes. `c.alpha != c.alphaTarget` used to be in this condition
+    // too, and that is what made the pointer hitch while the companion faded in: DwmFlush waits
+    // for the next vertical blank (measured 4.5-7.7 ms on this 144 Hz screen), so a 120 ms fade
+    // stalled the UI thread - and with it WH_MOUSE_LL - eight to ten times in a row. A pure
+    // alpha change cannot move pixels, so it needs no sync at all (HANDOVER_NEXT.md §3.19).
+    if (g_cfg.presentSync == 2 && (c.dragging || c.resizing)) {
         DwmFlush();
     }
     UpdateLayeredWindow(c.hwnd, nullptr, &dst, &size, c.dc, &src, 0, &bf, ULW_ALPHA);
@@ -4710,6 +4788,7 @@ static int CompanionAlphaTarget(Companion& c, POINT p) {
 // Visibility, per group (G2). Group 1 keeps the original rule; a group without the strip latches
 // on when the pointer is on one of its members (or inside its frame) and releases when it leaves.
 static void CompanionVisibilityTick(DWORD now) {
+    const double tEnter = NowMs();
     POINT p{};
     GetCursorPos(&p);
 
@@ -4774,15 +4853,29 @@ static void CompanionVisibilityTick(DWORD now) {
         // worker thread is nudged instead; its answer lands a few ms later and is invisible.
         c.stateAt = 0;
         NetQueryNudge();
-        // While hidden we only moved the stored rect, so put the window where it belongs now,
+        // While hidden we only moved the stored rect, so put the window where it belongs now -
+        // but only when it really is somewhere else: two SetWindowPos calls here cost ~4 ms in
+        // the frame the window appears, which is one more thing the pointer can feel.
+        RECT now{};
+        bool moved = !GetWindowRect(c.hwnd, &now) || now.left != c.rc.left || now.top != c.rc.top ||
+                     now.right - now.left != c.rc.right - c.rc.left ||
+                     now.bottom - now.top != c.rc.bottom - c.rc.top;
+        if (moved) {
+            SetWindowPos(c.hwnd, HWND_TOPMOST, c.rc.left, c.rc.top, c.rc.right - c.rc.left,
+                         c.rc.bottom - c.rc.top, SWP_NOACTIVATE);
+        }
         // and publish the anchor once (the flyout may be opened before the next move).
-        SetWindowPos(c.hwnd, HWND_TOPMOST, c.rc.left, c.rc.top, c.rc.right - c.rc.left,
-                     c.rc.bottom - c.rc.top, SWP_NOACTIVATE);
         AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
+        // z-order: group frame < companion < strip. The frame asserts itself just above, so
+        // both of these are needed on every show (dropping them lets the frame paint over the
+        // companion).
         SetWindowPos(c.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_hwnd)
             SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // The visible pixels are (re)built here and not while hidden: see the note in
+        // TrayStateRefresh. ~1 ms, once per appearance.
+        TrayRepaint(c);
     }
     // Visible from the moment it should show until the fade has actually reached 0, so the
     // fade-out is a fade instead of an instant disappearance (stepped in CompanionTick).
@@ -4792,6 +4885,8 @@ static void CompanionVisibilityTick(DWORD now) {
         if (!shouldBeVisible) CompanionTooltipShow(c, -1);
     }
     c.alphaTarget = target;
+    const double dVis = NowMs() - tEnter;
+    if (dVis >= 3.0) DLog(L"slow: companion visibility tick %.1f ms", dVis);
 }
 
 // ---------------------------------------------------------------- per-frame tick
@@ -4868,8 +4963,13 @@ static void CompanionTick(DWORD now) {
     }
 
     // 2. state + fade
-    TrayStateRefresh(now);
-    CompanionVisibilityTick(now);
+    {
+        const double tState = NowMs();
+        TrayStateRefresh(now);
+        CompanionVisibilityTick(now);
+        const double dState = NowMs() - tState;
+        if (dState >= 3.0) DLog(L"slow: state+visibility %.1f ms", dState);
+    }
 
     if (g_trayBar.alpha != g_trayBar.alphaTarget) {
         int diff = g_trayBar.alphaTarget - g_trayBar.alpha;
@@ -4877,7 +4977,10 @@ static void CompanionTick(DWORD now) {
         if (step < 1) step = 1;
         if (diff > 0) g_trayBar.alpha += step < diff ? step : diff;
         else g_trayBar.alpha += (-step) > diff ? -step : diff;
+        const double tPresent = NowMs();
         CompanionPresent(g_trayBar);
+        const double dPresent = NowMs() - tPresent;
+        if (dPresent >= 4.0) DLog(L"slow: companion fade present %.1f ms", dPresent);
         // the window is hidden only once the fade has finished, see CompanionVisibilityTick
         if (g_trayBar.alpha == 0 && g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
             ShowWindow(g_trayBar.hwnd, SW_HIDE);
@@ -4984,10 +5087,17 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < kTrayCellCount; i++)
                 if (PtInRect(&cells[i], pt)) { hover = i; break; }
             if (hover != c.hoverCell) {
+                const double tHover = NowMs();
                 c.hoverCell = hover;
                 TrayRepaint(c);
+                const double tPaint = NowMs();
                 CompanionPresent(c);
                 CompanionTooltipShow(c, hover);
+                const double dHover = NowMs() - tHover;
+                if (dHover >= 3.0) {
+                    DLog(L"slow: companion hover cell=%d paint %.1f ms, present+tooltip %.1f ms",
+                         hover, tPaint - tHover, dHover - (tPaint - tHover));
+                }
             }
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
             TrackMouseEvent(&tme);

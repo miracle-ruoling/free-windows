@@ -2834,8 +2834,11 @@ static void TaskbarAllowExpansion(DWORD ms) {
     DLog(L"taskbar ctl: expansion allowed for %lu ms", (unsigned long)ms);
 }
 
-// "The taskbar must stay down" - used around our own Win+X chord, because the shell
-// expands the bar to anchor that menu and then refuses to retract it.
+// "The taskbar must stay down" - used around our own Win+X chord (the shell expands the bar to
+// anchor that menu and then refuses to retract it) **and for as long as the shell's tray flyout
+// is on screen** (the shell asks to expand the bar for it; that rise is what later surfaced as
+// "the taskbar pops out by itself" once the cloak was released).
+// Cleared explicitly with TaskbarDenyClear(); the value is a deadline so a missed clear expires.
 static void TaskbarDenyExpansion(DWORD ms) {
     TaskbarCtlEnsure();
     if (!g_taskbarCtl) return;
@@ -2843,6 +2846,16 @@ static void TaskbarDenyExpansion(DWORD ms) {
     g_taskbarCtl->denyUntilMs = ms ? now + ms : 0;
     g_taskbarCtl->allowUntilMs = 0;
     DLog(L"taskbar ctl: expansion denied for %lu ms", (unsigned long)ms);
+}
+
+// Cheap "drop the request" for paths that run every frame: no write and no log when there is
+// nothing to clear.
+static void TaskbarDenyClear(const wchar_t* why = nullptr) {
+    TaskbarCtlEnsure();
+    if (!g_taskbarCtl) return;
+    if (!g_taskbarCtl->denyUntilMs) return;
+    g_taskbarCtl->denyUntilMs = 0;
+    DLog(L"taskbar ctl: deny cleared%s%s", why ? L" (" : L"", why ? why : L"");
 }
 
 static DWORD g_cloakLastWrite = 0;
@@ -7215,10 +7228,11 @@ static bool SettleFlyout(const PanelCtx& ctx, int ms) {
 static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
-    // Closing: while the flyout is in front of the user it *owns* the keyboard focus, so a
-    // plain Space toggles it shut. Going through Win+B first is what broke closing - it moved
-    // the focus away and the Space went nowhere, so the dock fell back to the grid (measured
-    // 2026-11-17 01:0x: with the flyout open, a plain Space closed it and nothing else did).
+    // Closing: while the flyout is in front of the user it owns the keyboard focus, so a plain
+    // Space toggles it shut (measured twice). If Space does nothing (the XAML focus may have
+    // wandered), park it: that is the same "closed" the outside-click handler uses, and it is
+    // immediate - falling through into the Win+B path made a close take 3+ seconds and could
+    // toggle the shell's flyout back open ("it pops up again by itself").
     {
         HWND fg = GetForegroundWindow();
         if (OverflowFlyoutOnScreen() && IsOverflowFlyoutWindow(fg)) {
@@ -7226,7 +7240,7 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
             keybd_event(VK_SPACE, 0, 0, 0);
             Sleep(50);
             keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
-            for (int i = 0; i < 25; i++) {
+            for (int i = 0; i < 15; i++) {
                 Sleep(20);
                 HWND f = FindOverflowFlyout();
                 if (!f || !IsWindowVisible(f)) {
@@ -7234,7 +7248,9 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
                     return true;
                 }
             }
-            DLog(L"tray: native flyout - Space did not close it, trying Win+B");
+            DLog(L"tray: native flyout - Space did not close it, parking it instead");
+            NativeTrayPark();
+            return true;
         }
     }
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
@@ -7244,12 +7260,8 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
 
     // No cloak, and **no rise either**: this whole path only needs the tray to take the
     // keyboard focus, and Space opens the flyout with the bar still sitting off screen
-    // (measured 2026-11-17 01:0x). Letting the shell expand the bar here is what produced the
-    // user's "tray opens / taskbar hides, tray closes / taskbar appears and then sits there":
-    // the bar was expanded for the flyout, the cloak hid it while the flyout was up, and when
-    // the flyout closed the cloak had to be released - at which point an already expanded bar
-    // became visible, and the shell will not retract it (its hide timer is ignored in that
-    // state; only a Start open+close cycle puts it back down).
+    // (measured 2026-11-17). Letting the shell expand the bar here is what produced the
+    // user's "tray opens / taskbar hides, tray closes / taskbar appears and then sits there".
     TaskbarDenyExpansion(2000);
 
     keybd_event(VK_LWIN, 0, 0, 0);
@@ -7260,50 +7272,32 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
     Sleep(40);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
 
-    // What Win+B has to achieve is the *keyboard focus* on the tray, not an expanded bar.
-    // Waiting for the bar rect was wrong: with the mod keeping the taskbar down the bar often
-    // never moves, yet the focus does arrive and Space opens the flyout just fine (measured
-    // 2026-11-17 01:0x: fg=Shell_TrayWnd with the bar still at y=1078, Space -> flyout
-    // visible). That wait is what made this path fail half the time and fall back to the grid.
-    bool up = alreadyUp;
-    for (int i = 0; i < 25 && !up; i++) {
-        Sleep(20);
-        RECT tr{};
-        if (!GetWindowRect(tray, &tr)) continue;
-        if ((tr.top + tr.bottom) / 2 < screenH) up = true;
-    }
+    // What Win+B has to achieve is the *keyboard focus* on the tray, not an expanded bar:
+    // waiting for the bar rect used to cost a full 500 ms on every "^" (the bar never rises
+    // here) and the focus arrives well before that.
     bool focus = false;
-    for (int i = 0; i < 40 && !focus; i++) {
+    for (int i = 0; i < 30 && !focus; i++) {
         if (GetForegroundWindow() == tray) { focus = true; break; }
         Sleep(10);
     }
-    DLog(L"tray: native flyout - bar %s, focus=%s",
-         up ? L"up" : L"still down", focus ? L"tray" : L"elsewhere");
-    if (!focus && !up) {
-        // Keep going anyway: Win+B is unreliable on this build (measured 2026-11-17: the
-        // same chord sometimes gives the tray the focus and sometimes does nothing at all,
-        // with or without the mod, with or without a cloak), and a Space that goes nowhere
-        // costs nothing. The caller falls back to the mouse path / the grid when no flyout
-        // window shows up, so this is only a "maybe" step.
-        DLog(L"tray: native flyout - Win+B gave neither the focus nor the bar, pressing Space anyway");
+    bool up = alreadyUp;
+    if (!up) {
+        RECT tr{};
+        if (GetWindowRect(tray, &tr) && (tr.top + tr.bottom) / 2 < screenH) up = true;
     }
-    // wait until the tray really owns the focus, then activate the chevron
-    for (int i = 0; i < 30 && GetForegroundWindow() != tray; i++) Sleep(10);
-    // Space is free to repeat: if the tray took the focus late, an earlier press went nowhere.
-    // Win+B itself is unreliable on this build (measured 2026-11-17: the same chord gave the
-    // tray the focus 1 time out of 5, unaffected by scan codes, by the mod's permission or by
-    // the cloak), so keep poking instead of giving up after one press.
+    DLog(L"tray: native flyout - bar %s, focus=%s", up ? L"up" : L"still down",
+         focus ? L"tray" : L"elsewhere");
+    // Space is harmless when it goes nowhere, so press it regardless: Win+B itself is
+    // unreliable on this build (measured 2026-11-17: 0-1 out of 5, unaffected by scan codes,
+    // by the mod's permission or by the cloak) and a late focus still gets activated.
+    keybd_event(VK_SPACE, 0, 0, 0);
+    Sleep(50);
+    keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
     bool seen = false;
-    for (int attempt = 0; attempt < 3 && !seen; attempt++) {
-        keybd_event(VK_SPACE, 0, 0, 0);
-        Sleep(50);
-        keybd_event(VK_SPACE, 0, KEYEVENTF_KEYUP, 0);
-        for (int i = 0; i < 10 && !seen; i++) {
-            Sleep(20);
-            HWND f = FindOverflowFlyout();
-            seen = f && IsWindowVisible(f);
-        }
-        if (!seen) DLog(L"tray: native flyout - Space attempt %d did not open it", attempt + 1);
+    for (int i = 0; i < 15 && !seen; i++) {
+        Sleep(20);
+        HWND f = FindOverflowFlyout();
+        seen = f && IsWindowVisible(f);
     }
     TaskbarDenyExpansion(0);           // the chord is done; a Win press may show the bar again
     if (seen) SettleFlyout(ctx, 400);
@@ -9915,13 +9909,23 @@ static void RenderTick() {
             // and refuses to hide it, so ask the mod (inside explorer) to cloak the taskbar
             // for us. Released once the flyout is gone (parked counts as gone), with a grace
             // period so the cloak survives the steps before the flyout appears.
+            //
+            // While the flyout is up the bar must also not be *expanded*: the shell keeps
+            // asking for that, and an expanded bar is what surfaced later as "the taskbar pops
+            // out by itself". So the deny is refreshed for the whole lifetime of the flyout and
+            // dropped shortly after it goes.
             {
                 const DWORD now2 = GetTickCount();
                 static bool wasOnScreen = false;
+                static DWORD lastDeny = 0;
                 if (OverflowFlyoutOnScreen()) {
                     g_cloakGraceUntil = 0;
                     wasOnScreen = true;
                     TaskbarCloakSet(true);
+                    if (!lastDeny || now2 - lastDeny >= 400) {
+                        lastDeny = now2;
+                        TaskbarDenyExpansion(1500);
+                    }
                 } else if (!g_cloakGraceUntil || (LONG)(now2 - g_cloakGraceUntil) >= 0) {
                     if (wasOnScreen) {
                         wasOnScreen = false;
@@ -9938,9 +9942,12 @@ static void RenderTick() {
                         g_cloakGraceUntil = now2 + 500;
                         TaskbarCloakSet(true);
                         g_fgBeforeTray = nullptr;
+                        lastDeny = 0;
                         DLog(L"tray: native flyout gone - focus handed back, taskbar hidden again");
                     } else {
                         TaskbarCloakSet(false);
+                        TaskbarDenyClear(L"tray flyout gone");
+                        lastDeny = 0;
                     }
                 }
             }

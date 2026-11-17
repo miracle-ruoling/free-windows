@@ -1,5 +1,16 @@
 # 交接：下一轮从这里开始
 
+> ## ⛔ 先读这一条（2026-11-17 16:30）
+> **任务栏那一套现在是"用户确认 OK"的稳定状态，动之前必须读 §3.19。**
+> 涉及：`TaskbarDenyExpansion/TaskbarDenyClear`、render tick 里的 deny 生命周期、
+> `OpenPowerUserMenu()` 的 deny+`Sleep(40)`、`NativeTrayPageKeyboard()`、
+> `TrayJobProc()` 里"不再弹自绘宫格"，以及 mod 里的 `g_allowOpen` latch 与
+> `MouseAllowedToShow()` 的判定顺序。
+> 这些地方**没有一处是多余的**：每一条都对应一个实测出来的故障（§3.17/§3.18/§3.19 有对照表）。
+> 想改就先跑一遍 §3.19 末尾那 5 条判据。
+> 存档：git tag **`known-good-2026-11-17-1630`**；`dock/dock.cpp.bak31_known_good_1630`；
+> mod 源码快照 `windhawk/local@taskbar-hidden-until-win.wh.cpp.1.0.4_known_good`。
+
 > **阅读顺序（新会话照这个来，别从旧文档倒着翻）**
 > 1. 本文 **§0 三分钟版本**（项目是什么、什么能用、下一步做什么）
 > 2. 本文 **§3.16**（托盘=原生浮窗，本轮最新、最容易踩坑：cloak 协议、为什么不能 SW_HIDE、
@@ -971,6 +982,40 @@ $t = [System.IO.File]::ReadAllText($p)          # 不带编码时默认 UTF8 且
 
 ---
 
+### 3.19 ⛔ 稳定状态（2026-11-17 16:30，用户确认"完全符合预期"）—— 别碰
+
+这一版是靠**三条互相配合的机制**撑起来的，任何一条单独看都像"多余/可以简化"，删掉就回退到某个已知故障。
+下表左边是代码位置，右边是**删掉它会立刻出现的现象**（都实测过）。
+
+| 位置 | 机制 | 删掉/改动的后果 |
+|---|---|---|
+| dock `OpenPowerUserMenu()` | 发 Win+X 之前 `TaskbarDenyExpansion(1200)` + **`Sleep(40)`** | shell 为了锚定 Win+X 菜单会把任务栏抬起来（+213ms），然后弹窗开着时拒绝收回 ⇒ **快速左右点 Win 格时任务栏露头并且不收**（原始 bug）。`Sleep(40)` 是给 mod 的 20ms 缓存留余量，删了 deny 会"迟到" |
+| dock render tick（`g_denyClearAt` 那段） | 浮窗在屏上时每 400ms `TaskbarDenyExpansion(1500)`；**只在浮窗消失 700ms 后才 `TaskbarDenyClear`** | 原来每帧都在"没有浮窗在屏 ⇒ 清 deny"，把打开路径刚写的 deny 18ms 就擦掉 ⇒ **托盘升起时任务栏跟着升、关掉后任务栏出现且不收**（§3.18） |
+| dock `NativeTrayPageKeyboard()` | ①开场就 `TaskbarDenyExpansion(2000)`（成功后**不清**，交给 render tick 续期）②不等"任务栏升起来"（那圈 500ms 轮询纯白等）③关闭走 `Space`，300ms 没关掉就 **`NativeTrayPark()`**，**绝不落进打开分支** | ①托盘把栏顶起来 ②点 `^` 卡半秒 ③`Space` 失败后落进 Win+B 分支，把浮窗又 toggle 开 ⇒ **"收起了又自己弹出来"**（稳定复现过） |
+| dock `TrayJobProc()` | 原生浮窗没出现时**不再弹自绘宫格** | 宫格要再等 1s 才出来，而且和 shell 抢下一次点击；用户 2026-11-17 明确要求去掉，**自己按 Win 手动兜底** |
+| mod `g_allowOpen` | 就是**普通 bool latch**（按下置真、看到栏在屏才撤），**不要再改成"带截止时间"** | 我 11-17 凌晨改过 deadline（按下 1200ms / 松手后 900ms），shell 请求展开常常更晚 ⇒ **按 Win 只出开始菜单不出任务栏**（用户最不能接受的一条）。Win+X 那种"按了 Win 但不该抬栏"由 dock 的 deny 负责，**不是**靠许可过期 |
+| mod `MouseAllowedToShow()` | 判定顺序 **deny → allow → WinKeyDown → latch**，且只读 `g_dockCtl` 缓存（**不要在 hook 里 `ReadDockCtl()`**） | 顺序变了：物理 Win 键会盖过 deny，Win+X 又把栏顶起来；在 hook 里开文件映射会让 shell 的动画路径变慢（hook 可能每帧都被调用） |
+| mod `CloakTick()` + `g_hideAskUntil` | dock 不再要求 cloak 时**立刻解 cloak 并求隐藏**（再 1.5s 内每 100ms 重求，条件是 `!WinKeyDown() && !AllowValid()`），`Wh_ModAfterInit` 里也会先收栏 | 旧版是"等它下屏才解 cloak"，而 **cloaked 的任务栏 shell 永远收不回去**（收起动画不跑、`SetWindowPos` 被 revert、`WM_TIMER 2` 无效）⇒ 死锁：按 Win 什么都不发生 |
+
+**验收判据（改完必须全过，5 条）**
+1. 快速左右交替点 Win 格 10 轮（20 次）→ 任务栏 rect **全程 `y=1078`**（`dev/t_winbtn_taskbar.ps1 -Mode cycle -Gap 180 -Cycles 10`）。
+2. 单次右键 Win 格 → 同样不抬栏（`dev/t_winbtn_repro.ps1` C 段 `minY=1078 riseAt=-1`）。
+3. 按 Win → 开始菜单 + 任务栏一起出；再按 → 一起收。
+4. 点 `^` 开托盘 → **任务栏不跟着升**；再点 `^` 收 → **不出现任何东西**（`dev/t_tray_watch.ps1`，任务栏 y 全程 1078）。
+5. 托盘开着时点 Win 格 → 只出开始菜单，**任务栏不出现**。
+   （第 3/5 条的注入会被 UIPI 过滤，**只能用 dock 自己的注入或让用户手工验**，见 §3.18 末尾。）
+
+**已知未做（不要顺手"修"掉稳定逻辑去凑）**
+- Win+X 菜单摆到位后**几秒会被 shell 挪回原生位置**（anchor mod 的 armed 窗口过期）。
+- 托盘 `^` 偶发不弹出（`Win+B` 把键盘焦点交给托盘这一步在 shell 侧不稳定）；现在**不再兜底**，等下一次点击或手动按 Win。
+
+**顺带修掉的卡顿（2026-11-17 16:4x，用户报"鼠标从外面滑进三图标小窗时边界卡顿"）**
+- 根因：`CompanionVisibilityTick()` 在"隐藏→可见"那一刻会 `c.stateAt = 0; c.netAt = 0` 强制刷新，而
+  `QueryNetwork()` 是 `WlanOpenHandle/EnumInterfaces/QueryInterface`（RPC 进 WLAN 服务，几十毫秒）**跑在 UI 线程**上
+  ⇒ 饿死 `WH_MOUSE_LL` ⇒ 指针在边界处卡住。滑出再滑入不卡，是因为那时不再强制刷新。
+- 修法：**网络状态搬到工作线程**（`NetQueryProc`，3s 周期 + `NetQueryNudge()` 立即唤醒，UI 线程只读
+  `g_netSnapshot` 快照，加锁只保护一次结构体拷贝）；"隐藏→可见"只保留廉价的音量/电量刷新 + 唤醒工作线程。
+- 音量/电量仍在 UI 线程（一个 COM getter + 一个 struct），COM 对象在启动时就已创建，不会在进场时付激活成本。
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**

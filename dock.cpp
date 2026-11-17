@@ -2572,6 +2572,10 @@ static void TaskbarAllowExpansion(DWORD ms);
 
 static void OpenPowerUserMenu() {
     const BYTE chord[] = {VK_LWIN, 'X'};
+    // ⛔ STABLE: the deny + the 40 ms margin are what stop the native taskbar from popping out
+    // while the Windows cell is clicked left/right in a row (HANDOVER_NEXT.md §3.19). The
+    // margin is for the mod's 20 ms cache - without it the request arrives after the shell has
+    // already started expanding the bar.
     // Arm the anchor first: the menu window is created shortly after the keystroke and the
     // mod uses this timestamp to tell it apart from every other XAML popup.
     ArmWinXAnchor();
@@ -2834,6 +2838,15 @@ static void TaskbarAllowExpansion(DWORD ms) {
     DLog(L"taskbar ctl: expansion allowed for %lu ms", (unsigned long)ms);
 }
 
+// ---- "the taskbar must stay down" request ------------------------------------------------
+// ⛔ STABLE (2026-11-17, user-verified). Read HANDOVER_NEXT.md §3.19 before touching any of
+// TaskbarDenyExpansion / TaskbarDenyClear or the places that call them: every one of them
+// exists because a measured bug came back without it. Rules:
+//   * only the dock's own Win+X chord (OpenPowerUserMenu) and the tray path may *set* it;
+//   * it is refreshed for as long as the shell's tray flyout is on screen;
+//   * it is cleared only via the g_denyClearAt path in RenderTick (700 ms after the flyout
+//     goes) or by an explicit "the request failed" line - never on a plain "no flyout is on
+//     screen" checked every frame, which used to wipe it 18 ms after it was written.
 // "The taskbar must stay down" - used around our own Win+X chord (the shell expands the bar to
 // anchor that menu and then refuses to retract it) **and for as long as the shell's tray flyout
 // is on screen** (the shell asks to expand the bar for it; that rise is what later surfaced as
@@ -3186,10 +3199,31 @@ static void QueryPower() {
     g_trayState.charging = (st.ACLineStatus == 1);
 }
 
-static void QueryNetwork() {
-    g_trayState.netKind = 0;
-    g_trayState.netQuality = 0;
-    g_trayState.netName[0] = 0;
+// ---- network state, queried off the UI thread (2026-11-17) ---------------------------
+// WlanOpenHandle + WlanEnumInterfaces + WlanQueryInterface is an RPC into the WLAN service and
+// costs tens of milliseconds. Done on the UI thread it starves our WH_MOUSE_LL hook, and a
+// hook that cannot answer in time stalls the *whole system's* pointer - the user felt it as a
+// hitch exactly when the tray companion (wifi/volume/battery) faded in, because that transition
+// forces a refresh. So the query lives on its own thread and the UI thread only copies the last
+// snapshot; nothing on the paint/hover path can block on the WLAN service any more.
+struct NetSnapshot {
+    int kind = 0;                     // 0 = none, 1 = WLAN, 2 = ethernet
+    int quality = 0;
+    wchar_t name[96] = L"";
+};
+static NetSnapshot g_netSnapshot;
+static unsigned g_netVersion = 0;         // bumped by the worker whenever it publishes
+static unsigned g_netSeen = 0;            // last version the UI thread adopted
+static CRITICAL_SECTION g_netLock;
+static bool g_netLockReady = false;
+static HANDLE g_netWake = nullptr;        // auto-reset: "query again now"
+static HANDLE g_netQuit = nullptr;        // manual-reset: thread exit
+static HANDLE g_netThread = nullptr;
+
+static void QueryNetworkInto(NetSnapshot* out) {
+    out->kind = 0;
+    out->quality = 0;
+    out->name[0] = 0;
 
     // Wi-Fi first: the WLAN API tells us both whether it is up and how good the signal is.
     bool wifiUp = false;
@@ -3209,9 +3243,8 @@ static void QueryNetwork() {
                                        wlan_intf_opcode_current_connection, nullptr, &attrSize,
                                        (PVOID*)&attr, &opType) == ERROR_SUCCESS &&
                     attr) {
-                    g_trayState.netQuality =
-                        (int)attr->wlanAssociationAttributes.wlanSignalQuality;
-                    wcsncpy_s(g_trayState.netName,
+                    out->quality = (int)attr->wlanAssociationAttributes.wlanSignalQuality;
+                    wcsncpy_s(out->name,
                               attr->strProfileName[0] ? attr->strProfileName : L"WLAN",
                               _TRUNCATE);
                     WlanFreeMemory(attr);
@@ -3224,8 +3257,8 @@ static void QueryNetwork() {
     }
 
     if (wifiUp) {
-        g_trayState.netKind = 1;
-        if (!g_trayState.netName[0]) wcscpy_s(g_trayState.netName, L"WLAN");
+        out->kind = 1;
+        if (!out->name[0]) wcscpy_s(out->name, L"WLAN");
         return;
     }
 
@@ -3234,28 +3267,119 @@ static void QueryNetwork() {
     // whether the internet is reachable.)
     DWORD flags = 0;
     if (InternetGetConnectedState(&flags, 0)) {
-        g_trayState.netKind = 2;
-        wcscpy_s(g_trayState.netName, L"以太网");
+        out->kind = 2;
+        wcscpy_s(out->name, L"以太网");
     }
+}
+
+static DWORD WINAPI NetQueryProc(LPVOID) {
+    NetSnapshot prev;
+    for (;;) {
+        HANDLE waits[2] = {g_netQuit, g_netWake};
+        DWORD r = WaitForMultipleObjects(2, waits, FALSE, 3000);
+        if (r == WAIT_OBJECT_0) break;                 // quit
+        NetSnapshot s;
+        const DWORD t0 = GetTickCount();
+        QueryNetworkInto(&s);
+        const DWORD spent = GetTickCount() - t0;
+        EnterCriticalSection(&g_netLock);
+        g_netSnapshot = s;
+        g_netVersion++;
+        LeaveCriticalSection(&g_netLock);
+        // Diagnostics: a change is what the icon shows (rare), and a slow query is worth a line
+        // because that is exactly the time the UI thread used to spend blocking the mouse hook.
+        const bool changed = s.kind != prev.kind || s.quality != prev.quality ||
+                             wcscmp(s.name, prev.name) != 0;
+        if (changed || spent >= 100) {
+            DLog(L"tray net worker: kind=%d q=%d '%s' took %lu ms", s.kind, s.quality, s.name,
+                 (unsigned long)spent);
+            prev = s;
+        }
+    }
+    return 0;
+}
+
+static void NetQueryStart() {
+    if (!g_netLockReady) {
+        InitializeCriticalSection(&g_netLock);
+        g_netLockReady = true;
+    }
+    if (!g_netWake) g_netWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_netQuit) g_netQuit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_netThread && g_netWake && g_netQuit) {
+        g_netThread = CreateThread(nullptr, 0, NetQueryProc, nullptr, 0, nullptr);
+    }
+}
+
+// "Do it as soon as the worker can" - never blocks the caller.
+static void NetQueryNudge() {
+    if (g_netWake) SetEvent(g_netWake);
+}
+
+// Copy the worker's last answer into the painted state. Cheap (one small struct under a lock)
+// and only does anything when the worker has published something new, so it is safe to call on
+// every housekeeping tick - which is what keeps the icon honest without a blocking query.
+static void QueryNetworkFromSnapshot() {
+    if (!g_netLockReady) return;
+    NetSnapshot s;
+    unsigned ver = 0;
+    EnterCriticalSection(&g_netLock);
+    s = g_netSnapshot;
+    ver = g_netVersion;
+    LeaveCriticalSection(&g_netLock);
+    if (ver == g_netSeen) return;
+    g_netSeen = ver;
+    g_trayState.netKind = s.kind;
+    g_trayState.netQuality = s.quality;
+    wcscpy_s(g_trayState.netName, s.name);
+}
+
+// True when the worker has published a newer network answer than the one being painted.
+static bool NetVersionFresh() {
+    if (!g_netLockReady) return false;
+    EnterCriticalSection(&g_netLock);
+    const unsigned v = g_netVersion;
+    LeaveCriticalSection(&g_netLock);
+    return v != g_netSeen;
 }
 
 static void TrayStateRefresh(DWORD now) {
     // Two cadences on purpose: volume/power are cheap (a COM getter and a struct), but the
     // WLAN query is an RPC into the wireless service and can take tens of milliseconds - at
-    // 1 Hz that was a visible hitch every second while the bar was on screen. So: cheap
-    // values every second, network every five, and nothing at all while the bar is hidden.
-    if (g_trayBar.alpha <= 0 && g_trayBar.stateAt) return;
+    // 1 Hz that was a visible hitch every second while the bar was on screen. Since 2026-11-17
+    // that query runs on its own thread (NetQueryProc); here we only copy its last answer and
+    // ask for a new one every few seconds, so nothing on this path can block.
+    if (g_trayBar.alpha <= 0 && g_trayBar.stateAt) {
+        // Hidden: the expensive part is skipped, but a fresh answer from the network worker is
+        // still adopted (and baked into the DIB) so the icon is right the instant the window
+        // appears - otherwise it showed "not connected" for a frame or two on the first hover.
+        if (NetVersionFresh()) {
+            const TrayState was = g_trayState;
+            QueryNetworkFromSnapshot();
+            if (memcmp(&was, &g_trayState, sizeof(TrayState)) != 0) {
+                DLog(L"tray bar (hidden): net=%d(q=%d '%s') vol=%d mute=%d bat=%d chg=%d",
+                     g_trayState.netKind, g_trayState.netQuality, g_trayState.netName,
+                     g_trayState.volPercent, (int)g_trayState.muted, g_trayState.batPercent,
+                     (int)g_trayState.charging);
+            }
+            if (g_trayBar.hwnd) TrayRepaint(g_trayBar);
+        }
+        return;
+    }
 
     bool networkDue = !g_trayBar.netAt || (now - g_trayBar.netAt) >= 5000;
-    if (g_trayBar.stateAt && (now - g_trayBar.stateAt) < 1000) return;
+    // The cadence gate must not hold back a fresh answer from the worker: the wifi icon would
+    // then be up to a second stale right after the companion appears.
+    if (g_trayBar.stateAt && (now - g_trayBar.stateAt) < 1000 && !NetVersionFresh()) return;
     g_trayBar.stateAt = now;
 
     TrayState before = g_trayState;
     QueryVolume();
     QueryPower();
+    QueryNetworkFromSnapshot();
     if (networkDue) {
         g_trayBar.netAt = now;
-        QueryNetwork();
+        NetQueryNudge();          // the answer arrives on the worker thread; no blocking here
     }
     bool changed = memcmp(&before, &g_trayState, sizeof(TrayState)) != 0;
     if (changed && g_trayBar.hwnd) {
@@ -4642,8 +4766,14 @@ static void CompanionVisibilityTick(DWORD now) {
     bool wasVisible = c.visible;
     c.visible = (target > 0);
     if (c.visible && !wasVisible && c.hwnd) {
-        c.stateAt = 0;              // fresh values for the first frame on screen
-        c.netAt = 0;
+        // Volume/power are cheap (a COM getter and a struct), so they are refreshed for the
+        // first frame on screen. The network state must NOT be re-queried here: that is an RPC
+        // into the WLAN service, and doing it on this path blocked the UI thread (and with it
+        // WH_MOUSE_LL) exactly when the pointer crossed into this window - the hitch the user
+        // reported on 2026-11-17, worse with glass on because the same frame also bakes. The
+        // worker thread is nudged instead; its answer lands a few ms later and is invisible.
+        c.stateAt = 0;
+        NetQueryNudge();
         // While hidden we only moved the stored rect, so put the window where it belongs now,
         // and publish the anchor once (the flyout may be opened before the next move).
         SetWindowPos(c.hwnd, HWND_TOPMOST, c.rc.left, c.rc.top, c.rc.right - c.rc.left,
@@ -5035,6 +5165,8 @@ static void CompanionCreate() {
     c.alphaTarget = 0;
     CompanionEnsureDib(c, w, h);
     c.stateAt = 0;
+    NetQueryStart();                     // the WLAN query has to stay off the UI thread
+    NetQueryNudge();
     TrayStateRefresh(GetTickCount());    // real state first, so the first paint is correct
     TrayRepaint(c);
     CompanionPresent(c);
@@ -7229,6 +7361,13 @@ static bool SettleFlyout(const PanelCtx& ctx, int ms) {
 // single Space opens the flyout (measured by the user 2026-11-16 23:0x). It also needs no
 // screen coordinates. Falls back to "Win + click the chevron" if the taskbar never shows up.
 static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
+    // ⛔ STABLE (HANDOVER_NEXT.md §3.19): three things in here are load-bearing.
+    //   1. the deny below: the shell expands the taskbar for its flyout, and an expanded bar
+    //      is what later shows up as "the taskbar appears when the tray closes and stays";
+    //   2. no "wait for the bar to rise" loop: the bar does not rise any more, and that loop
+    //      cost a flat 500 ms on every "^" click;
+    //   3. closing: Space, then park - never fall through into the open path (that toggled
+    //      the shell's flyout back open: "it closes and then opens by itself").
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!tray) return false;
     // Closing: while the flyout is in front of the user it owns the keyboard focus, so a plain
@@ -7364,6 +7503,9 @@ static PanelCtx g_trayJobCtx{};
 static bool g_trayJobWasOpen = false;
 
 static DWORD WINAPI TrayJobProc(LPVOID) {
+    // ⛔ STABLE: no built-in-grid fallback (HANDOVER_NEXT.md §3.19). Showing our own grid after
+    // a failed open costs another second and fights the shell for the next click; the user
+    // asked for "just wait, or press Win and use the tray by hand" instead.
     const PanelCtx ctx = g_trayJobCtx;
     const bool wasOpen = g_trayJobWasOpen;
     if (!wasOpen) g_fgBeforeTray = GetForegroundWindow();

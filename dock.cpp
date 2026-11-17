@@ -3089,6 +3089,11 @@ struct Companion {
     int hoverCell = -1;
     HWND tipWnd = nullptr;
     TOOLINFOW tipInfo{};
+    // Kept active for the whole session and only moved/texted on hover: the first
+    // TTM_TRACKACTIVATE after a deactivate costs ~125 ms (measured 2026-11-17), and it used to
+    // run inside the mouse-move handler - that was the hitch when the pointer entered the
+    // window. See CompanionTooltipShow().
+    bool tipActive = false;
     DWORD stateAt = 0;
     DWORD netAt = 0;              // the WLAN query is expensive: its own, slower cadence
     bool visible = false;
@@ -3888,21 +3893,38 @@ static void CompanionTooltipEnsure(Companion& c) {
         LRESULT added = SendMessageW(c.tipWnd, TTM_ADDTOOLW, 0, (LPARAM)&c.tipInfo);
         DLog(L"tray bar: tooltip %p add cb=%d -> %ld (err=%lu)", (void*)c.tipWnd, size,
              (long)added, (unsigned long)GetLastError());
-        if (added) return;
+        if (added) {
+            // Warm it up once, off screen. The first TTM_TRACKACTIVATE costs ~125 ms; paying it
+            // here (during load) means every later hover is a cheap move + text change.
+            const double t0 = NowMs();
+            c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
+            SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(-4000, -4000));
+            SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&c.tipInfo);
+            c.tipActive = true;
+            DLog(L"tray bar: tooltip warmed up in %.1f ms", NowMs() - t0);
+            return;
+        }
     }
 }
 
 static void CompanionTooltipShow(Companion& c, int cell) {
     if (!c.tipWnd) return;
+    const double t0 = NowMs();
     if (cell < 0) {
+        // Hide by moving it off screen instead of TTM_TRACKACTIVATE FALSE: re-activating is
+        // what costs ~125 ms, and that used to happen on the first hover of every appearance.
         c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
-        SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, FALSE, (LPARAM)&c.tipInfo);
+        SendMessageW(c.tipWnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&c.tipInfo);
+        SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(-4000, -4000));
+        const double d = NowMs() - t0;
+        if (d >= 3.0) DLog(L"slow: tooltip hide %.1f ms", d);
         return;
     }
     static std::wstring text;
     text = TrayTipText(cell);
     c.tipInfo.lpszText = const_cast<LPWSTR>(text.c_str());
     SendMessageW(c.tipWnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&c.tipInfo);
+    const double t1 = NowMs();
 
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
@@ -3910,7 +3932,18 @@ static void CompanionTooltipShow(Companion& c, int cell) {
     POINT pt{c.rc.left + (cells[cell].left + cells[cell].right) / 2,
              c.rc.top + cells[cell].bottom + 6};
     SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x, pt.y));
-    LRESULT on = SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&c.tipInfo);
+    const double t2 = NowMs();
+    // Only (re)activate if it is not already up: that call is the 125 ms one.
+    LRESULT on = 1;
+    if (!c.tipActive) {
+        on = SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&c.tipInfo);
+        if (on) c.tipActive = true;
+    }
+    const double t3 = NowMs();
+    if (t3 - t0 >= 3.0) {
+        DLog(L"slow: tooltip cell=%d text %.1f, position %.1f, activate %.1f ms (track=%ld)",
+             cell, t1 - t0, t2 - t1, t3 - t2, (long)on);
+    }
     static int logged = 0;
     if (logged < 6) {
         logged++;
@@ -5092,11 +5125,12 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 TrayRepaint(c);
                 const double tPaint = NowMs();
                 CompanionPresent(c);
+                const double tPres = NowMs();
                 CompanionTooltipShow(c, hover);
-                const double dHover = NowMs() - tHover;
-                if (dHover >= 3.0) {
-                    DLog(L"slow: companion hover cell=%d paint %.1f ms, present+tooltip %.1f ms",
-                         hover, tPaint - tHover, dHover - (tPaint - tHover));
+                const double tTip = NowMs();
+                if (tTip - tHover >= 3.0) {
+                    DLog(L"slow: companion hover cell=%d paint %.1f, present %.1f, tooltip %.1f ms",
+                         hover, tPaint - tHover, tPres - tPaint, tTip - tPres);
                 }
             }
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};

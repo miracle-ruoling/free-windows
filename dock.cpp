@@ -2889,6 +2889,8 @@ static void TaskbarCloakForce() {
 // Opening takes a moment (Win+B, the taskbar sliding up, Space, the flyout animating in), so
 // the cloak must survive the window where the flyout is not on screen yet.
 static DWORD g_cloakGraceUntil = 0;
+// When the "keep the taskbar down" request may be dropped again (set when a tray flyout goes).
+static DWORD g_denyClearAt = 0;
 // What had the focus before we opened the flyout: a tray that keeps the keyboard focus makes
 // the shell expand its taskbar again later, so the focus is handed back when the flyout goes.
 static HWND g_fgBeforeTray = nullptr;
@@ -7300,7 +7302,10 @@ static bool NativeTrayPageKeyboard(const PanelCtx& ctx) {
         HWND f = FindOverflowFlyout();
         seen = f && IsWindowVisible(f);
     }
-    TaskbarDenyExpansion(0);           // the chord is done; a Win press may show the bar again
+    // On success the deny stays: the render tick keeps it alive for as long as the flyout is on
+    // screen and drops it 700 ms after the flyout goes. Only a failed open gives it back right
+    // away, so a Win press is not blocked by a stale request.
+    if (!seen) TaskbarDenyExpansion(0);
     if (seen) SettleFlyout(ctx, 400);
     DLog(L"tray: native flyout - keyboard path done, flyout %s", seen ? L"open" : L"MISSING");
     return true;
@@ -9948,12 +9953,23 @@ static void RenderTick() {
                         TaskbarCloakSet(true);
                         g_fgBeforeTray = nullptr;
                         lastDeny = 0;
+                        // Keep the "stay down" request a little longer than the close itself:
+                        // the shell asks to re-expand right after its flyout goes away.
+                        g_denyClearAt = now2 + 700;
                         DLog(L"tray: native flyout gone - focus handed back, taskbar hidden again");
                     } else {
                         TaskbarCloakSet(false);
-                        TaskbarDenyClear(L"tray flyout gone");
-                        lastDeny = 0;
                     }
+                }
+                // The deny is only ever dropped here, and only after the flyout has been and
+                // gone. Clearing it whenever no flyout is on screen was fatal: the "^" path
+                // writes it *before* the flyout exists, and the very next tick used to wipe it
+                // - so the shell was free to expand the bar 130 ms later, which is the
+                // "taskbar rises together with the tray and then never comes back down" the
+                // user reported.
+                if (g_denyClearAt && (LONG)(now2 - g_denyClearAt) >= 0) {
+                    g_denyClearAt = 0;
+                    TaskbarDenyClear(L"tray flyout gone");
                 }
             }
             CompanionTick(now);      // attached windows: follow, fade, tray state

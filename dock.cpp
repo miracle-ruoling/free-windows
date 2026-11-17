@@ -56,8 +56,17 @@
 static HWND g_hwnd;
 static void CompanionSaveAllPositions();      // defined with the companions
 static void CompanionFollowTo(int stripX, int stripY);   // ditto; called from Present()
-enum SPageKind { kPageDock = 0, kPageStrip = 1, kPageTray = 2, kPageGroup = 3 };
-static void ShowSettings(int hintKind = -1, int hintId = 0);   // per-window pages (G3)
+// Page identity (how a page reads/writes and re-applies itself) and the object a menu asks
+// for. Pages are chosen by the *components* the object owns, see SettingsBuildPages().
+enum SPageKind {
+    kPageGlass = 0,       // 玻璃页: [dock], global params shared by every glass window
+    kPageFloatDock = 1,   // 浮窗页 of the strip: [dock]
+    kPageBar = 2,         // 图标条页: [dock], only things a float window cannot use
+    kPageFloatTray = 3,   // 浮窗页 of a companion: [traybar]
+    kPageGroupKind = 4,   // 组 N
+};
+enum SObj { kObjStrip = 0, kObjCompanion = 1, kObjGroup = 2 };
+static void ShowSettings(int hintObj = kObjStrip, int hintId = 0);   // per-window pages (G3/H2)
 static void* g_paintBits;
 static HWND g_setWnd;
 static int g_paintW, g_paintH;
@@ -154,6 +163,17 @@ struct Config {
     int upscaleSmallIcons = 1;   // blow up icons whose artwork is smaller
     int material = 1;            // 0 solid, 1 glass (baked blur)
     int lightMode = 0;           // 0 dark, 1 light
+    // ---- H2 (2026-11-17): the background is a *layer model*, not a single enum ------------
+    // bgMode  : what is drawn underneath  0 = the desktop behind the window, 1 = an image
+    //           (placeholder, not rendered yet), 2 = a solid colour
+    // glassLayer: whether the glass layer runs over that background (blur + tint + rim)
+    // `material` above is now *derived* from these two (glass needs "behind" + layer on) and is
+    // kept only because the paint path still keys off it.
+    int bgMode = 0;
+    int glassLayer = 1;
+    int color = 0;               // 0 black, 1 white (solid background only)
+    int solidOpacity = 235;      // ~92 %: a fully opaque black slab looks nothing like the rest
+    int dragNoCapture = 0;       // H3: drag-time backdrop update off => keep the frozen one
     int glassOpacity = 140;      // how much glass there is (0 = invisible)
     int tintStrength = 110;      // how much of the glass is tint vs blur
     int dumpBake = 0;            // diagnostic: write the captured backdrop
@@ -299,6 +319,24 @@ static void LoadConfig() {
     g_cfg.scrollStep = GetInt(L"dock", L"scrollStep", 1);
     g_cfg.allowResize = GetInt(L"dock", L"allowResize", 1);
     g_cfg.upscaleSmallIcons = GetInt(L"dock", L"upscaleSmallIcons", 1);
+    // ---- H2 layer model, migrated once from the old global `material` switch ---------------
+    {
+        const int materialOld = GetInt(L"dock", L"material", 1);
+        // material=1 meant "glass over the desktop"; material=0 was the plain (transparent)
+        // look. So the defaults reproduce both exactly, and no existing profile changes when
+        // this build first runs.
+        g_cfg.bgMode = GetInt(L"dock", L"bgMode", materialOld ? 0 : 2);
+        if (g_cfg.bgMode < 0 || g_cfg.bgMode > 2) g_cfg.bgMode = materialOld ? 0 : 2;
+        g_cfg.glassLayer = GetInt(L"dock", L"glassLayer", materialOld ? 1 : 0);
+        if (g_cfg.glassLayer != 0 && g_cfg.glassLayer != 1) g_cfg.glassLayer = materialOld ? 1 : 0;
+        g_cfg.color = GetInt(L"dock", L"color", 0);
+        if (g_cfg.color < 0 || g_cfg.color > 1) g_cfg.color = 0;
+        g_cfg.solidOpacity = GetInt(L"dock", L"solidOpacity", 235);
+        if (g_cfg.solidOpacity < 0) g_cfg.solidOpacity = 0;
+        if (g_cfg.solidOpacity > 255) g_cfg.solidOpacity = 255;
+        g_cfg.dragNoCapture = GetInt(L"dock", L"dragNoCapture", 0);
+        g_cfg.material = (g_cfg.bgMode == 0 && g_cfg.glassLayer) ? 1 : 0;
+    }
     g_cfg.lightMode = GetInt(L"dock", L"lightMode", 0);
     g_cfg.glassOpacity = GetInt(L"dock", L"glassOpacity", 140);
     if (g_cfg.glassOpacity < 0) g_cfg.glassOpacity = 0;
@@ -311,7 +349,7 @@ static void LoadConfig() {
     g_cfg.presentSync = GetInt(L"dock", L"presentSync", 2);   // 2 = flush before, see Present()
     g_cfg.presentOrder = GetInt(L"dock", L"presentOrder", 0);
     g_cfg.blurIcons = GetInt(L"dock", L"blurIcons", 0);
-    g_cfg.material = GetInt(L"dock", L"material", 1);
+    // `material` was read here before H2; it is derived from (bgMode, glassLayer) just above.
     if (g_cfg.material < 0 || g_cfg.material > 1) g_cfg.material = 1;
     g_cfg.blurRadius = GetInt(L"dock", L"blurRadius", 16);
     if (g_cfg.blurRadius < 0) g_cfg.blurRadius = 0;
@@ -4546,7 +4584,7 @@ static bool HandleGroupCommand(Group& g, int cmd) {
         return true;
     }
     if (cmd == kGCmdSettings) {
-        ShowSettings(kPageGroup, g.id);
+        ShowSettings(kObjGroup, g.id);
         return true;
     }
     return false;
@@ -4777,7 +4815,7 @@ static void CompanionShowMenu(Companion& c) {
         if (Group* gg = GroupById(c.groupId)) GroupRecompute(*gg);
         DLog(L"tray bar: menu -> default size %dx%d", w, h);
     } else if (cmd == kCmdSettings) {
-        ShowSettings(kPageTray, g_trayBar.groupId);
+        ShowSettings(kObjCompanion, 0);
     } else if (cmd == kCmdGroupNew) {
         int id = NewGroupId();
         if (id) {
@@ -9144,6 +9182,10 @@ struct SRow {
     int isToggle;               // 1 = segmented buttons instead of a slider
     const wchar_t* onText;      // toggle label of value 1 (left pill); nullptr = 开
     const wchar_t* offText;     // toggle label of value 0 (right pill); nullptr = 关
+    // N-way choice (H2): labels for the values 0..N-1, drawn left to right. Replaces the slider
+    // for things like "background type". nullptr = not a choice row.
+    const wchar_t* const* choices = nullptr;
+    int choiceCount = 0;
 };
 
 struct SPage {
@@ -9152,38 +9194,64 @@ struct SPage {
     const SRow* rows;
     int count;
     int kind;
-    int groupId;                // kPageGroup only
+    int groupId;                // kPageGroupKind only
 };
 
-// Dock page: material + performance, i.e. what is true for "the dock" as a whole.
-static const SRow kRowsDock[] = {
-    {L"material", L"背景类型", 0, 1, 0, 1, L"玻璃", L"纯色"},
+// ---------------------------------------------------------------- H2: pages by component
+// A page belongs to a *component*, not to a window kind: the strip has (float + bar + glass),
+// a glass companion has (float + glass), a plain companion only (float). The tab set of an
+// object is therefore "the pages of the components it owns" (PLAN_COMPONENTS.md §2.2).
+enum Component { kCompFloat = 1, kCompBar = 2, kCompGlass = 4 };
+
+static const wchar_t* const kBgNames[] = {L"透过背后", L"图片", L"纯色"};
+static const wchar_t* const kColorNames[] = {L"黑", L"白"};
+
+// ---- 玻璃页 (component: kCompGlass; global, one copy for every glass window) --------------
+static const SRow kRowsGlass[] = {
     {L"lightMode", L"外观", 0, 1, 0, 1, L"浅色", L"深色"},
     {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0, nullptr, nullptr},
     {L"tintStrength", L"色调浓度", 0, 255, 0, 0, nullptr, nullptr},
     {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
     {L"refreshHz", L"背景刷新帧率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
     {L"captureHz", L"背景截取频率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
+    // H3: off = keep the frozen backdrop while dragging (the user picked that on 2026-11-17,
+    // knowing the background "sticks" to the window for the length of the drag).
+    {L"dragNoCapture", L"拖动时不更新背景", 0, 1, 0, 1, L"不更新", L"更新"},
 };
 
-// Strip page: everything about the icon bar's own layout.
-static const SRow kRowsStrip[] = {
+// ---- 浮窗页 for the strip (component: kCompFloat; section [dock]) -------------------------
+static const SRow kRowsFloatDock[] = {
+    {L"bgMode", L"背景", 0, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
+    {L"glassLayer", L"玻璃层", 0, 1, 0, 1, L"开", L"关"},
+    {L"color", L"纯色颜色", 0, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
+    {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
-    {L"iconSize", L"默认图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
-    {L"gap", L"图标间距", 0, 40, 0, 0, nullptr, nullptr},
     {L"pad", L"内边距", 0, 40, 0, 0, nullptr, nullptr},
-    {L"minIcon", L"最小图标", 8, 64, 0, 0, nullptr, nullptr},
-    {L"maxIcon", L"最大图标", 16, 160, 0, 0, nullptr, nullptr},
-    {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0, nullptr, nullptr},
-    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
-    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
 };
 
-// Companion page: the overrides that make it stop looking like the strip. -1 = inherit.
-static const SRow kRowsTray[] = {
+// ---- 浮窗页 for a companion (component: kCompFloat; section [traybar]) -------------------
+// -1 = inherit from [dock], exactly like radius/pad/gap already did.
+static const SRow kRowsFloatTray[] = {
+    {L"bgMode", L"背景", -1, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
+    {L"glassLayer", L"玻璃层", -1, 1, 0, 1, L"开", L"关"},
+    {L"color", L"纯色颜色", -1, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
+    {L"solidOpacity", L"纯色不透明度", -1, 255, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
     {L"pad", L"内边距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
     {L"gap", L"格子间距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
+};
+
+// ---- 图标条页 (component: kCompBar; things a float window has no use for) ----------------
+static const SRow kRowsBar[] = {
+    {L"iconSize", L"默认图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
+    {L"gap", L"图标间距", 0, 40, 0, 0, nullptr, nullptr},
+    {L"minIcon", L"最小图标", 8, 64, 0, 0, nullptr, nullptr},
+    {L"maxIcon", L"最大图标", 16, 160, 0, 0, nullptr, nullptr},
+    {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0, nullptr, nullptr},
+    {L"scrollStep", L"滚轮翻页步长", 1, 5, 0, 0, nullptr, nullptr},
+    // These two move to the 组 page in H2b (the group owns the fade distances).
+    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
+    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
 };
 
 // Group page: the frame and its two switches.
@@ -9233,6 +9301,11 @@ static int TrayKeyVal(const wchar_t* key) {
     if (!wcscmp(key, L"radius")) return g_trayBar.radiusOv;
     if (!wcscmp(key, L"pad")) return g_trayBar.padOv;
     if (!wcscmp(key, L"gap")) return g_trayBar.gapOv;
+    // H2 float-style rows: -1 = inherit [dock]
+    if (!wcscmp(key, L"bgMode")) return GetInt(L"traybar", L"bgMode", -1);
+    if (!wcscmp(key, L"glassLayer")) return GetInt(L"traybar", L"glassLayer", -1);
+    if (!wcscmp(key, L"color")) return GetInt(L"traybar", L"color", -1);
+    if (!wcscmp(key, L"solidOpacity")) return GetInt(L"traybar", L"solidOpacity", -1);
     return -1;
 }
 
@@ -9241,11 +9314,11 @@ static int PageVal(int i) {
     if (!p || i < 0 || i >= p->count) return 0;
     const SRow& row = p->rows[i];
     if (row.colorAlpha) return TintAlpha();
-    if (p->kind == kPageGroup) {
+    if (p->kind == kPageGroupKind) {
         Group* g = GroupById(p->groupId);
         return g ? GroupKeyVal(*g, row.key) : 0;
     }
-    if (p->kind == kPageTray) return TrayKeyVal(row.key);
+    if (p->kind == kPageFloatTray) return TrayKeyVal(row.key);
     return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : 0);
 }
 
@@ -9291,12 +9364,12 @@ static void PageSet(int i, int v) {
         WritePrivateProfileStringW(p->section.c_str(), L"tint", buf, g_iniPath.c_str());
     } else {
         swprintf_s(buf, L"%d", v);
-        if (p->kind != kPageGroup)      // group pages persist through GroupSaveFlag
+        if (p->kind != kPageGroupKind)  // group pages persist through GroupSaveFlag
             WritePrivateProfileStringW(p->section.c_str(), row.key, buf, g_iniPath.c_str());
     }
 
     switch (p->kind) {
-        case kPageDock: {
+        case kPageGlass: {
             LoadConfig();
             g_glassCacheValid = false;
             if (!wcscmp(row.key, L"blurRadius") || !wcscmp(row.key, L"material"))
@@ -9322,10 +9395,11 @@ static void PageSet(int i, int v) {
             Present();
             break;
         }
-        case kPageStrip:
+        case kPageFloatDock:
+        case kPageBar:
             ApplyStripStyle();
             break;
-        case kPageTray: {
+        case kPageFloatTray: {
             int v2 = v;
             if (!wcscmp(row.key, L"radius")) g_trayBar.radiusOv = v2;
             else if (!wcscmp(row.key, L"pad")) g_trayBar.padOv = v2;
@@ -9337,7 +9411,7 @@ static void PageSet(int i, int v) {
             }
             break;
         }
-        case kPageGroup: {
+        case kPageGroupKind: {
             Group* g = GroupById(p->groupId);
             if (!g) break;
             if (!wcscmp(row.key, L"enabled")) {
@@ -9514,7 +9588,8 @@ static void SettingsPaint() {
     for (int i = 0; i < p->count; i++) {
         const SRow& row = p->rows[i];
         DrawTextAlpha(30, y, 330, 46, row.label, 24, 0xF4FFFFFF);
-        if (!row.isToggle) {
+        const bool isChoiceRow = (row.choices && row.choiceCount > 0);
+        if (!row.isToggle && !isChoiceRow) {
             wchar_t val[32]{};
             if (g_rowVal[i] < 0) wcscpy_s(val, L"继承");
             else swprintf_s(val, L"%d", g_rowVal[i]);
@@ -9523,7 +9598,18 @@ static void SettingsPaint() {
 
         int tx = 370, tw = g_setW - 370 - 170;
         int ty = y + 20;
-        if (row.isToggle) {
+        if (row.choices && row.choiceCount > 0) {
+            // N-way choice (H2): one pill per value, left to right.
+            const int n = row.choiceCount;
+            const int seg = tw / n;
+            for (int k = 0; k < n; k++) {
+                bool on = (g_rowVal[i] == k);
+                RECT pr{tx + k * seg, ty - 14, tx + (k + 1) * seg - 6, ty + 16};
+                FillRound(g_setDC, pr, 8, on ? 0xFF4C9AFF : 0x30FFFFFF);
+                DrawTextAlpha(tx + k * seg + 14, ty - 22, seg - 26, 44, row.choices[k], 19,
+                              on ? 0xFFFFFFFF : 0xC0FFFFFF);
+            }
+        } else if (row.isToggle) {
             int half = tw / 2;
             for (int k = 0; k < 2; k++) {
                 bool on = (g_rowVal[i] == (k == 0 ? 1 : 0));
@@ -9572,6 +9658,19 @@ static void RowFromX(int i, int x) {
     if (!p || i < 0 || i >= p->count) return;
     const SRow& row = p->rows[i];
     int tx = 370, tw = g_setW - 370 - 170;
+    if (row.choices && row.choiceCount > 0) {
+        const int n = row.choiceCount;
+        const int seg = tw / n;
+        int v = seg > 0 ? (x - tx) / seg : 0;
+        if (v < 0) v = 0;
+        if (v > n - 1) v = n - 1;
+        if (v != g_rowVal[i]) {
+            g_rowVal[i] = v;
+            PageSet(i, v);
+            SettingsPaint();
+        }
+        return;
+    }
     if (row.isToggle) {
         int v = (x >= tx + tw / 2) ? 0 : 1;
         if (v != g_rowVal[i]) {
@@ -9665,30 +9764,93 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-// One page per window: the dock as a whole, the strip, every companion, every existing group.
-static void SettingsBuildPages(int hintKind, int hintId, int* hintPage) {
+// H2: a companion's background / glass-layer choice. -1 in [traybar] = inherit from [dock],
+// exactly like radius/pad/gap already do; the strip is always "its own".
+static int CompanionBgMode(const Companion& c) {
+    (void)c;
+    int v = GetInt(L"traybar", L"bgMode", -1);
+    if (v < 0 || v > 2) v = g_cfg.bgMode;
+    return v;
+}
+
+static bool CompanionUsesGlass(const Companion& c) {
+    int layer = GetInt(L"traybar", L"glassLayer", -1);
+    if (layer != 0 && layer != 1) layer = g_cfg.glassLayer;
+    return CompanionBgMode(c) == 0 && layer == 1;      // H3 gives it a real backdrop
+}
+
+// The tab set of an object is the set of components it owns (PLAN_COMPONENTS.md §2.2):
+//   the strip          → 浮窗 + 图标条 + 玻璃(if the glass layer is on) + 组 1
+//   a glass companion  → 浮窗 + 玻璃 + 组 N
+//   a plain companion  → 浮窗 + 组 N
+//   a group (menu)     → 组 N only (a group is not a window: no background, no glass)
+// `hintObj` is what the menu asked for, `hintId` the group id when it is a group.
+static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     g_pages.clear();
-    g_pages.push_back(SPage{L"全局", L"dock", kRowsDock,
-                            (int)(sizeof(kRowsDock) / sizeof(kRowsDock[0])), kPageDock, 0});
-    g_pages.push_back(SPage{L"条", L"dock", kRowsStrip,
-                            (int)(sizeof(kRowsStrip) / sizeof(kRowsStrip[0])), kPageStrip, 0});
-    if (g_trayBar.hwnd && g_trayBar.enabled)
-        g_pages.push_back(SPage{L"托盘", L"traybar", kRowsTray,
-                                (int)(sizeof(kRowsTray) / sizeof(kRowsTray[0])), kPageTray, 0});
-    for (int id = 1; id <= g_groupCount; id++) {
+    *hintPage = -1;
+    int wantKind = kPageFloatDock;
+    int wantGroup = 0;
+
+    auto addGroupPage = [](int id) {
         wchar_t title[32];
         swprintf_s(title, L"组 %d", id);
         g_pages.push_back(SPage{title, L"", kRowsGroup,
-                                (int)(sizeof(kRowsGroup) / sizeof(kRowsGroup[0])), kPageGroup, id});
-    }
-    g_page = 0;
-    *hintPage = -1;
-    for (int i = 0; i < (int)g_pages.size(); i++) {
-        if (g_pages[i].kind != hintKind) continue;
-        if (hintKind != kPageGroup || g_pages[i].groupId == hintId) {
-            *hintPage = i;
-            break;
+                                (int)(sizeof(kRowsGroup) / sizeof(kRowsGroup[0])),
+                                kPageGroupKind, id});
+    };
+
+    if (hintObj == kObjGroup) {
+        wantKind = kPageGroupKind;
+        wantGroup = hintId;
+        addGroupPage(hintId);
+    } else if (hintObj == kObjCompanion) {
+        // A companion owns "float" always, "glass" only when its own background is the glass
+        // layer, and the 组 page of the group it belongs to (groupId 0 = in no group).
+        wantKind = kPageFloatTray;
+        g_pages.push_back(SPage{L"浮窗", L"traybar", kRowsFloatTray,
+                                (int)(sizeof(kRowsFloatTray) / sizeof(kRowsFloatTray[0])),
+                                kPageFloatTray, 0});
+        const bool glass = CompanionUsesGlass(g_trayBar);
+        if (glass)
+            g_pages.push_back(SPage{L"玻璃", L"dock", kRowsGlass,
+                                    (int)(sizeof(kRowsGlass) / sizeof(kRowsGlass[0])),
+                                    kPageGlass, 0});
+        if (g_trayBar.groupId > 0) {
+            wantGroup = g_trayBar.groupId;
+            addGroupPage(g_trayBar.groupId);
         }
+    } else {
+        // The strip: a float window that also happens to be an icon bar and uses the glass.
+        wantKind = kPageFloatDock;
+        wantGroup = 1;
+        g_pages.push_back(SPage{L"浮窗", L"dock", kRowsFloatDock,
+                                (int)(sizeof(kRowsFloatDock) / sizeof(kRowsFloatDock[0])),
+                                kPageFloatDock, 0});
+        g_pages.push_back(SPage{L"图标条", L"dock", kRowsBar,
+                                (int)(sizeof(kRowsBar) / sizeof(kRowsBar[0])), kPageBar, 0});
+        if (g_cfg.bgMode == 0 && g_cfg.glassLayer)
+            g_pages.push_back(SPage{L"玻璃", L"dock", kRowsGlass,
+                                    (int)(sizeof(kRowsGlass) / sizeof(kRowsGlass[0])),
+                                    kPageGlass, 0});
+        addGroupPage(1);
+    }
+
+    g_page = 0;
+    for (int i = 0; i < (int)g_pages.size(); i++) {
+        if (g_pages[i].kind != wantKind) continue;
+        if (wantKind == kPageGroupKind && g_pages[i].groupId != wantGroup) continue;
+        *hintPage = i;
+        break;
+    }
+    // One line per open: the tab set is the whole point of H2, so make it visible in the log.
+    {
+        std::wstring list;
+        for (int i = 0; i < (int)g_pages.size(); i++) {
+            if (i) list += L" | ";
+            list += g_pages[i].title;
+        }
+        DLog(L"settings: obj=%d group=%d -> %d page(s): %s", hintObj, wantGroup,
+             (int)g_pages.size(), list.c_str());
     }
 }
 
@@ -10854,7 +11016,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             else if (cmd == 4) ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr,
                                             SW_SHOWNORMAL);
-            else if (cmd == 5) ShowSettings(kPageStrip, 0);
+            else if (cmd == 5) ShowSettings(kObjStrip, 0);
             else if (cmd == 6) {
                 bool on = SetAutoStart(!AutoStartEnabled());
                 DLog(L"autostart -> %d (ok=%d)", (int)AutoStartEnabled(), (int)on);

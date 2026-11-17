@@ -1043,6 +1043,52 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - 修法：**网络状态搬到工作线程**（`NetQueryProc`，3s 周期 + `NetQueryNudge()` 立即唤醒，UI 线程只读
   `g_netSnapshot` 快照，加锁只保护一次结构体拷贝）；"隐藏→可见"只保留廉价的音量/电量刷新 + 唤醒工作线程。
 - 音量/电量仍在 UI 线程（一个 COM getter + 一个 struct），COM 对象在启动时就已创建，不会在进场时付激活成本。
+### 3.20 H2a 已落地（2026-11-17 17:3x）：设置按组件分（结构/改名/ini 迁移）
+
+**用户 2026-11-17 17:2x 拍板（这次问了 6 个，全部按推荐选项）：**
+1. 组的淡出距离 → 量到 **组成员外接矩形 + margin**（= 画组框那圈）；
+2. 我们自己的弹窗（宫格/设置/菜单/缩略图）→ **算"在组里"，整组保持全亮**；
+3. ackground=solid → **给一个不透明度滑杆，默认 92%**（不搞完全不透明）；
+4. 数据模型 → **H2 就落地"背景 + 玻璃层"两层**（不是三选一）；
+5. "拖动时是否更新背景" → 放**玻璃页**，关掉 = **沿用冻结的旧底图**（用户选了这个；
+   代价是拖动时背景会"粘在窗口上"，已告知并记录在案）；
+6. 节奏 → **H2a（结构/改名/迁移，行为不变）→ 用户验 → H2b（浮窗样式生效 + 组距离）**。
+
+**H2a 做了什么（dock.cpp 的 settings UI 段，整段重排）**
+- 页签由**组件集合**算出，不再按 kind 写死：enum Component { kCompFloat=1, kCompBar=2, kCompGlass=4 } +
+  SettingsBuildPages(hintObj, hintId, &hint)。对象 → 页签：
+  | 对象 | 页签 |
+  |---|---|
+  | 图标条（条） | 浮窗 图标条 玻璃〔bgMode=透过背后 且 玻璃层开〕 组 1 |
+  | 玻璃浮窗 | 浮窗 玻璃 组 N |
+  | 非玻璃浮窗 | 浮窗 组 N |
+  | 组（从组菜单进） | 只有 组 N |
+- 页内行表按组件拆开：kRowsGlass（全局玻璃）、kRowsFloatDock（条的浮窗）、
+  kRowsFloatTray（浮窗的浮窗，-1=继承）、kRowsBar（图标条专有）、kRowsGroup（组）。
+- SPageKind 换成 kPageGlass / kPageFloatDock / kPageBar / kPageFloatTray / kPageGroupKind；
+  菜单入口改成"哪个对象"：ShowSettings(kObjStrip|kObjCompanion|kObjGroup, groupId)。
+- SRow 新增 choices/choiceCount：**N 选一分段按钮**（背景类型三项、纯色颜色两项），
+  渲染在 SettingsPaint()，命中在 RowFromX()；原先的 0/1 toggle 与滑杆不变。
+
+**ini（向后兼容，老配置一个值都不用改）**
+- 新增 [dock] bgMode=0|1|2（透过背后 / 图片 / 纯色）、glassLayer=0|1、color=0|1、
+  solidOpacity=0..255（默认 235）、dragNoCapture=0|1（H3 用）。
+- material 变成**派生值**：material = (bgMode==0 && glassLayer)，只因为旧绘制路径还认它。
+  迁移：缺 gMode 时按 material 推（1→gMode=0,glassLayer=1；0→gMode=2,glassLayer=0），
+  所以**现有 profile 的观感完全不变**（本机 material=1 → 透过背后 + 玻璃层开）。
+- [traybar] 的同名键 -1 = 继承 [dock]（CompanionBgMode()/CompanionUsesGlass()）。
+- 打开面板时日志打一行 settings: obj=N group=N -> K page(s): 浮窗 | 图标条 | ...，**页签集合最好的验证入口**。
+
+**H2a 里"只存不生效"的（H2b/H3 接）**：color、solidOpacity、gMode=图片（image= 键还没建）、
+以及浮窗自己的玻璃底（§2.4.3：浮窗的玻璃是 H3 的活，现在选玻璃 = 保持现有 4% 白 + 字形）。
+**gMode/glassLayer 不是占位**：它们真的切换"玻璃路径 vs 纯色/无玻璃路径"（等价于旧 material）。
+
+**H2b 待做（用户验完 H2a 再动）**
+1. adeStart/fadeEnd 两行从 图标条 页搬到 组 N 页，值迁到 [group]/[group.N]，
+   计量改成 GroupAlphaTarget()：距离 = 到 组成员外接矩形 + margin，组内成员（含条）共用一个 alpha；
+   我们自己的弹窗算"在组里"（保持全亮）。**这条会顺带改掉条的淡出手感**（距离基准从"条自身"变成"组框"）。
+2. 浮窗的 color/solidOpacity 真绘制；gMode=图片 的界面入口（文件选择框仍留 H3）。
+3. dragNoCapture（拖动时是否更新背景）接进 H3 的抓图路径。
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**

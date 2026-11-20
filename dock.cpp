@@ -1153,6 +1153,11 @@ static int g_alpha = 255;
 static double g_qpcFreq = 0.0;
 static double g_statGlass = 0, g_statIcons = 0, g_statPresent = 0, g_statBake = 0;
 static int g_statPaints = 0, g_statPresents = 0, g_statBakes = 0;
+// presentSync=2's DwmFlush() *waits* for the next composition and is invisible in the "present"
+// figure above (which only wraps the two real present calls). On this 144 Hz screen it measures
+// 4.3-4.4 ms per moving frame - the single largest per-frame cost of a drag, so it is measured.
+static double g_statSync = 0;
+static int g_statSyncs = 0;
 // Frames where the strip had moved out of its backdrop snapshot while a drag forbade
 // re-capturing. Non-zero means the glass is being drawn from a picture that no longer covers
 // the window - the "背景抖动" the user saw on 2026-11-16 14:48. Reported in the cadence line.
@@ -2282,7 +2287,14 @@ static void Present() {
     // composition leaves the whole next interval for both halves to be picked up together.
     // Only worth it when the position is about to change: a stationary repaint (fade, icon
     // zoom) has no geometry to pair the pixels with, and flushing there would just block.
-    if (g_cfg.presentSync == 2 && pdst) DwmFlush();
+    if (g_cfg.presentSync == 2 && pdst) {
+        LARGE_INTEGER s0{}, s1{};
+        QueryPerformanceCounter(&s0);
+        DwmFlush();
+        QueryPerformanceCounter(&s1);
+        g_statSync += QpcMs(s0, s1);
+        g_statSyncs++;
+    }
     // The strip is about to land at `dst`: move the windows that follow it in this very step.
     // Doing it here (after the composition wait, before our own update) puts the strip and its
     // companions into the *same* composition. Following from the 16 ms housekeeping gate left
@@ -4678,6 +4690,36 @@ static void GroupDragBegin(Group& g, POINT screen) {
     }
 }
 
+// Move the strip (and everything attached to it) to (x,y) *right now*, inside the mouse message,
+// without repainting anything.
+//
+// ⛔ Only correct when the pixels do not depend on where the window sits - i.e. a solid background
+// (bgMode=solid) or no background at all. With the glass layer on, the baked backdrop is anchored
+// to the desktop, so a move *must* repaint with the new offset, and geometry + pixels have to land
+// in the same composition (that is what presentSync=2's DwmFlush is for, HANDOVER §4.1).
+//
+// Why it matters (user report 2026-11-20 22:33, "快速拖动整个组很卡顿，纯色也卡"):
+// the drag used to be applied once per *frame tick* - capped at refreshHz (60 Hz here) - and every
+// one of those frames blocked 4.3-4.4 ms in DwmFlush (measured, 144 Hz screen). At high speed the
+// group therefore advanced in 60 Hz steps on a 144 Hz display (2 or 3 refresh intervals per step):
+// that is the judder that was reported. Moving here makes the window follow the mouse at the
+// mouse's own rate, and since nothing is repainted there is no geometry/pixel pair to sync - so no
+// flush either.
+static void MoveStripNow(int x, int y) {
+    if (!g_hwnd) return;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+    CompanionFollowTo(x, y);          // same message: the group never comes apart
+    GroupRecompute(DefaultGroup());
+}
+
+// Which of the two move paths applies to this profile?
+//   position-independent pixels (solid / no background) → MoveStripNow() per mouse message
+//   glass                                              → the tick, so pixels and geometry pair up
+static bool GlassBackdropIsPositional() {
+    return g_cfg.material == 1;      // material = (bgMode == 0 && glassLayer), see LoadConfig
+}
+
 static void GroupDragTo(Group& g, POINT screen) {
     GroupDragState& st = g.drag;
     if (!st.active) return;
@@ -4693,7 +4735,10 @@ static void GroupDragTo(Group& g, POINT screen) {
     if (g.id == 1) {
         g_cfg.x = screen.x - st.grab.x;
         g_cfg.y = screen.y - st.grab.y;
-        g_dragMovePending = true;    // the frame tick moves + presents in one composition
+        // Same split as the strip's own drag: no position-dependent pixels -> move right now,
+        // otherwise let the frame tick move + present in one composition.
+        if (GlassBackdropIsPositional()) g_dragMovePending = true;
+        else MoveStripNow(g_cfg.x, g_cfg.y);
         return;
     }
     // A group without the strip has no anchor to drive: place every member absolutely from the
@@ -11153,13 +11198,16 @@ static void RenderTick() {
                 // per-frame cost, measured with QPC
                 if (g_statPaints > 0) {
                     DLog(L"frame: n=%d paint=%.2fms (glass %.2f + icons %.2f) present=%.2fms"
-                         L" bake=%.2fms (n=%d)",
+                         L" bake=%.2fms (n=%d) sync=%.2fms (n=%d)",
                          g_statPaints, (g_statGlass + g_statIcons) / g_statPaints,
                          g_statGlass / g_statPaints, g_statIcons / g_statPaints,
                          g_statPresents ? g_statPresent / g_statPresents : 0.0,
-                         g_statBakes ? g_statBake / g_statBakes : 0.0, g_statBakes);
+                         g_statBakes ? g_statBake / g_statBakes : 0.0, g_statBakes,
+                         g_statSyncs ? g_statSync / g_statSyncs : 0.0, g_statSyncs);
                 }
                 g_statGlass = g_statIcons = g_statPresent = g_statBake = 0;
+                g_statSync = 0;
+                g_statSyncs = 0;
                 g_statPaints = g_statPresents = g_statBakes = 0;
                 g_captureCount = 0;
                 g_trayBar.glassCount = 0;
@@ -11329,7 +11377,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // Moving the window here and repainting on the next tick is what made the
                 // backdrop slide: between the two, the old pixels travel with the window.
                 // Remember the target and let the frame tick move + paint together.
-                g_dragMovePending = true;
+                // With a solid / no background there are no position-dependent pixels, so the
+                // tick is pure latency: move right here (see MoveStripNow).
+                if (GlassBackdropIsPositional()) g_dragMovePending = true;
+                else MoveStripNow(g_cfg.x, g_cfg.y);
                 return 0;
             }
             if (g_pressActive && !g_dragging && !g_reordering) {

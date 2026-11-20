@@ -49,10 +49,11 @@ $r = New-Object GD+RECT
 $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top
 Write-Output ("strip {0},{1} {2}x{3}" -f $r.Left, $r.Top, $w, $h)
 
-# Grab in the bottom padding band, middle of the long axis: not an icon (that would start an
-# icon reorder) and not an edge (that would start a resize).
-$x0 = $r.Left + [int]($w * 0.5)
-$y0 = $r.Bottom - 6
+# Grab in the LEFT padding band at mid height: not an icon (that starts an icon reorder), not the
+# top/bottom band (that is the resize edge - grabbing there *scales* the group, which is what made
+# this probe look like it "did not move").
+$x0 = $r.Left + 5
+$y0 = $r.Top + [int]($h / 2)
 
 function Shot([string]$name) {
     if (-not $name) { return }

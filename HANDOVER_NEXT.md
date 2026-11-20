@@ -1245,6 +1245,44 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - 坑：**测量脚本必须 DPI-aware**。不调 `SetProcessDpiAwarenessContext(-4)` 时 `GetWindowRect` 返回的是
   虚拟化坐标（793x86 会读成 634x69），我这一轮差点以为把用户的布局改坏了。
 
+### 3.25 快速拖动整个组"卡顿"的真因（2026-11-20 22:4x，用户报"纯色也卡"）
+
+**不是玻璃**（用户判断对了）：`bgMode=2 / solidOpacity=255` 时根本没有抓图
+（`cadence: 0 captures`、`bake=0.00ms`）。
+
+**实测（本机 144 Hz，`t_glassdrag.ps1` 拖条，`allowResize=0` 让内边距带能抓起来）**
+
+| | 拖动中每 10 s | per-frame |
+|---|---|---|
+| 改之前 | 263 repaints / 144 companion moves | `paint 1.58 + present 0.18 + **sync 4.41 ms**` |
+| 改之后 | **0 repaints** / 219 companion moves | `sync 0.00 ms (n=0)` |
+
+两个原因叠在一起：
+1. **拖动是"每帧一次"的**：`WM_MOUSEMOVE` 只记目标（`g_dragMovePending`），真正移动在 render tick 里，
+   而 tick 上限 = `refreshHz`（这里 60 Hz）。144 Hz 屏幕上 60 Hz ⇒ 每步显示 2~3 个刷新周期 ⇒ 抖动。
+2. **每帧还阻塞 4.3–4.4 ms 在 `DwmFlush()`**（`presentSync=2`，144 Hz 屏实测）。它以前从来没被量过：
+   `frame:` 里的 `present=` 只包住两个真正的上屏调用，flush 在它外面。**现在 `frame:` 行多了 `sync=`**。
+
+**改法（只对"像素与窗口位置无关"的配置生效）**
+- 新增 `GlassBackdropIsPositional()` = `g_cfg.material == 1`（= 透过背后 + 玻璃层开）。
+- 否则（纯色 / 全透明）拖动时走 `MoveStripNow()`：在**鼠标消息里**直接
+  `SetWindowPos` + `CompanionFollowTo()` + `GroupRecompute()`，**不重绘**。
+  没有重绘就没有"几何/像素配对"的问题，于是也不需要 flush。
+- 玻璃配置**原样不动**（还是 tick 里 move+paint、还是 flush）—— 那条是 §3.19 的稳定状态，别为了手感改它。
+
+**回归**：`t_groupbox.ps1 -Margin 13` 几何 `True`；`t_winbtn_taskbar.ps1 -Mode cycle` `y=1078`；
+拖动中没有 `slow:` 行。
+
+**两个坑（都真的踩了）**
+- **`File.WriteAllText(path, $null)` 会把文件清成 0 字节**（.NET 把 null 当空串）。我用 PowerShell 改
+  `dock.cpp` 时变量恰好是 null，整个文件被清空 —— 靠 `git checkout -- dock.cpp` 救回来。**改源码只用
+  read/edit 工具**，别用写文件脚本。
+- 探针抓条的位置：`EdgeAt()` 的缩放带是轮廓内 **10 px**，而 `pad=10` ⇒ **纯色档下内边距带全是缩放带**，
+  想"移动"只能按在两个图标之间 6 px 的缝里（或临时 `allowResize=0`）。这是另一个待办（见下）。
+
+**新的待办**：纯色/玻璃档下条没有可抓的"空白移动区"（pad 10 ≤ 缩放带 10），用户只能拖图标缝。
+建议把 `EdgeAt` 的 band 改成 `min(10, pad)` 或按"离轮廓的距离 ≥ pad-2"判定。
+
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**

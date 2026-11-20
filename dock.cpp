@@ -122,6 +122,7 @@ static bool g_menuSeen = false;   // ... and we actually saw its window
 static DWORD g_menuOpenedAt = 0;
 static DWORD g_menuOutsideAt = 0;
 static unsigned int g_menuPid = 0;   // process that owns the forwarded menu
+static HWND g_menuHwnd = nullptr;   // the popup we are tracking (menus are reused)
 // --- "who is allowed to own the foreground while the panel is up" -----------------
 // The panel is a NOACTIVATE layered window, so it never holds focus itself. It only
 // goes away when the foreground becomes a *third party*: neither us, nor the window
@@ -2681,6 +2682,23 @@ static int DistanceToWindow() {
     // Same for the shell's overflow flyout once we have moved it next to the chevron: the
     // user works in it, so the strip has to stay up while the cursor is over it.
     {
+        // Every popup of ours counts as "us" (user 2026-11-17, PLAN_COMPONENTS §7-A4): the
+        // settings panel, the thumbnail preview and the context menu are all anchored to the
+        // strip, and with the pointer on one of them the strip used to fade out - taking the
+        // popup with it and, worse, hiding the group frame while the user was still working
+        // in the settings panel ("移出组再移回来之后框线不显示", reported 2026-11-20).
+        HWND ours[3] = {g_setWnd, g_thumbWnd, g_menuHwnd};
+        for (HWND h : ours) {
+            if (!h || !IsWindow(h) || !IsWindowVisible(h)) continue;
+            RECT orr{};
+            if (!GetWindowRect(h, &orr)) continue;
+            int guard = 16;
+            int dg = dist(orr);
+            if (dg < d) d = dg;
+            if (d <= guard) d = 0;
+        }
+    }
+    {
         HWND flyout = g_trayNative ? FindOverflowFlyout() : nullptr;
         if (flyout && IsWindowVisible(flyout)) {
             RECT fr{};
@@ -4305,6 +4323,9 @@ static void GroupPlace(Group& g) {
     }
     SetWindowPos(g.hwnd, nullptr, g.rc.left, g.rc.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     if (sizeChanged) GroupPresent(g);
+    DLog(L"group %d: place %ld,%ld %dx%d repaint=%d painted=%dx%d alpha=%d target=%d en=%d vis=%d",
+         g.id, (long)g.rc.left, (long)g.rc.top, w, h, (int)sizeChanged, g.paintedW, g.paintedH,
+         g.alpha, g.alphaTarget, (int)g.enabled, (int)IsWindowVisible(g.hwnd));
 }
 
 static void GroupRecompute(Group& g) {
@@ -4312,6 +4333,8 @@ static void GroupRecompute(Group& g) {
     if (!GroupBoxRect(g, &want)) {
         g.rc = RECT{0, 0, 0, 0};
         if (g.hwnd) ShowWindow(g.hwnd, SW_HIDE);
+        DLog(L"group %d: no frame (members<2) -> hidden (alpha=%d target=%d)", g.id, g.alpha,
+             g.alphaTarget);
         return;
     }
     g.rc = want;
@@ -4883,15 +4906,37 @@ static void CompanionVisibilityTick(DWORD now) {
         // frame: a fast scale/drag outruns the box rect by a message or two, and reading that
         // as "left the group" faded everything out in the middle of the gesture (bugs
         // 2026-11-16 00:44 and the G1 drag). Group drags/scales are whitelisted here.
-        if (onMember) g.shown = true;
+        //
+        // Our own popups count as "inside the group" too (user 2026-11-17, §7-A4) - but only
+        // while the pointer is actually *on* one of them: with the settings panel / preview /
+        // forwarded menu open the pointer is on our UI and the frame used to hide, which then
+        // looked like "the frame does not come back after moving the companion out of the group
+        // and back in" (reported 2026-11-20).
+        bool ourUi = false;
+        {
+            HWND ours[3] = {g_setWnd, g_thumbWnd, g_menuHwnd};
+            for (HWND h : ours) {
+                if (!h || !IsWindow(h) || !IsWindowVisible(h)) continue;
+                RECT pr{};
+                if (GetWindowRect(h, &pr) && PtInRect(&pr, p)) { ourUi = true; break; }
+            }
+            if (!ourUi && g_menuOpen) ourUi = true;      // a forwarded menu swallows the pointer
+        }
+        if (onMember || inBox || ourUi) g.shown = true;
         else if (!inBox && !g.scale.active && !g.drag.active) g.shown = false;
 
         bool wantShown = g.shown && haveBox;      // a group of one has no frame at all
+        if (g.hwnd && (wantShown ? 255 : 0) != g.alphaTarget) {
+            DLog(L"group %d: target -> %d (shown=%d box=%d alpha=%d)", g.id,
+                 wantShown ? 255 : 0, (int)g.shown, (int)haveBox, g.alpha);
+        }
         if (wantShown && g.alphaTarget == 0 && g.hwnd) {
             // The frame is (re)appearing: its geometry may be stale after members moved while
             // it was hidden, and the z-order has to be re-asserted (strip > members > frame).
             GroupRecompute(g);
             ShowWindow(g.hwnd, SW_SHOWNOACTIVATE);
+            GroupPresent(g);     // a window re-shown after SW_HIDE keeps the alpha of its last
+                                 // present, so assert it once with the current value
             if (g.id == 1) {
                 if (g_trayBar.hwnd)
                     SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -6617,7 +6662,6 @@ static int DistanceToRect(const RECT& r, POINT p) {
 // "whatever new visible window that process put on screen after we posted the
 // message": a classic #32768 menu for Win32 apps, a WPF/XAML popup for others.
 static std::vector<unsigned long long> g_menuBaseline;
-static HWND g_menuHwnd = nullptr;   // the popup we are tracking (menus are reused)
 
 static void CollectPidWindows(unsigned int pid, std::vector<unsigned long long>& out) {
     out.clear();

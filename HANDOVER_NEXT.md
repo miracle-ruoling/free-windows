@@ -1089,6 +1089,32 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
    我们自己的弹窗算"在组里"（保持全亮）。**这条会顺带改掉条的淡出手感**（距离基准从"条自身"变成"组框"）。
 2. 浮窗的 color/solidOpacity 真绘制；gMode=图片 的界面入口（文件选择框仍留 H3）。
 3. dragNoCapture（拖动时是否更新背景）接进 H3 的抓图路径。
+### 3.21 组框"移出再移回之后不显示"（2026-11-20 20:5x）
+
+**用户报告**：把三图标小窗 移到一个新组 再移回 默认组 之后，**组框线不显示**（显示边框线 是开的）。
+
+**我的复现**：干净重启后按 组 ▸ 组 2 → 组 ▸ 默认组 走一遍，**框线正常回来了**
+（日志 group 1: place 438,-34 1080x157 repaint=0 ... vis=1）。所以不是"移动本身把状态搞坏"。
+
+**最可能的原因（已修）**：移动那一步是在**菜单里点的**，之后用户把鼠标放到**设置面板**上继续调——
+而 CompanionVisibilityTick() 判"在不在组里"只看"指针在成员上 / 在框内"，**我们自己的弹窗不算**
+⇒ 整组被判"离开" ⇒ 框淡出。等用户再看条时，框的 alpha 已经 0，看起来就是"框线没了"。
+（PLAN_COMPONENTS §7-A4 本来就要做这条，用户 2026-11-17 已拍板"弹窗算在组里"。）
+
+**改动（三处，都很小）**
+1. CompanionVisibilityTick()：**指针落在我们自己的弹窗上**（设置面板 / 缩略图 / 转发的应用菜单，
+   另外 g_menuOpen 一开就算）时，视为 shown —— 用 PtInRect 精确判，避免"弹窗一存在整组就常亮"。
+   （第一版我写成"弹窗存在就算"，结果框线**一直不消失**，当场就改回精确判定。）
+2. DistanceToWindow()：同样把这三个弹窗按"距离 0"算（否则指针在面板上时条会淡掉）。
+3. 组框**重新出现**时补一次 GroupPresent()：SW_HIDE 之后的窗口会保留**上次 present 的 alpha**，
+   补一次可以消掉任何"窗口 visible 但 alpha 停在 0"的脏状态。
+
+**顺带留下的诊断日志**（都是事件触发，不是每帧；出现即证据）
+- group N: place x,y WxH repaint=R painted=WxH alpha=A target=T en=E vis=V
+- group N: no frame (members<2) -> hidden (alpha=A target=T)
+- group N: target -> T (shown=S box=B alpha=A)
+
+**还没做**：H2b（adeStart/fadeEnd 搬到组页 + 组矩形距离 + 浮窗 color/solidOpacity 真绘制）。
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**

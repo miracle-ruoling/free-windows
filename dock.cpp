@@ -9916,6 +9916,16 @@ struct SPage {
 // forward declarations for the picture row / row state helpers (defined with SettingsPaint below)
 static std::wstring GalleryNewest();
 static void WriteImagePath(const std::wstring& section, const std::wstring& path);
+// The two picture buttons must never open a dialog from inside a mouse message.
+// ⛔ Reported 2026-11-21 02:0x: picking a picture then closing the dialog made it reopen, forever.
+// Cause: WM_LBUTTONDOWN set g_dragRow + capture and called RowFromX() straight away; the modal
+// file dialog keeps pumping our messages, so every WM_MOUSEMOVE with the row still "dragged" ran
+// RowFromX() again - and for the picture row that means "open the dialog again". A queued action
+// plus a re-entry guard makes the click return before any dialog exists.
+static const UINT kSetMsgPickImage = WM_APP + 7;
+static int g_setPickAction = 0;        // 1 = from the gallery, 2 = add a new picture
+static bool g_pickBusy = false;        // a dialog is up right now
+
 static void SettingsPaint();
 static void SettingsPickFromGallery();
 static void SettingsPickNewImage();
@@ -10417,15 +10427,20 @@ static void WriteImagePath(const std::wstring& section, const std::wstring& path
 // the user can see/manage it - there is nothing to pick yet.
 static void SettingsPickFromGallery() {
     const SPage* p = ActivePage();
-    if (!p) return;
+    if (!p || g_pickBusy) return;
     const std::wstring dir = GalleryDir();
     if (GalleryNewest().empty()) {
+        g_pickBusy = true;
         ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        g_pickBusy = false;
         DLog(L"gallery: empty - opened %s", dir.c_str());
         return;
     }
     std::wstring picked;
-    if (!PickImageFile(g_setWnd, dir, &picked)) return;
+    g_pickBusy = true;
+    const bool got = PickImageFile(g_setWnd, dir, &picked);
+    g_pickBusy = false;
+    if (!got) return;
     WriteImagePath(p->section, picked);
     LoadConfig();
     SettingsPaint();
@@ -10434,9 +10449,12 @@ static void SettingsPickFromGallery() {
 // "Add a picture" (+): pick from anywhere, copy it into the gallery, make it the background.
 static void SettingsPickNewImage() {
     const SPage* p = ActivePage();
-    if (!p) return;
+    if (!p || g_pickBusy) return;
     std::wstring picked;
-    if (!PickImageFile(g_setWnd, std::wstring(), &picked)) return;
+    g_pickBusy = true;
+    const bool got = PickImageFile(g_setWnd, std::wstring(), &picked);
+    g_pickBusy = false;
+    if (!got) return;
     WriteImagePath(p->section, CopyIntoGallery(picked));
     LoadConfig();
     SettingsPaint();
@@ -10642,8 +10660,14 @@ static void RowFromX(int i, int x) {
             if (SettingsRowVisible(p, k)) y += kRowH;
         const int bs = 34;
         const int clockL = g_setW - 156, plusL = clockL + bs + 12;
-        if (x >= clockL && x < clockL + bs) SettingsPickFromGallery();
-        else if (x >= plusL && x < plusL + bs) SettingsPickNewImage();
+        int action = 0;
+        if (x >= clockL && x < clockL + bs) action = 1;
+        else if (x >= plusL && x < plusL + bs) action = 2;
+        // Queued, not called: see kSetMsgPickImage.
+        if (action && !g_pickBusy && !g_setPickAction) {
+            g_setPickAction = action;
+            PostMessageW(g_setWnd, kSetMsgPickImage, 0, 0);
+        }
         return;
     }
     if (row.choices && row.choiceCount > 0) {
@@ -10681,6 +10705,17 @@ static void RowFromX(int i, int x) {
 
 static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case kSetMsgPickImage: {
+            // The picture button's click is handled *here*, after the mouse message has returned,
+            // so the modal dialog can never be re-entered by the click that opened it.
+            const int action = g_setPickAction;
+            g_setPickAction = 0;
+            if (!g_pickBusy) {
+                if (action == 1) SettingsPickFromGallery();
+                else if (action == 2) SettingsPickNewImage();
+            }
+            return 0;
+        }
         case WM_LBUTTONDOWN: {
             int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
             if (mx >= g_setW - 66 && mx <= g_setW - 16 && my >= 12 && my <= 62) {  // the × glyph
@@ -10712,7 +10747,16 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
             return 0;
         }
         case WM_MOUSEMOVE:
-            if (g_dragRow >= 0) RowFromX(g_dragRow, GET_X_LPARAM(lp));
+            if (g_dragRow >= 0) {
+                // Only sliders follow the pointer. A toggle / choice / the picture row must not
+                // repeat its action while the button is held (that is what looped the file dialog).
+                const SPage* pg = ActivePage();
+                if (pg && g_dragRow < pg->count) {
+                    const SRow& rr = pg->rows[g_dragRow];
+                    if (!rr.isToggle && !rr.choices && wcscmp(rr.key, L"image"))
+                        RowFromX(g_dragRow, GET_X_LPARAM(lp));
+                }
+            }
             return 0;
         case WM_MOUSEWHEEL: {
             POINT p{};

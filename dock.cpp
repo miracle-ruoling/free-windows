@@ -9913,6 +9913,15 @@ struct SPage {
     int groupId;                // kPageGroupKind only
 };
 
+// forward declarations for the picture row / row state helpers (defined with SettingsPaint below)
+static std::wstring GalleryNewest();
+static void WriteImagePath(const std::wstring& section, const std::wstring& path);
+static void SettingsPaint();
+static void SettingsPickFromGallery();
+static void SettingsPickNewImage();
+static bool SettingsRowVisible(const SPage* p, int i);
+static bool SettingsRowDisabled(const SPage* p, int i);
+
 // ---------------------------------------------------------------- H2: pages by component
 // A page belongs to a *component*, not to a window kind: the strip has (float + bar + glass),
 // a glass companion has (float + glass), a plain companion only (float). The tab set of an
@@ -9943,6 +9952,9 @@ static const SRow kRowsFloatDock[] = {
     {L"glassLayer", L"玻璃层", 0, 1, 0, 1, L"开", L"关"},
     {L"color", L"纯色颜色", 0, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
     {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
+    // Only shown while the background *is* a picture (see SettingsRowVisible); its two buttons
+    // open the gallery / add a new picture - there is no numeric value behind it.
+    {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
     {L"pad", L"内边距", 0, 40, 0, 0, nullptr, nullptr},
 };
@@ -9954,6 +9966,8 @@ static const SRow kRowsFloatTray[] = {
     {L"glassLayer", L"玻璃层", -1, 1, 0, 1, L"开", L"关"},
     {L"color", L"纯色颜色", -1, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
     {L"solidOpacity", L"纯色不透明度", -1, 255, 0, 0, nullptr, nullptr},
+    // Same picture row as the strip's (inherits [dock] image= when empty).
+    {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
     {L"pad", L"内边距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
     {L"gap", L"格子间距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
@@ -10086,6 +10100,18 @@ static void PageSet(int i, int v) {
         swprintf_s(buf, L"%d", v);
         if (p->kind != kPageGroupKind)  // group pages persist through GroupSaveFlag
             WritePrivateProfileStringW(p->section.c_str(), row.key, buf, g_iniPath.c_str());
+    }
+
+    // Switching the background to "picture" applies the last picture that was used, so the window
+    // never goes blank just because this section has no `image=` yet (user, 2026-11-21).
+    if (!wcscmp(row.key, L"bgMode") && v == 1 && p->kind != kPageGroupKind) {
+        std::vector<wchar_t> cur(MAX_PATH * 2, 0);
+        GetPrivateProfileStringW(p->section.c_str(), L"image", L"", cur.data(), (DWORD)cur.size(),
+                                 g_iniPath.c_str());
+        if (!cur[0]) {
+            const std::wstring last = GalleryNewest();
+            if (!last.empty()) WriteImagePath(p->section, last);
+        }
     }
 
     switch (p->kind) {
@@ -10263,7 +10289,11 @@ static void SettingsFreeDib() {
 
 static void SettingsResizeForPage() {
     const SPage* p = ActivePage();
-    int rows = p ? p->count : 1;
+    int rows = 0;
+    if (p) {
+        for (int i = 0; i < p->count; i++)
+            if (SettingsRowVisible(p, i)) rows++;
+    }
     if (rows < 1) rows = 1;
     g_setH = kRowsTop + rows * kRowH + 56;
     SettingsFreeDib();
@@ -10272,8 +10302,184 @@ static void SettingsResizeForPage() {
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// ---- picture gallery (H3 image backgrounds) --------------------------------------------
+// The gallery is a plain folder next to dock.ini. We never list or manage it in code: Explorer is
+// the manager (rename/delete/move = the user's own file manager, no UI from us). Only two
+// operations touch it - "+" copies a chosen picture in, and the clock picks one already there.
+static std::wstring GalleryDir() {
+    std::wstring dir = g_iniPath;
+    size_t slash = dir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) dir.resize(slash + 1);
+    else dir.clear();
+    dir += L"backgrounds";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+static bool IsImageFile(const std::wstring& path) {
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = path.substr(dot);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    return ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".bmp" ||
+           ext == L".webp";
+}
+
+// Newest picture in the gallery, or "" when there is none.
+static std::wstring GalleryNewest() {
+    const std::wstring dir = GalleryDir();
+    std::wstring best;
+    ULARGE_INTEGER bestAt{};
+    bestAt.QuadPart = 0;
+    WIN32_FIND_DATAW fd{};
+    const wchar_t* pats[] = {L"\\*.png", L"\\*.jpg", L"\\*.jpeg", L"\\*.bmp", L"\\*.webp"};
+    for (const wchar_t* pat : pats) {
+        HANDLE h = FindFirstFileW((dir + pat).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            ULARGE_INTEGER at{};
+            at.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+            at.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            if (at.QuadPart > bestAt.QuadPart) {
+                bestAt = at;
+                best = dir + L"\\" + fd.cFileName;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return best;
+}
+
+// Copy a picture into the gallery (unless it is already there) and return the gallery path.
+static std::wstring CopyIntoGallery(const std::wstring& src) {
+    const std::wstring dir = GalleryDir();
+    const std::wstring lowerSrc = Lower(src), lowerDir = Lower(dir);
+    if (lowerSrc.rfind(lowerDir, 0) == 0) return src;       // already inside: nothing to do
+    size_t slash = src.find_last_of(L"\\/");
+    std::wstring name = slash == std::wstring::npos ? src : src.substr(slash + 1);
+    std::wstring dst = dir + L"\\" + name;
+    for (int n = 2; n < 100; n++) {
+        if (GetFileAttributesW(dst.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+        size_t dot = name.find_last_of(L'.');
+        wchar_t suffix[16]{};
+        swprintf_s(suffix, L"-%d", n);
+        dst = dir + L"\\" + (dot == std::wstring::npos ? name + suffix
+                                                       : name.substr(0, dot) + suffix + name.substr(dot));
+    }
+    if (!CopyFileW(src.c_str(), dst.c_str(), TRUE)) {
+        DLog(L"gallery: copy %s -> %s failed (%lu)", src.c_str(), dst.c_str(), GetLastError());
+        return src;                                          // still usable in place
+    }
+    DLog(L"gallery: added %s", dst.c_str());
+    return dst;
+}
+
+static bool PickImageFile(HWND owner, const std::wstring& startDir, std::wstring* out) {
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IFileOpenDialog, (void**)&dlg)))
+        return false;
+    COMDLG_FILTERSPEC types[] = {{L"图片", L"*.png;*.jpg;*.jpeg;*.bmp;*.webp"}};
+    dlg->SetFileTypes(1, types);
+    dlg->SetTitle(startDir.empty() ? L"选择背景图片" : L"从图库选择背景图片");
+    if (!startDir.empty()) {
+        IShellItem* folder = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(startDir.c_str(), nullptr, IID_IShellItem,
+                                                  (void**)&folder))) {
+            dlg->SetFolder(folder);
+            folder->Release();
+        }
+    }
+    bool ok = false;
+    if (SUCCEEDED(dlg->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                *out = path;
+                CoTaskMemFree(path);
+                ok = true;
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return ok;
+}
+
+static void WriteImagePath(const std::wstring& section, const std::wstring& path) {
+    WritePrivateProfileStringW(section.c_str(), L"image", path.c_str(), g_iniPath.c_str());
+    DLog(L"image: %s image=%s", section.c_str(), path.c_str());
+}
+
+// "Choose a picture from the gallery" (clock). An empty gallery opens Explorer at the folder so
+// the user can see/manage it - there is nothing to pick yet.
+static void SettingsPickFromGallery() {
+    const SPage* p = ActivePage();
+    if (!p) return;
+    const std::wstring dir = GalleryDir();
+    if (GalleryNewest().empty()) {
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        DLog(L"gallery: empty - opened %s", dir.c_str());
+        return;
+    }
+    std::wstring picked;
+    if (!PickImageFile(g_setWnd, dir, &picked)) return;
+    WriteImagePath(p->section, picked);
+    LoadConfig();
+    SettingsPaint();
+}
+
+// "Add a picture" (+): pick from anywhere, copy it into the gallery, make it the background.
+static void SettingsPickNewImage() {
+    const SPage* p = ActivePage();
+    if (!p) return;
+    std::wstring picked;
+    if (!PickImageFile(g_setWnd, std::wstring(), &picked)) return;
+    WriteImagePath(p->section, CopyIntoGallery(picked));
+    LoadConfig();
+    SettingsPaint();
+}
+
+// A picture row is only meaningful while the background *is* a picture.
+static bool SettingsRowVisible(const SPage* p, int i) {
+    if (!p || i < 0 || i >= p->count) return false;
+    if (wcscmp(p->rows[i].key, L"image")) return true;
+    int bg = 0;
+    if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
+    else bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    return bg == 1;
+}
+
+// Rows that contradict the current background are shown greyed and cannot be switched
+// (user, 2026-11-21: "选中纯色时玻璃层强制改到关并且不能切换" + the same class of dead setting).
+static bool SettingsRowDisabled(const SPage* p, int i) {
+    if (!p || i < 0 || i >= p->count) return false;
+    const wchar_t* key = p->rows[i].key;
+    int bg = 0;
+    if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
+    else bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    if (!wcscmp(key, L"glassLayer")) return bg == 2;        // solid has no glass material
+    if (!wcscmp(key, L"color") || !wcscmp(key, L"solidOpacity")) return bg != 2;
+    if (!wcscmp(key, L"image")) return bg != 1;
+    return false;
+}
+
 static void SettingsPaint() {
     if (!g_setWnd) return;
+    // The visible row set can change while the panel is open (the picture row only exists while
+    // the background *is* a picture), so re-fit the window before drawing - otherwise the last
+    // row gets clipped.
+    {
+        const SPage* pv = ActivePage();
+        int want = 0;
+        if (pv)
+            for (int i = 0; i < pv->count; i++)
+                if (SettingsRowVisible(pv, i)) want++;
+        if (want < 1) want = 1;
+        if (g_setH != kRowsTop + want * kRowH + 56) SettingsResizeForPage();
+    }
     if (!g_setBits) {
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -10317,13 +10523,47 @@ static void SettingsPaint() {
     int y = kRowsTop;
     for (int i = 0; i < p->count; i++) {
         const SRow& row = p->rows[i];
-        DrawTextAlpha(30, y, 330, 46, row.label, 24, 0xF4FFFFFF);
+        if (!SettingsRowVisible(p, i)) continue;      // e.g. the picture row outside image mode
+        const bool dis = SettingsRowDisabled(p, i);
+        DrawTextAlpha(30, y, 330, 46, row.label, 24, dis ? 0x5AFFFFFF : 0xF4FFFFFF);
+        if (!wcscmp(row.key, L"image")) {
+            // The picture row: current file name, then two square buttons - clock = pick from the
+            // gallery, + = add a new picture (and copy it in).
+            std::wstring cur = ImagePathFor(p->section == L"traybar" ? L"traybar" : L"dock");
+            std::wstring name = cur;
+            size_t slash = cur.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) name = cur.substr(slash + 1);
+            if (name.empty()) name = L"（未设置）";
+            if (name.size() > 26) name = name.substr(0, 24) + L"…";
+            DrawTextAlpha(g_setW - 470, y, 300, 46, name, 19, 0xC8FFFFFF);
+            const int bs = 34;
+            RECT clock{g_setW - 156, y + 8, g_setW - 156 + bs, y + 8 + bs};
+            RECT plus{clock.right + 12, y + 8, clock.right + 12 + bs, y + 8 + bs};
+            for (const RECT& b : {clock, plus}) {
+                FillRound(g_setDC, b, 9, 0x30FFFFFF);
+            }
+            // clock glyph: circle + two hands
+            int ccx = (clock.left + clock.right) / 2, ccy = (clock.top + clock.bottom) / 2;
+            for (int a = 0; a < 360; a += 6) {
+                double r = 10.0;
+                SetPixelPremul(ccx + (int)(r * cos(a * 3.14159265 / 180)),
+                               ccy + (int)(r * sin(a * 3.14159265 / 180)), 0xE0FFFFFF);
+            }
+            DrawLine(ccx, ccy, ccx, ccy - 6, 2, 0xFFFFFFFF);
+            DrawLine(ccx, ccy, ccx + 5, ccy + 2, 2, 0xFFFFFFFF);
+            // plus glyph
+            int pcx = (plus.left + plus.right) / 2, pcy = (plus.top + plus.bottom) / 2;
+            DrawLine(pcx - 8, pcy, pcx + 8, pcy, 2, 0xFFFFFFFF);
+            DrawLine(pcx, pcy - 8, pcx, pcy + 8, 2, 0xFFFFFFFF);
+            y += kRowH;
+            continue;
+        }
         const bool isChoiceRow = (row.choices && row.choiceCount > 0);
         if (!row.isToggle && !isChoiceRow) {
             wchar_t val[32]{};
             if (g_rowVal[i] < 0) wcscpy_s(val, L"继承");
             else swprintf_s(val, L"%d", g_rowVal[i]);
-            DrawTextAlpha(g_setW - 150, y, 120, 46, val, 24, 0xFFFFFFFF);
+            DrawTextAlpha(g_setW - 150, y, 120, 46, val, 24, dis ? 0x5AFFFFFF : 0xFFFFFFFF);
         }
 
         int tx = 370, tw = g_setW - 370 - 170;
@@ -10335,24 +10575,26 @@ static void SettingsPaint() {
             for (int k = 0; k < n; k++) {
                 bool on = (g_rowVal[i] == k);
                 RECT pr{tx + k * seg, ty - 14, tx + (k + 1) * seg - 6, ty + 16};
-                FillRound(g_setDC, pr, 8, on ? 0xFF4C9AFF : 0x30FFFFFF);
+                FillRound(g_setDC, pr, 8, dis ? 0x14FFFFFF : (on ? 0xFF4C9AFF : 0x30FFFFFF));
                 DrawTextAlpha(tx + k * seg + 14, ty - 22, seg - 26, 44, row.choices[k], 19,
-                              on ? 0xFFFFFFFF : 0xC0FFFFFF);
+                              dis ? 0x50FFFFFF : (on ? 0xFFFFFFFF : 0xC0FFFFFF));
             }
         } else if (row.isToggle) {
             int half = tw / 2;
+            // A disabled toggle always reads "关": that is the only state the window can be in.
+            const int shown = dis ? 0 : g_rowVal[i];
             for (int k = 0; k < 2; k++) {
-                bool on = (g_rowVal[i] == (k == 0 ? 1 : 0));
+                bool on = (shown == (k == 0 ? 1 : 0));
                 RECT pr{tx + k * half, ty - 14, tx + (k + 1) * half - 6, ty + 16};
-                FillRound(g_setDC, pr, 8, on ? 0xFF4C9AFF : 0x30FFFFFF);
+                FillRound(g_setDC, pr, 8, dis ? 0x14FFFFFF : (on ? 0xFF4C9AFF : 0x30FFFFFF));
             }
-            bool leftOn = (g_rowVal[i] == 1);
+            bool leftOn = (shown == 1);
             const wchar_t* lt = row.onText ? row.onText : L"开";
             const wchar_t* rt = row.offText ? row.offText : L"关";
             DrawTextAlpha(tx + 18, ty - 22, half - 30, 44, lt, 20,
-                          leftOn ? 0xFFFFFFFF : 0xC0FFFFFF);
+                          dis ? 0x50FFFFFF : (leftOn ? 0xFFFFFFFF : 0xC0FFFFFF));
             DrawTextAlpha(tx + half + 18, ty - 22, half - 30, 44, rt, 20,
-                          leftOn ? 0xC0FFFFFF : 0xFFFFFFFF);
+                          dis ? 0x90FFFFFF : (leftOn ? 0xC0FFFFFF : 0xFFFFFFFF));
         } else {
             FillRound(g_setDC, RECT{tx, ty, tx + tw, ty + 6}, 3, 0x40FFFFFF);
             double frac = (row.maxv > row.minv)
@@ -10361,8 +10603,9 @@ static void SettingsPaint() {
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
             int px = tx + (int)(frac * tw);
-            FillRound(g_setDC, RECT{tx, ty, px, ty + 6}, 3, 0xFF4C9AFF);
-            FillRound(g_setDC, RECT{px - 8, ty - 5, px + 8, ty + 11}, 8, 0xFFFFFFFF);
+            FillRound(g_setDC, RECT{tx, ty, px, ty + 6}, 3, dis ? 0x30FFFFFF : 0xFF4C9AFF);
+            FillRound(g_setDC, RECT{px - 8, ty - 5, px + 8, ty + 11}, 8,
+                      dis ? 0x40FFFFFF : 0xFFFFFFFF);
         }
         y += kRowH;
     }
@@ -10377,17 +10620,32 @@ static void SettingsPaint() {
 static int RowAt(int y) {
     const SPage* p = ActivePage();
     if (!p) return -1;
-    int start = kRowsTop;
-    if (y < start || y >= kRowsTop + p->count * kRowH) return -1;
-    int i = (y - start) / kRowH;
-    return (i >= 0 && i < p->count) ? i : -1;
+    int yy = kRowsTop;
+    for (int i = 0; i < p->count; i++) {
+        if (!SettingsRowVisible(p, i)) continue;      // hidden rows take no space either
+        if (y >= yy && y < yy + kRowH) return i;
+        yy += kRowH;
+    }
+    return -1;
 }
 
 static void RowFromX(int i, int x) {
     const SPage* p = ActivePage();
     if (!p || i < 0 || i >= p->count) return;
     const SRow& row = p->rows[i];
+    if (SettingsRowDisabled(p, i)) return;        // greyed rows are not clickable on purpose
     int tx = 370, tw = g_setW - 370 - 170;
+    if (!wcscmp(row.key, L"image")) {
+        // The two buttons of the picture row: clock = gallery, + = add a new picture.
+        int y = kRowsTop;
+        for (int k = 0; k < i; k++)
+            if (SettingsRowVisible(p, k)) y += kRowH;
+        const int bs = 34;
+        const int clockL = g_setW - 156, plusL = clockL + bs + 12;
+        if (x >= clockL && x < clockL + bs) SettingsPickFromGallery();
+        else if (x >= plusL && x < plusL + bs) SettingsPickNewImage();
+        return;
+    }
     if (row.choices && row.choiceCount > 0) {
         const int n = row.choiceCount;
         const int seg = tw / n;

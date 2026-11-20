@@ -35,9 +35,11 @@
 > 工作目录已从 `common_workspace` 改名为 `fly_bar`（`C:\Users\20979\RP_Projects\fly_bar\`），
 > 文档里的旧路径已全部改过来。
 
-> **接下来（按顺序）**：①H2（设置按组件重构）—— 决策已全部拍板，见 `PLAN_COMPONENTS.md` §2/§7；
-> ②`PLAN_COMPONENTS.md` §3.4 那两条（玻璃页"拖动时是否更新背景"、玻璃改成"处理层"+图片背景）
-> 还等 A9/A10 三个小问题；③§3.16 末尾那条"任务栏偶发露头"的 mod 修改**等用户 Compile**。
+> **进度（2026-11-20 21:4x）**：H2a、H2b 已完成；H3 的第一步（共享抓图管道 `BakeGlass()` + 浮窗真玻璃 +
+> 每帧预算 `captureBudgetMs`）也已完成并验证 —— **当前状态看 §3.23**。
+> **接下来（按顺序）**：①H3c（拖动时的"冻结全工作区快照" + `dragNoCapture`）；②`bgMode=图片`；
+> ③`PLAN_COMPONENTS.md` §3.4 的 A10 三个小问题（玻璃层 vs 图片背景的正交关系）；
+> ④§3.16 末尾那条"任务栏偶发露头"的 mod 修改**等用户 Compile**。
 
 ---
 
@@ -1048,7 +1050,7 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 **用户 2026-11-17 17:2x 拍板（这次问了 6 个，全部按推荐选项）：**
 1. 组的淡出距离 → 量到 **组成员外接矩形 + margin**（= 画组框那圈）；
 2. 我们自己的弹窗（宫格/设置/菜单/缩略图）→ **算"在组里"，整组保持全亮**；
-3. ackground=solid → **给一个不透明度滑杆，默认 92%**（不搞完全不透明）；
+3. background=solid → **给一个不透明度滑杆，默认 92%**（不搞完全不透明）；
 4. 数据模型 → **H2 就落地"背景 + 玻璃层"两层**（不是三选一）；
 5. "拖动时是否更新背景" → 放**玻璃页**，关掉 = **沿用冻结的旧底图**（用户选了这个；
    代价是拖动时背景会"粘在窗口上"，已告知并记录在案）；
@@ -1074,20 +1076,20 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - 新增 [dock] bgMode=0|1|2（透过背后 / 图片 / 纯色）、glassLayer=0|1、color=0|1、
   solidOpacity=0..255（默认 235）、dragNoCapture=0|1（H3 用）。
 - material 变成**派生值**：material = (bgMode==0 && glassLayer)，只因为旧绘制路径还认它。
-  迁移：缺 gMode 时按 material 推（1→gMode=0,glassLayer=1；0→gMode=2,glassLayer=0），
+  迁移：缺 bgMode 时按 material 推（1→bgMode=0,glassLayer=1；0→bgMode=2,glassLayer=0），
   所以**现有 profile 的观感完全不变**（本机 material=1 → 透过背后 + 玻璃层开）。
 - [traybar] 的同名键 -1 = 继承 [dock]（CompanionBgMode()/CompanionUsesGlass()）。
 - 打开面板时日志打一行 settings: obj=N group=N -> K page(s): 浮窗 | 图标条 | ...，**页签集合最好的验证入口**。
 
-**H2a 里"只存不生效"的（H2b/H3 接）**：color、solidOpacity、gMode=图片（image= 键还没建）、
+**H2a 里"只存不生效"的（H2b/H3 接）**：color、solidOpacity、bgMode=图片（image= 键还没建）、
 以及浮窗自己的玻璃底（§2.4.3：浮窗的玻璃是 H3 的活，现在选玻璃 = 保持现有 4% 白 + 字形）。
-**gMode/glassLayer 不是占位**：它们真的切换"玻璃路径 vs 纯色/无玻璃路径"（等价于旧 material）。
+**bgMode/glassLayer 不是占位**：它们真的切换"玻璃路径 vs 纯色/无玻璃路径"（等价于旧 material）。
 
 **H2b 待做（用户验完 H2a 再动）**
 1. adeStart/fadeEnd 两行从 图标条 页搬到 组 N 页，值迁到 [group]/[group.N]，
    计量改成 GroupAlphaTarget()：距离 = 到 组成员外接矩形 + margin，组内成员（含条）共用一个 alpha；
    我们自己的弹窗算"在组里"（保持全亮）。**这条会顺带改掉条的淡出手感**（距离基准从"条自身"变成"组框"）。
-2. 浮窗的 color/solidOpacity 真绘制；gMode=图片 的界面入口（文件选择框仍留 H3）。
+2. 浮窗的 color/solidOpacity 真绘制；bgMode=图片 的界面入口（文件选择框仍留 H3）。
 3. dragNoCapture（拖动时是否更新背景）接进 H3 的抓图路径。
 ### 3.21 组框"移出再移回之后不显示"（2026-11-20 20:5x）
 
@@ -1134,9 +1136,79 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - 不透明度下限夹到 3，否则整块 alpha 0 会让窗口不可点（layered 按 alpha 命中，老坑）。
 
 **还没做（下一步/H3）**
-- 条自己的 gMode=solid（[dock]）：现在等于"无玻璃 = 透明"，没有实心块；要画实心块得改 Paint() 的底色。
-- gMode=图片（image= 键 + 文件选择框）仍只有界面占位。
+- 条自己的 `bgMode=solid`（[dock]）：现在等于"无玻璃 = 透明"，没有实心块 → 2026-11-20 21:2x 已补上（`337a7e4`）。
+- `bgMode=图片`（image= 键 + 文件选择框）仍只有界面占位（见 §3.23 末尾"H3 剩下"）。
 - dragNoCapture（拖动时不更新背景，用户选了"沿用冻结旧底图"）要等 H3 的抓图路径。
+### 3.23 H3a 落地（2026-11-20 21:2x–21:4x）：抓图管道共享 + 托盘浮窗真的有玻璃
+
+> 上一节"还没做"里的第一条（条的实心块）已经在 `337a7e4` 里补完了；本节是 H3 的第一步。
+
+**① 一份管道、每个窗口一份烘焙（PLAN_COMPONENTS.md §3 的骨架）**
+- 新增 `struct GlassTarget`（`bmp/bits/w/h/origin/valid/marginUsed/at/lastMs/dirty`）：一个玻璃窗口
+  "带边距、已经模糊+上色"的图。条 = `g_stripGlass`；浮窗 = `Companion::glass`。
+- 原来 `CaptureBackdrop()` 里的 300 行搬进 `BakeGlass(t, winRect, margin, tag)`：
+  抓（PrintWindow 或屏幕回读）→ 裁剪 → 降采样 → 模糊 → 升采样 → lift/tint/opacity，全部按 `tag` 打日志
+  （`bake[strip]: ...` / `bake[companion]: ...`）。
+- 返回三态 `BakeResult`：`kBakeOk` / `kBakeFailed`（保留旧图）/ `kBakeNoBudget`（这次跳过，下帧再来）。
+  ⛔ **失败必须清掉 dirty**（老代码就是 `g_bakeDirty = false; return;`）：否则每帧重试一次 15 ms 抓图。
+  因预算被跳过则**必须保留 dirty**，否则这张图要等下一个 captureHz 才补。
+- 条自己的 `CaptureBackdrop()` 只剩"算边距 + 调 BakeGlass"（拖动 256 / 静止 64），行为不变。
+
+**② 抓图时排除我们**所有**窗口（不只是正在被烤的那一个）**
+- `IsOurWindow()` / `CollectOurWindows()`：条、浮窗、宫格、缩略图、设置面板、菜单、背景层。
+- `GrabScreenExcluding(list, ...)` 一次给所有可见窗口打 `WDA_EXCLUDEFROMCAPTURE`，抓完立刻撤回。
+  只排一个的话，两扇互相压着的玻璃会把**对方的玻璃**拍进自己的底图，而且是永久性错误（每次都拍错版本）。
+- 没有我们窗口可见时直接抓（不打标记）；拿不到 exclusion 标记的老系统：条退回"藏一下再抓"（仍 500 ms 限流），
+  浮窗直接放弃这次抓图（藏它会闪，看不见的抓图不如不抓）。
+
+**③ 浮窗（托盘三合一）现在真的有玻璃**
+- `[traybar] bgMode=透过背后 + glassLayer=开`（缺省 = 继承 `[dock]`）时，`TrayRepaint()` 在 4% 底洗之上用
+  `CompanionPaintGlass()` 把烘焙图按圆角覆盖 + 边缘光贴上去（`EnsureFloatMask` 缓存掩码，形状不变）。
+  底洗保留 ⇒ 第一张图还没到 / 抓不到时仍然可点。**关掉的办法**：`[traybar] glassLayer=0`（回到老观感，已实测）。
+- 命中不变：满覆盖处 alpha=255，整个圆角块都是按钮，图标照旧叠在上面。
+
+**④ 每帧预算 + 只抓看得见的（PLAN §3.3）**
+- `[dock] captureBudgetMs`（默认 8，面板在"玻璃"页）：一帧里**第一张**抓图必做，第二张只有
+  "这一帧还没花到 8 ms"才做 → 两扇窗自然轮流，帧率不掉，玻璃底图刷新率摊薄。
+- `g_bakeBudgetUsedMs` 在 `RenderTick()` 开头清零；条的抓图在 `Paint()` 里，天然先拿预算
+  （浮窗的 `CompanionGlassTick()` 放在 PaintAndPresent **之后**）。
+- `alpha == 0` 的窗口一张都不抓：实测空闲 10 s = `0 repaints / 0 captures`。
+
+**⑤ 移动只重裁，不重抓**
+- 浮窗移动**不再**把玻璃标脏：图是"钉在屏幕上"的，`CompanionGlassTick()` 用新偏移重画（~0.5 ms）。
+- 只有"走出烘焙范围"才重抓；移动中给 **128 px** 边距（`kCompanionMargin`，并粘住 3 s —— 两种尺寸来回切会让
+  DIB 反复重建）。静止仍是 64 px。
+- 效果：拖条时浮窗跟着走，抓图从"每帧一次 ~15 ms"降到"整个拖动几次"。
+
+**实测（本机 1920x1080，captureHz=20，blurRadius=25，lightMode=1）**
+
+| 场景 | 数字 |
+|---|---|
+| 两扇玻璃都可见（指针在组内） | 196 captures/10s（条 110 + 浮窗 88），`paint=15.2ms`，`bake=12.9ms` |
+| 只有条是玻璃（`[traybar] glassLayer=0`） | 155 captures/10s，浮窗 0 次 |
+| 空闲（都淡出） | 0 repaints / 0 captures |
+| 浮窗一张（373x209 静止 / 501x337 移动） | 0–16 ms / 15–31 ms |
+
+**验收（三条都过）**
+- 两扇玻璃同时在场都跟手：截图取样 条身 `#A69D9D` vs 浮窗身 `#A69E9E`（同一套玻璃参数、同一时刻）。
+- 拖动 231 步（~8 s）没有 `stale backdrop snapshot` 行（256 px 边距够用；更长/更快的拖动仍会到那一步 → H3c）。
+- 空闲 CPU 同量级（0 抓图）。
+- 回归：`t_winbtn_taskbar.ps1 -Mode cycle`（9 s）任务栏一直 `y=1078`；`t_groupbox.ps1 -Margin 13` 几何 `True`。
+
+**顺手做的**
+- 部署的 ini 里有一段**重复的 `[dock]`**（末尾 `x=437 y=64`，老残留），已删。`GetPrivateProfile*` 只认第一段，
+  所以之前没出事，但留着会误导人。**面板写值的代码仍可能重复追加同名键，下一轮要修**（写前先删旧键）。
+- 新探针 `dev/t_dock_reload.ps1`：用 EnumWindows 找 `DockStripWindow` 再 post `WM_TIMER 2` 触发重载。
+  这台机器上 `FindWindowW("DockStripWindow")` 从普通权限进程返回 0，别用 FindWindow。
+- 坑：`dev/t_dragperf.ps1` 会**改条的大小**（只恢复位置，不恢复 w/h）。用过它必须重启 dock，
+  否则条变小、按距离算的 alpha 全不对（这一轮就被它坑了一次）。
+
+**还没做（H3 剩下）**
+- H3c：拖动时"一次性抓整个工作区 → 冻结 → 只给正在动的玻璃窗口用"（用户 2026-11-16 拍板的方案），
+  以及 `dragNoCapture=1`（用户 ini 里现在是 1 = 不更新，沿用冻结旧图）。
+- `bgMode=图片`（`image=` 键 + 选图框）仍然只有界面占位。
+- §4.5 的 `WDA_EXCLUDEFROMCAPTURE` 策略复核：现在抓图期间排除的是**所有** dock 窗口（范围比之前更宽）。
+
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -1146,8 +1218,9 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 2. **每帧的重活只在抓图和图标**：`CaptureBackdrop()` 一次 ~8–9 ms（屏幕回读有 ~7 ms 固定开销，
    面积再小也省不了）；`Paint()` 每帧只有 0.37 ms（混色已经烤进烘焙图，圆角/边缘光走缓存的
    `g_covMask`/`g_rimMask`）。**任何"每帧加一点计算"的改动都要先看这个预算。**
-3. **抓图边距是动态的**（`g_bakeMarginUsed`）：静止 = 0（只抓条自己），拖动/拉伸 = 256
-   （靠重新裁剪而不是重抓）。`covered` 是**包含**判定（不是相等），否则拉伸时会每帧重抓 → 闪。
+3. **抓图边距是动态的**（H3 后是 `GlassTarget::marginUsed`，条 = `g_stripGlass.marginUsed`）：
+   静止 = 0（只抓条自己），拖动/拉伸 = 256（靠重新裁剪而不是重抓）。浮窗同理：静止 64 / 移动 128。
+   `covered` 是**包含**判定（不是相等），否则拉伸时会每帧重抓 → 闪。
 4. **透明档的命中测试**：layered 窗口按 **alpha** 判定命中，`Paint()` 在 `noGlass` 下只画图标，
    其余像素 alpha=0 → **空白区域收不到鼠标**。所以：拉伸结束后 `ShrinkToIcons()` 把窗口收成
    "图标+pad"，热区按 pad 内缩（角=两端图标四角、上下带=中间图标上下两方）。
@@ -1233,6 +1306,8 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 | **`t_tray_openclose.ps1`** | 【§3.17】用户报的"托盘开→任务栏收起 / 托盘关→任务栏弹出"那一轮的完整走查：Win×2 归一 → `^` 开 → `^` 关 → 点桌面，每步打印 bar/cloak/浮窗 |
 | **`t_winb_scan.ps1 [-NoScan]`** | 【§3.17】`Win+B` 给不给托盘焦点：带/不带 scan code 各 N 轮，输出成功率 |
 | **`t_tray_watch.ps1 -Clicks -Gap`** | 【§3.17】一边点 `^` 一边 15ms 采样"任务栏 y/cloak + 所有 `TopLevelWindowForOverflowXamlIsland` 窗口（可见性/坐标）+ 前台"，用来抓"浮窗被谁关了/托盘自己又弹出来" |
+| **`t_dock_reload.ps1 [-Delay ms]`** | 【§3.23】改完 ini 让运行中的 dock 重载（EnumWindows 找 `DockStripWindow` → post `WM_TIMER 2`）。这台机器上 `FindWindowW` 从普通权限进程返回 0，所以别用 FindWindow |
+| **`hoverat.ps1 -X -Y -Out -Wait`** | 【§3.23】把光标放到指定点并**回读坐标确认**（`SetCursorPos` 会因 UIPI 静默失败），再截全屏。测玻璃/淡入都用它 |
 
 ---
 

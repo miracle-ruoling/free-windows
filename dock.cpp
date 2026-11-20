@@ -73,7 +73,6 @@ static int g_paintW, g_paintH;
 static HICON HiResIconForPath(const std::wstring& path);
 static void SetPixelPremul(int x, int y, DWORD argb);
 static void DLog(const wchar_t* fmt, ...);
-static HBITMAP g_bakeBmp;
 
 // Profiling helper for "why did the pointer hitch?" (see HANDOVER_NEXT.md §3.19). It is only
 // used by the "slow: ..." log lines, which fire only when something is unexpectedly slow, so
@@ -90,21 +89,41 @@ static double NowMs() {
     return (double)c.QuadPart * 1000.0 / (double)freq;
 }
 static bool g_bakeDirty = true;
-static bool g_bakeValid = false;      // g_bakeBits holds a real capture
-static void* g_bakeBits;
-static int g_bakeW, g_bakeH;
-static DWORD g_bakeTick;
-// The blurred bake is captured with this margin around the strip, so a moving strip can
-// keep reading the same picture at a shifted offset (see CaptureBackdrop).
-static int g_bakeMargin = 256;   // TEMP experiment: fewer re-bakes while dragging
-// Margin actually baked into the current picture. A drag needs the padding (it re-crops the
-// same bake instead of re-grabbing); at rest nothing can move the strip, so only the strip
-// itself is grabbed - which is ~45% cheaper per capture and directly buys snapshot rate.
-static int g_bakeMarginUsed = 0;
 
-static DWORD g_lastCaptureMs = 0;      // cost of the last PrintWindow, in ms
+// ---- H3 (PLAN_COMPONENTS.md §3): one bake pipeline, one target per glass window --------
+// A GlassTarget is the padded, already-blurred-and-tinted picture a glass window draws from.
+// The strip owns g_stripGlass; any other glass window owns one of its own (Companion::glass).
+// Per-window *targets* with a single shared *pipeline* is the whole point of H3: the expensive
+// part (read the screen, blur, tint) exists once, only the cheap crop is per window.
+struct GlassTarget {
+    HBITMAP bmp = nullptr;      // the DIB the pixels live in (owned by this target)
+    void* bits = nullptr;       // ... and its 32bpp top-down pixels
+    int w = 0, h = 0;           // size of the padded picture
+    POINT origin{};             // screen coords of its top-left corner
+    bool valid = false;         // bits holds a real capture (not the neutral fill)
+    int marginUsed = 0;         // padding that was baked in (see g_bakeMargin)
+    DWORD at = 0;               // tick of the last successful bake
+    DWORD lastMs = 0;           // cost of that bake, in ms
+    bool dirty = true;          // a bake is wanted before it may be read
+};
+
+// The blurred bake is captured with this margin around the strip, so a moving strip can
+// keep reading the same picture at a shifted offset (see BakeGlass).
+static int g_bakeMargin = 256;   // TEMP experiment: fewer re-bakes while dragging
+// Margin actually baked into the current picture (GlassTarget::marginUsed). A drag needs the
+// padding (it re-crops the same bake instead of re-grabbing); at rest nothing can move the
+// strip, so only the strip itself is grabbed - ~45% cheaper per capture.
+static GlassTarget g_stripGlass;
+
 static int g_captureCount = 0;         // captures since the last cadence line
-static POINT g_bakeOrigin{};        // screen coords of the bake's top-left
+static DWORD g_lastBakeMs = 0;         // cost of the most recent bake (any window), ms
+// H3 §3.3: a per-frame budget for "start a new capture". Two glass windows both want a
+// backdrop every 1/captureHz; without a budget they would both run inside the same tick and
+// the frame loop would stall for the sum of them. With it, the second one simply waits for a
+// later tick (a glass backdrop is a slow-moving thing - nobody can see 200 vs 216 ms).
+static int g_bakeBudgetUsedMs = 0;
+// H3: the padding a *moving* float window's bake gets (see CompanionGlassTick).
+static const int kCompanionMargin = 128;
 // The glass body (everything before the icons) cached as pixels: while only the icons
 // are animating there is no reason to recompute 160k pixels of glass per frame.
 static std::vector<uint32_t> g_glassCache;
@@ -112,6 +131,7 @@ static int g_glassCacheW = 0, g_glassCacheH = 0;
 static int g_glassCacheOx = -1, g_glassCacheOy = -1;   // snapshot offset it was drawn for
 static bool g_glassCacheValid = false;
 static void CaptureBackdrop();
+static void CompanionGlassTick(DWORD now);   // H3: the float window bakes its own backdrop
 static int g_cachedIconPx;
 static HWND g_gridWnd;            // the "^" panel, built further down
 static bool g_gridVisible = false;
@@ -185,6 +205,10 @@ struct Config {
     int blurRadius = 16;          // blur radius in full-resolution pixels
     int refreshHz = 60;           // how often the strip repaints (0..180)
     int captureHz = 5;            // how often the backdrop is re-captured (0..refreshHz)
+    // H3 §3.3: how many ms a single frame may spend *starting* captures. The first capture in a
+    // frame is always allowed; a second one only if the frame is still under this budget, so
+    // N glass windows stretch their refresh rate instead of dropping frames.
+    int captureBudgetMs = 8;
     int hoverMs = 160;            // duration of the icon grow/shrink zoom (ms)
     int bakeRefreshMs = 900;
     DWORD tint = 0x99101010;
@@ -362,6 +386,9 @@ static void LoadConfig() {
     g_cfg.captureHz = GetInt(L"dock", L"captureHz", 5);
     if (g_cfg.captureHz < 0) g_cfg.captureHz = 0;
     if (g_cfg.captureHz > g_cfg.refreshHz) g_cfg.captureHz = g_cfg.refreshHz;
+    g_cfg.captureBudgetMs = GetInt(L"dock", L"captureBudgetMs", 8);
+    if (g_cfg.captureBudgetMs < 0) g_cfg.captureBudgetMs = 0;
+    if (g_cfg.captureBudgetMs > 100) g_cfg.captureBudgetMs = 100;
     g_cfg.hoverMs = GetInt(L"dock", L"hoverMs", 160);
     if (g_cfg.hoverMs < 40) g_cfg.hoverMs = 40;
     if (g_cfg.hoverMs > 600) g_cfg.hoverMs = 600;
@@ -2045,8 +2072,8 @@ static void Paint(int w, int h) {
         if (logged < 5) {
             logged++;
             DLog(L"paint: material=%d bake=%p bakeW=%d bakeH=%d w=%d h=%d op=%d tint=%d blur=%d",
-                 g_cfg.material, g_bakeBits, g_bakeW, g_bakeH, w, h, g_cfg.glassOpacity,
-                 g_cfg.tintStrength, g_cfg.blurRadius);
+                 g_cfg.material, g_stripGlass.bits, g_stripGlass.w, g_stripGlass.h, w, h,
+                 g_cfg.glassOpacity, g_cfg.tintStrength, g_cfg.blurRadius);
         }
     }
     // The glass depends on *where* the strip currently sits inside the padded bake, so
@@ -2058,9 +2085,9 @@ static void Paint(int w, int h) {
     } else {
         GetWindowRect(g_hwnd, &wrNow);
     }
-    const int pw = g_bakeW, ph = g_bakeH;
-    int ox = wrNow.left - g_bakeOrigin.x;
-    int oy = wrNow.top - g_bakeOrigin.y;
+    const int pw = g_stripGlass.w, ph = g_stripGlass.h;
+    int ox = wrNow.left - g_stripGlass.origin.x;
+    int oy = wrNow.top - g_stripGlass.origin.y;
     if (pw >= w) {
         if (ox < 0) ox = 0;
         if (ox > pw - w) ox = pw - w;
@@ -2085,7 +2112,8 @@ static void Paint(int w, int h) {
                       ((DWORD)a << 24) | (g_cfg.color ? 0x00FFFFFFu : 0x00000000u));
         }
     } else {
-    if (g_cfg.material == 1 && g_bakeBits && g_bakeW >= w && g_bakeH >= h) {
+    if (g_cfg.material == 1 && g_stripGlass.bits && g_stripGlass.w >= w &&
+        g_stripGlass.h >= h) {
         // baked blur + configurable tint, with a sub-pixel coverage edge so the
         // corners are smooth (no 1-bit region mask)
         double cx = w / 2.0, cy = h / 2.0;
@@ -2100,7 +2128,7 @@ static void Paint(int w, int h) {
         DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF, tb = g_cfg.tint & 0xFF;
         if (g_cfg.lightMode) { tr = tg = tb = 255; }
         // read the padded bake at the offset computed above (see the cache key)
-        const uint32_t* bake = (const uint32_t*)g_bakeBits + (size_t)oy * pw + ox;
+        const uint32_t* bake = (const uint32_t*)g_stripGlass.bits + (size_t)oy * pw + ox;
         // The tint/lift/opacity live in the bake already, so this pass is a copy plus the
         // precomputed per-strip-pixel coverage and rim.
         EnsureStripMasks(w, h, baseRadius);
@@ -3171,6 +3199,16 @@ struct Companion {
     // Per-window style overrides (R4): [traybar] radius/pad/gap. -1 = inherit from [dock],
     // which is the "跟随条样式" default; the plan's "独立样式" hook is exactly this.
     int padOv = -1, gapOv = -1, radiusOv = -1;
+    // H3: this window's own padded backdrop bake (same pipeline as the strip, own pixels).
+    // It is only filled when the window actually draws the glass layer - see CompanionGlassTick.
+    GlassTarget glass;
+    int glassCount = 0;           // bakes done since the last cadence line (it costs real ms)
+    DWORD glassSig = 0;           // glass parameters the current bake was made with
+    // H3: when the window last moved. A moved window only needs the *crop* to follow (the
+    // picture is anchored to the screen, see CompanionPaintGlass), so a move must not trigger
+    // a capture - otherwise following the strip during a drag would re-grab ~15 ms per frame.
+    DWORD glassMovedAt = 0;
+    DWORD glassWideUntil = 0;     // keep the wide bake margin until then (see CompanionGlassTick)
 };
 static Companion g_trayBar;
 
@@ -3187,6 +3225,9 @@ static int CompanionRadiusPercent(const Companion& c) {
 // forward declarations (the state poller repaints, and the painting code is further down)
 static void TrayRepaint(Companion& c);
 static void CompanionPresent(Companion& c);
+// H3: "does this window draw the glass layer?" - defined with the component helpers further
+// down, needed by the paint path above it.
+static bool CompanionUsesGlass(const Companion& c);
 // the group frame (R2) is derived geometry: "the strip + every following companion"
 static struct Group& DefaultGroup();
 static bool GroupBoxRect(Group& g, RECT* out);
@@ -3811,7 +3852,12 @@ static bool CursorInCompanionGroup() {
 static void CompanionSetRect(Companion& c, int x, int y, int w, int h, bool repaint,
                              bool publishAnchor = false) {
     bool sizeChanged = (w != c.rc.right - c.rc.left) || (h != c.rc.bottom - c.rc.top);
+    const bool moved = (c.rc.left != x || c.rc.top != y);
     c.rc = RECT{x, y, x + w, y + h};
+    // H3: a move does *not* invalidate the bake - the picture stays anchored to the desktop and
+    // CompanionGlassTick re-crops it. A resize does (the bake has to cover the new size).
+    if (moved) c.glassMovedAt = GetTickCount();
+    if (sizeChanged) c.glass.dirty = true;
     if (repaint || sizeChanged) CompanionEnsureDib(c, w, h);
     if (repaint) TrayRepaint(c);
     if (IsWindow(c.hwnd)) {
@@ -3890,6 +3936,80 @@ static void CompanionLoad(Companion& c) {
          (int)c.follow, (int)c.enabled);
 }
 
+// ---- H3: the float window's glass ------------------------------------------------------
+// Rounded-rect coverage + rim for a *plain* window (no per-corner animation like the strip),
+// built once per size/radius so the per-frame pass has no sqrt in it.
+static std::vector<BYTE> g_fltCov, g_fltRim;
+static int g_fltW = 0, g_fltH = 0, g_fltR = -1;
+
+static void EnsureFloatMask(int w, int h, int radius) {
+    if (w == g_fltW && h == g_fltH && radius == g_fltR) return;
+    g_fltCov.assign((size_t)w * h, 0);
+    g_fltRim.assign((size_t)w * h, 0);
+    int R = radius;
+    int maxR = (w < h ? w : h) / 2;
+    if (R > maxR) R = maxR;
+    if (R < 0) R = 0;
+    double cx = w / 2.0, cy = h / 2.0, hw = w / 2.0, hh = h / 2.0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            double qx = fabs(x + 0.5 - cx) - (hw - R);
+            double qy = fabs(y + 0.5 - cy) - (hh - R);
+            double ax = qx > 0 ? qx : 0;
+            double ay = qy > 0 ? qy : 0;
+            double inx = qx > qy ? qx : qy;
+            if (inx > 0) inx = 0;
+            double d = sqrt(ax * ax + ay * ay) + inx - R;
+            double cov = 0.5 - d;
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            g_fltCov[(size_t)y * w + x] = (BYTE)(cov * 255);
+            if (d > -2.5) {
+                double e = 1.0 + d / 2.5;
+                if (e > 0) {
+                    DWORD ea = (DWORD)(e * cov * 0.22 * 255);
+                    if (ea > 255) ea = 255;
+                    g_fltRim[(size_t)y * w + x] = (BYTE)ea;
+                }
+            }
+        }
+    }
+    g_fltW = w; g_fltH = h; g_fltR = radius;
+}
+
+// Paint the baked backdrop into the companion's own DIB. The bake is a picture of the desktop
+// with the same lift/tint/opacity the strip uses, so all that is left here is masking it to the
+// rounded rect and adding the rim - the expensive part ran once, in BakeGlass().
+// The offsets are *clamped* rather than refused: a window that slid out of its bake keeps a
+// glass body that lags behind the desktop (exactly what the strip does in the same situation)
+// instead of flashing a different background for the length of a drag.
+static bool CompanionPaintGlass(Companion& c) {
+    const GlassTarget& g = c.glass;
+    if (!g.valid || !g.bits) return false;
+    const int w = c.dibW, h = c.dibH;
+    if (w <= 0 || h <= 0 || g.w < w || g.h < h) return false;
+    int ox = c.rc.left - g.origin.x, oy = c.rc.top - g.origin.y;
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+    if (ox > g.w - w) ox = g.w - w;
+    if (oy > g.h - h) oy = g.h - h;
+    EnsureFloatMask(w, h, RadiusForPercent(w, h, CompanionRadiusPercent(c)));
+    for (int y = 0; y < h; y++) {
+        const uint32_t* src = (const uint32_t*)g.bits + (size_t)(oy + y) * g.w + ox;
+        const BYTE* covRow = &g_fltCov[(size_t)y * w];
+        const BYTE* rimRow = &g_fltRim[(size_t)y * w];
+        for (int x = 0; x < w; x++) {
+            DWORD a = covRow[x];
+            if (!a) continue;
+            // the bake is opaque, so the glass body is too: coverage is the only alpha
+            SetPixelPremul(x, y, (a << 24) | (src[x] & 0x00FFFFFF));
+            DWORD ea = rimRow[x];
+            if (ea) SetPixelPremul(x, y, (ea << 24) | 0x00FFFFFF);
+        }
+    }
+    return true;
+}
+
 static void TrayRepaint(Companion& c) {
     if (!c.hwnd || !c.bits) return;
 
@@ -3926,6 +4046,10 @@ static void TrayRepaint(Companion& c) {
     }
     FillRound(c.dc, all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
               bgFill);
+    // H3: with the glass layer on, the baked backdrop replaces the wash as the background. It
+    // lands on top of the fill, so the fill is still the clickable area while the first bake
+    // is missing (and the wash is invisible anyway).
+    if (CompanionUsesGlass(c)) CompanionPaintGlass(c);
 
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
@@ -8668,12 +8792,14 @@ static void SyncBackground() {
 //    so there is nothing to flicker), cached for 160 ms
 //  * downscale to 1/4, box-blur twice with a radius capped at 64 (cheap), then
 //    upscale into the draw buffer
-static void FreeBake() {
-    if (g_bakeBmp) { DeleteObject(g_bakeBmp); g_bakeBmp = nullptr; }
-    g_bakeBits = nullptr;
-    g_bakeW = g_bakeH = 0;
-    g_bakeValid = false;
+static void FreeGlass(GlassTarget& t) {
+    if (t.bmp) { DeleteObject(t.bmp); t.bmp = nullptr; }
+    t.bits = nullptr;
+    t.w = t.h = 0;
+    t.valid = false;
+    t.dirty = true;
 }
+static void FreeBake() { FreeGlass(g_stripGlass); }
 
 static void BoxBlurSmall(std::vector<uint32_t>& v, int w, int h, int radius) {
     if (radius <= 0 || w <= 0 || h <= 0) return;
@@ -8773,6 +8899,25 @@ static int NonBlackPct(const uint32_t* px, int w, int h) {
     return tot ? (int)(n * 100 / tot) : -1;
 }
 
+// Every window this process puts on screen. A backdrop capture must never photograph one of
+// them: with the strip as the only glass window that was just "skip g_hwnd", but as soon as a
+// second glass window exists, the one would end up baked into the other's glass (H3).
+static bool IsOurWindow(HWND h) {
+    if (!h) return false;
+    return h == g_hwnd || h == g_trayBar.hwnd || h == g_gridWnd || h == g_thumbWnd ||
+           h == g_setWnd || h == g_menuHwnd || h == g_bgWnd;
+}
+
+// The list a capture has to keep out of the picture, most important first.
+static int CollectOurWindows(HWND* out, int max) {
+    int n = 0;
+    HWND list[] = {g_hwnd, g_trayBar.hwnd, g_gridWnd, g_thumbWnd, g_setWnd, g_menuHwnd, g_bgWnd};
+    for (HWND h : list) {
+        if (h && IsWindowVisible(h) && n < max) out[n++] = h;
+    }
+    return n;
+}
+
 static HWND WindowUnderUs(const RECT& wr) {
     struct Ctx {
         const RECT* wr;
@@ -8781,7 +8926,7 @@ static HWND WindowUnderUs(const RECT& wr) {
     EnumWindows(
         [](HWND h, LPARAM lp) -> BOOL {
             auto* c = reinterpret_cast<Ctx*>(lp);
-            if (h == g_hwnd || !IsWindowVisible(h) || IsIconic(h)) return TRUE;
+            if (IsOurWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return TRUE;
             // A closed UWP/app window usually stays WS_VISIBLE and is only *cloaked* by
             // DWM. PrintWindow on one still renders its last frame, which is how a closed
             // Settings page kept showing up inside the glass: it was picked as "the window
@@ -8814,8 +8959,14 @@ static HWND WindowUnderUs(const RECT& wr) {
 // PrintWindow cannot render) and nothing on screen changes, so no flicker.
 // Older systems do not support it: there we hide the window for the grab, which
 // costs a possible one-frame blink but only on machines without the flag.
-static bool GrabScreenUnderUs(std::vector<uint32_t>& out, int w, int h, POINT origin) {
-    if (!g_hwnd || w <= 0 || h <= 0) return false;
+//
+// H3: it is now *every* window of ours, not just the one being baked. Two glass windows
+// overlap all the time (the float window sits under the strip); excluding only the one being
+// captured would bake the other one's glass into the picture it shows, and the error would be
+// permanent (each bake would re-photograph the wrong copy).
+static bool GrabScreenExcluding(const HWND* exclude, int nExclude, std::vector<uint32_t>& out,
+                                int w, int h, POINT origin) {
+    if (w <= 0 || h <= 0) return false;
 
     // one reusable DIB: creating it per grab was most of the cost
     static HDC mdc = nullptr;
@@ -8842,12 +8993,23 @@ static bool GrabScreenUnderUs(std::vector<uint32_t>& out, int w, int h, POINT or
     }
     if (!bmp || !bits) return false;
 
-    BOOL excluded = SetWindowDisplayAffinity(g_hwnd, WDA_EXCLUDEFROMCAPTURE);
+    HWND applied[8];
+    int nApplied = 0;
+    bool excluded = true;
+    for (int i = 0; i < nExclude && i < 8; i++) {
+        if (!SetWindowDisplayAffinity(exclude[i], WDA_EXCLUDEFROMCAPTURE)) { excluded = false; break; }
+        applied[nApplied++] = exclude[i];
+    }
     if (!excluded) {
+        for (int i = 0; i < nApplied; i++) SetWindowDisplayAffinity(applied[i], WDA_NONE);
+        nApplied = 0;
         // Without the capture-exclusion flag the only way to keep ourselves out of the
         // picture is to hide the window for the grab. That is a visible blink, so it was
         // fine at 3 grabs/s and is not fine now that the snapshot refreshes 25-30x/s:
-        // rather than flicker, keep the previous bake until the next slow moment.
+        // rather than flicker, keep the previous bake until the next slow moment. Only the
+        // strip can do that (it is the window the picture is for); a companion would blink,
+        // and skipping its capture is better than a capture nobody can look at.
+        if (nExclude <= 0 || exclude[0] != g_hwnd) return false;
         static DWORD lastHideGrab = 0;
         DWORD t = GetTickCount();
         if (lastHideGrab && t - lastHideGrab < 500) return false;
@@ -8859,8 +9021,8 @@ static bool GrabScreenUnderUs(std::vector<uint32_t>& out, int w, int h, POINT or
     bool ok = BitBlt(mdc, 0, 0, w, h, screen, origin.x, origin.y, SRCCOPY | CAPTUREBLT) != 0;
     ReleaseDC(nullptr, screen);
 
-    if (excluded) SetWindowDisplayAffinity(g_hwnd, WDA_NONE);
-    else {
+    for (int i = 0; i < nApplied; i++) SetWindowDisplayAffinity(applied[i], WDA_NONE);
+    if (!excluded) {
         ShowWindow(g_hwnd, SW_SHOWNA);
         Present();
     }
@@ -8873,8 +9035,8 @@ static bool GrabScreenUnderUs(std::vector<uint32_t>& out, int w, int h, POINT or
     static int logged = 0;
     if (logged < 3) {
         logged++;
-        DLog(L"bake: screen grab via %s ok=%d", excluded ? L"capture exclusion" : L"hide/show",
-             (int)ok);
+        DLog(L"bake: screen grab via %s ok=%d (excluded %d window(s))",
+             excluded ? L"capture exclusion" : L"hide/show", (int)ok, nApplied);
     }
     return ok;
 }
@@ -8913,28 +9075,44 @@ struct UnderCache {
 };
 static UnderCache g_underCache;
 
-static void CaptureBackdrop() {
+// H3 §3.3: is there room in this frame for one more capture? The *first* capture of a frame
+// always runs (used = 0); a second one only if the frame is still under the budget. Two glass
+// windows therefore take turns instead of stacking up in the same tick.
+static bool BakeBudgetAllows() {
+    if (g_bakeBudgetUsedMs <= 0) return true;
+    return g_bakeBudgetUsedMs < g_cfg.captureBudgetMs;
+}
+
+// What a BakeGlass() call did. The three cases need different handling by the caller, and the
+// difference matters: a *failed* capture must not be retried every frame (that is a busy loop
+// of 15 ms grabs), while one skipped for the budget *must* be retried on the next frame.
+enum BakeResult {
+    kBakeOk = 0,        // the target now holds a real capture
+    kBakeFailed = 1,    // nothing usable was read; the target kept its previous picture
+    kBakeNoBudget = 2,  // skipped on purpose (H3 §3.3): try again on a later frame
+};
+
+// Read + blur + tint the desktop behind `winRect` into `t`. `margin` pads the capture on every
+// side, so a window that moves a little keeps reading the same picture at a new offset.
+static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, const wchar_t* tag) {
     LARGE_INTEGER bq0{}, bq1{};
     QueryPerformanceCounter(&bq0);
     DWORD bakeT0 = GetTickCount();
-    if (!g_hwnd) return;
-    RECT rc{};
-    GetClientRect(g_hwnd, &rc);
-    int cw = rc.right, ch = rc.bottom;
-    if (cw <= 0 || ch <= 0) return;
-    // wide margin while dragging, tight otherwise (see g_bakeMarginUsed)
+    const int cw = winRect.right - winRect.left, ch = winRect.bottom - winRect.top;
+    if (cw <= 0 || ch <= 0) return kBakeFailed;
+    if (!BakeBudgetAllows()) return kBakeNoBudget;
+    // wide margin while dragging, tight otherwise (the caller knows whether it is moving).
     // A resize grows the window, so the bake has to be big enough that the next few
     // hundred pixels of growth are already inside it - otherwise every frame re-grabs.
     // A *group* drag (board / 屏蔽位移) moves the strip exactly like its own drag does, so it
     // must get the same margin; without it the snapshot was 0 px wide and every frame was
     // painted from a picture that no longer covered the window ("背景抖动", 2026-11-16 14:48).
-    const bool moving = g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling();
-    const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
-    g_bakeMarginUsed = M;
+    const int M = margin;
+    t.marginUsed = M;
     int w = cw + 2 * M, h = ch + 2 * M;
 
-    if (w != g_bakeW || h != g_bakeH || !g_bakeBmp) {
-        FreeBake();
+    if (w != t.w || h != t.h || !t.bmp) {
+        FreeGlass(t);
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = w;
@@ -8943,18 +9121,19 @@ static void CaptureBackdrop() {
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
         HDC screen = GetDC(nullptr);
-        g_bakeBmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &g_bakeBits, nullptr, 0);
+        t.bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &t.bits, nullptr, 0);
         ReleaseDC(nullptr, screen);
-        g_bakeW = w;
-        g_bakeH = h;
+        t.w = w;
+        t.h = h;
     }
-    if (!g_bakeBmp || !g_bakeBits) return;
+    if (!t.bmp || !t.bits) return kBakeFailed;
 
-    RECT wr{};
-    GetWindowRect(g_hwnd, &wr);
-    RECT capR{wr.left - M, wr.top - M, wr.right + M, wr.bottom + M};
-    g_bakeOrigin.x = capR.left;
-    g_bakeOrigin.y = capR.top;
+    RECT capR{winRect.left - M, winRect.top - M, winRect.right + M, winRect.bottom + M};
+    t.origin.x = capR.left;
+    t.origin.y = capR.top;
+    // everything of ours that must not appear in the picture (see GrabScreenExcluding)
+    HWND excl[8];
+    const int nExclude = CollectOurWindows(excl, 8);
 
     // Grab our (padded) rect out of whatever we are covering.
     // Source order matters for cost: reading the composited screen is one BitBlt of the
@@ -8963,12 +9142,12 @@ static void CaptureBackdrop() {
     // can keep a 1940x631 crop of it. The screen grab is also the more truthful source:
     // it is literally what is on screen now (video, UWP, layered widgets and all).
     // PrintWindow still wins in exactly one case: when one of *our own* popups is over the
-    // strip (hover preview, a tray menu, the grid, the settings panel). A screen grab would
+    // window (hover preview, a tray menu, the grid, the settings panel). A screen grab would
     // bake that popup into the glass, while PrintWindow of the window underneath ignores it.
     const bool ownPopup = g_popupOpen || g_menuOpen || g_gridVisible || g_setWnd ||
                           (g_thumbWnd && IsWindowVisible(g_thumbWnd));
     std::vector<uint32_t> fbuf((size_t)w * h, 0xFF202020);
-    HWND under = ownPopup ? WindowUnderUs(wr) : nullptr;
+    HWND under = ownPopup ? WindowUnderUs(capR) : nullptr;
     bool got = false;
     int pwOk = 0;               // PrintWindow's return value
     int grabbed = 0;            // 1 = the fallback screen grab was used
@@ -9063,7 +9242,8 @@ static void CaptureBackdrop() {
             got = true;
             grabbed = 2;               // 2 = reused the cached screen grab
             copied = w * h;
-        } else if (GrabScreenUnderUs(fbuf, w, h, POINT{capR.left, capR.top})) {
+        } else if (GrabScreenExcluding(excl, nExclude, fbuf, w, h,
+                                       POINT{capR.left, capR.top})) {
             got = true;
             grabbed = 1;
             copied = w * h;
@@ -9075,19 +9255,18 @@ static void CaptureBackdrop() {
         }
     }
     if (!got) {
-        if (g_bakeValid) {
+        if (t.valid) {
             static DWORD lastQuiet = 0;
-            DWORD t = GetTickCount();
-            if (t - lastQuiet > 5000) {
-                lastQuiet = t;
-                DLog(L"bake: nothing usable under us (under=%p cls=%s pw=%d) - keeping the "
-                     L"previous bake",
-                     (void*)under, ucls, pwOk);
+            DWORD t2 = GetTickCount();
+            if (t2 - lastQuiet > 5000) {
+                lastQuiet = t2;
+                DLog(L"bake[%s]: nothing usable under us (under=%p cls=%s pw=%d) - keeping "
+                     L"the previous bake",
+                     tag, (void*)under, ucls, pwOk);
             }
-            g_bakeDirty = false;
-            return;
+            return kBakeFailed;
         }
-        // First ever capture and no backdrop: neutral grey so the strip is still
+        // First ever capture and no backdrop: neutral grey so the window is still
         // readable; the next successful capture replaces it.
     }
 
@@ -9142,7 +9321,7 @@ static void CaptureBackdrop() {
 
     // upscale back into the draw buffer: bilinear, otherwise the 4x4 blocks of
     // the quarter-resolution buffer show up as a visible grid at low radii
-    auto* dst = (uint32_t*)g_bakeBits;
+    auto* dst = (uint32_t*)t.bits;
     if (step == 1) {
         // blur off -> step 1: the downscale above was a 1:1 copy and this "bilinear
         // upscale" is an identity, but it still ran a lambda per pixel over the whole
@@ -9189,36 +9368,39 @@ static void CaptureBackdrop() {
         long long sig = (long long)got * 1000000000LL + (long long)pwOk * 100000000LL +
                         (long long)grabbed * 10000000LL + (long long)rWide * 10000 +
                         (long long)w * 100 + h;
-        DWORD t = GetTickCount();
+        DWORD t2 = GetTickCount();
         // `grabbed` is part of the signature and flips between 1 (fresh grab) and 2
         // (cached), so this line used to fire on every capture - and each firing runs
         // DetailScore twice over the whole padded bake. Rate-limit it.
-        if (((sig != lastSig || !got) && t - lastLog > 1500) || t - lastLog > 5000) {
+        if (((sig != lastSig || !got) && t2 - lastLog > 1500) || t2 - lastLog > 5000) {
             lastSig = sig;
-            lastLog = t;
-            DLog(L"bake: under=%p cls=%s got=%d pw=%d grab=%d cover=%d%% under=%dx%d "
+            lastLog = t2;
+            DLog(L"bake[%s]: under=%p cls=%s got=%d pw=%d grab=%d cover=%d%% under=%dx%d "
                  L"size=%dx%d small=%dx%d r=%d crop=%d took=%lu",
-                 (void*)under, ucls, (int)got, pwOk, grabbed, covPct, underW, underH, w, h, sw, sh,
-                 rWide, cacheHits, (unsigned long)(GetTickCount() - bakeT0));
-            DLog(L"bake: pre=%08X post=%08X detail %d -> %d (tint=%d op=%d light=%d)", pre, post,
-                 DetailScore(fbuf.data(), w, h), DetailScore(dst, w, h), g_cfg.tintStrength,
-                 g_cfg.glassOpacity, g_cfg.lightMode);
+                 tag, (void*)under, ucls, (int)got, pwOk, grabbed, covPct, underW, underH, w, h,
+                 sw, sh, rWide, cacheHits, (unsigned long)(GetTickCount() - bakeT0));
+            DLog(L"bake[%s]: pre=%08X post=%08X detail %d -> %d (tint=%d op=%d light=%d)", tag,
+                 pre, post, DetailScore(fbuf.data(), w, h), DetailScore(dst, w, h),
+                 g_cfg.tintStrength, g_cfg.glassOpacity, g_cfg.lightMode);
         }
     }
     if (g_cfg.dumpBake) {
-        SaveBmp(L"dock_bake_pre.bmp", fbuf.data(), w, h);
-        SaveBmp(L"dock_bake_post.bmp", dst, w, h);
+        wchar_t n1[64], n2[64];
+        swprintf_s(n1, L"dock_bake_%s_pre.bmp", tag);
+        swprintf_s(n2, L"dock_bake_%s_post.bmp", tag);
+        SaveBmp(n1, fbuf.data(), w, h);
+        SaveBmp(n2, dst, w, h);
     }
 
     // Lift + tint + glassOpacity are a pure function of this pixel, so they are applied
     // here - once per capture - instead of once per frame in Paint().
     {
         double a = g_cfg.glassOpacity / 255.0;
-        double t = g_cfg.tintStrength / 255.0;
+        double tintK = g_cfg.tintStrength / 255.0;
         DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF,
               tb = g_cfg.tint & 0xFF;
         if (g_cfg.lightMode) { tr = tg = tb = 255; }
-        uint32_t* px = (uint32_t*)g_bakeBits;
+        uint32_t* px = (uint32_t*)t.bits;
         const size_t n = (size_t)w * h;
         for (size_t i = 0; i < n; i++) {
             uint32_t v = px[i];
@@ -9229,9 +9411,9 @@ static void CaptureBackdrop() {
             if (rd < 0) rd = 0; if (rd > 255) rd = 255;
             if (gn < 0) gn = 0; if (gn > 255) gn = 255;
             if (bl < 0) bl = 0; if (bl > 255) bl = 255;
-            double gr = rd * (1 - t) + tr * t;
-            double gg = gn * (1 - t) + tg * t;
-            double gb = bl * (1 - t) + tb * t;
+            double gr = rd * (1 - tintK) + tr * tintK;
+            double gg = gn * (1 - tintK) + tg * tintK;
+            double gb = bl * (1 - tintK) + tb * tintK;
             gr = gr * a + rd * (1 - a);
             gg = gg * a + gn * (1 - a);
             gb = gb * a + bl * (1 - a);
@@ -9239,14 +9421,37 @@ static void CaptureBackdrop() {
         }
     }
 
-    g_bakeTick = GetTickCount();
-    g_lastCaptureMs = GetTickCount() - bakeT0;
+    const DWORD costMs = GetTickCount() - bakeT0;
+    t.at = GetTickCount();
+    t.lastMs = costMs;
+    t.valid = true;
+    t.dirty = false;              // only after a successful capture
+    g_lastBakeMs = costMs;
+    g_bakeBudgetUsedMs += (int)costMs;      // H3 §3.3: the rest of this frame may be out of budget
     g_captureCount++;
     QueryPerformanceCounter(&bq1);
     g_statBake += QpcMs(bq0, bq1);
     g_statBakes++;
-    g_bakeValid = true;
-    g_bakeDirty = false;          // only after a successful capture
+    return kBakeOk;
+}
+
+// Bake the strip's own backdrop. Kept as its own function because two things here are the
+// strip's alone: the margin (a drag re-crops the same picture instead of re-grabbing) and the
+// g_bakeDirty flag the paint path keys off.
+static void CaptureBackdrop() {
+    if (!g_hwnd) return;
+    RECT rc{};
+    GetClientRect(g_hwnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
+    const bool moving = g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling();
+    const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
+    RECT wr{};
+    GetWindowRect(g_hwnd, &wr);
+    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip");
+    // ⛔ A *failed* capture clears the flag even though nothing was captured (the previous
+    // bake is still good). Leaving it set would retry a 15 ms grab on every single frame.
+    // One skipped for the frame budget keeps it set, so the next frame picks it up again.
+    if (r != kBakeNoBudget) g_bakeDirty = false;
 }
 
 static void PaintAndPresent() {
@@ -9347,6 +9552,8 @@ static const SRow kRowsGlass[] = {
     {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
     {L"refreshHz", L"背景刷新帧率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
     {L"captureHz", L"背景截取频率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
+    // H3 §3.3: how much of one frame may be spent starting captures (see Config).
+    {L"captureBudgetMs", L"每帧截取预算 (ms)", 0, 100, 0, 0, nullptr, nullptr},
     // H3: off = keep the frozen backdrop while dragging (the user picked that on 2026-11-17,
     // knowing the background "sticks" to the window for the length of the drag).
     {L"dragNoCapture", L"拖动时不更新背景", 0, 1, 0, 1, L"不更新", L"更新"},
@@ -9924,6 +10131,89 @@ static bool CompanionUsesGlass(const Companion& c) {
     return CompanionBgMode(c) == 0 && layer == 1;      // H3 gives it a real backdrop
 }
 
+// H3: the float window's backdrop refresh. Same rules as the strip (captureHz, a floor of 2x
+// the measured cost, never mid-drag), plus the three things the plan asks for:
+//  * a fully faded-out window costs nothing (alpha 0 -> no capture at all, §3.3.3);
+//  * it draws the frame budget from the same pot as the strip (§3.3.2, see BakeGlass);
+//  * a window smaller than the strip pays proportionally less - its padded rect is ~1/10 of
+//    the strip's area, so the two together stay near the cost of one.
+static void CompanionGlassTick(DWORD now) {
+    Companion& c = g_trayBar;
+    if (!c.hwnd || c.alpha <= 0) return;
+    if (!IsWindowVisible(c.hwnd)) return;
+    if (!CompanionUsesGlass(c)) {
+        c.glass.dirty = false;      // nothing reads it: do not capture for it either
+        return;
+    }
+    // A settings change (reload, colour, blur ...) must not wait for the next natural capture:
+    // the bake has the lift/tint/opacity burned in, so it is wrong until re-made. The signature
+    // is cheap to compare and needs no notification plumbing from the panel.
+    const DWORD sig = g_cfg.tint ^ ((DWORD)g_cfg.tintStrength << 8) ^
+                      ((DWORD)g_cfg.glassOpacity << 16) ^ ((DWORD)g_cfg.blurRadius << 20) ^
+                      ((DWORD)g_cfg.lightMode << 26);
+    if (sig != c.glassSig) {
+        c.glassSig = sig;
+        c.glass.dirty = true;
+    }
+    // "no glass" setting (opacity and tint both 0): the composite would only be a frozen copy
+    if (g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0) return;
+    // A window that moved only needs the *crop* to follow: the bake is anchored to the screen,
+    // so re-painting from the new offset keeps the backdrop still while the window slides over
+    // it. Only leaving the padded bake needs a new capture. This is what makes following the
+    // strip through a drag cheap (a re-crop, ~0.5 ms) instead of a grab per frame (~15 ms).
+    const bool justMoved = c.glassMovedAt != 0;
+    if (justMoved && c.glass.valid && c.bits) {
+        const int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
+        const int ox = c.rc.left - c.glass.origin.x, oy = c.rc.top - c.glass.origin.y;
+        if (ox < 0 || oy < 0 || ox + w > c.glass.w || oy + h > c.glass.h) {
+            c.glass.dirty = true;          // out of the padded bake: one capture is required
+        } else {
+            TrayRepaint(c);
+            CompanionPresent(c);
+        }
+    }
+    c.glassMovedAt = 0;
+    if (g_cfg.captureHz <= 0) return;
+    UINT capMs = (UINT)(1000 / g_cfg.captureHz);
+    if (capMs < 1) capMs = 1;
+    DWORD floorMs = c.glass.lastMs * 2;
+    if (floorMs > capMs) capMs = floorMs;
+    if (!c.glass.dirty && now - c.glass.at < capMs) return;
+    // Never grab mid-drag: a capture blocks the frame, and the picture it would replace is the
+    // same desktop anyway. The bake is marked dirty, so the frame after the drop is fresh.
+    if (c.dragging || c.resizing) {
+        c.glass.dirty = true;
+        return;
+    }
+    // Blur needs pixels around the window to look right. While the window is *moving* the bake
+    // gets a margin, so the next hundred pixels of travel are already inside it and cost a
+    // re-crop instead of a capture; at rest the tight margin is enough (~45 % cheaper per
+    // capture, exactly as on the strip).
+    // 128 px, not the strip's 256: this window is 245x81, so a 128 px margin already makes the
+    // bake 2x2.5 times bigger than the window itself, and it re-bakes every captureHz anyway.
+    // The decision is sticky for a few seconds - flipping between two margins made every bake
+    // resize (and thus re-create) the DIB.
+    const bool movingSoon = justMoved || g_dragging || g_resizeEdge || DefaultGroupBusy() ||
+                            GroupScaling() || (c.glassWideUntil && (LONG)(c.glassWideUntil - now) > 0);
+    const int M = movingSoon ? kCompanionMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
+    if (movingSoon) c.glassWideUntil = now + 3000;
+    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion");
+    if (r == kBakeNoBudget) return;              // another window took this frame's budget
+    if (r == kBakeFailed) {
+        // Nothing usable (or the exclusion flag is missing on this system): wait a normal
+        // capture period before trying again, otherwise every frame retries a failed grab.
+        c.glass.at = now;
+        c.glass.dirty = false;
+        return;
+    }
+    c.glassCount++;
+    // the bake is new -> the pixels in the window are stale
+    if (c.bits) {
+        TrayRepaint(c);
+        CompanionPresent(c);
+    }
+}
+
 // The tab set of an object is the set of components it owns (PLAN_COMPONENTS.md §2.2):
 //   the strip          → 浮窗 + 图标条 + 玻璃(if the glass layer is on) + 组 1
 //   a glass companion  → 浮窗 + 玻璃 + 组 N
@@ -10370,6 +10660,9 @@ static bool AnimateReorder() {
 static void RenderTick() {
         DWORD now = GetTickCount();
         bool dirty = false;
+        // H3 §3.3: the capture budget is per frame. Whoever bakes first in this tick pays for
+        // it; a second bake only runs if the tick is still under [dock] captureBudgetMs.
+        g_bakeBudgetUsedMs = 0;
         // A drag only records where the strip should go (see the WM_MOUSEMOVE branch);
         // the move itself is applied by UpdateLayeredWindow below, together with the new
         // pixels, so the two can never be seen a frame apart.
@@ -10613,18 +10906,18 @@ static void RenderTick() {
             GetWindowRect(g_hwnd, &curR);
             RECT cr{};
             GetClientRect(g_hwnd, &cr);
-            const int M = g_bakeMarginUsed;
+            const int M = g_stripGlass.marginUsed;
             // The bake covers the strip plus M on every side, so a move that stays
             // inside that window needs no new bake at all - just a repaint that
             // reads the same blurred picture at the new offset. The backdrop then
             // stays anchored to the desktop instead of sliding with the strip.
-            int ox = curR.left - g_bakeOrigin.x, oy = curR.top - g_bakeOrigin.y;
+            int ox = curR.left - g_stripGlass.origin.x, oy = curR.top - g_stripGlass.origin.y;
             // Containment, not equality: as long as the window (any size) sits inside the
             // snapshot with its top-left at (ox, oy), the existing picture can be re-cropped
             // and nothing needs grabbing. An equality test re-grabbed on every resize frame.
-            bool covered = g_bakeBits && g_bakeW >= cr.right && g_bakeH >= cr.bottom &&
-                           ox >= 0 && oy >= 0 && ox + cr.right <= g_bakeW &&
-                           oy + cr.bottom <= g_bakeH;
+            bool covered = g_stripGlass.bits && g_stripGlass.w >= cr.right &&
+                           g_stripGlass.h >= cr.bottom && ox >= 0 && oy >= 0 &&
+                           ox + cr.right <= g_stripGlass.w && oy + cr.bottom <= g_stripGlass.h;
             bool captureDue = false;
             // Dragging is a no-capture zone (see below): a real mouse twitches a few
             // pixels when it is clicked, so "hold the strip without moving" counts as a
@@ -10639,10 +10932,10 @@ static void RenderTick() {
             if (g_cfg.captureHz > 0) {
                 UINT capMs = (UINT)(1000 / g_cfg.captureHz);
                 if (capMs < 1) capMs = 1;
-                // A capture costs g_lastCaptureMs. Asking for 65/s used to starve the
+                // A capture costs g_lastBakeMs. Asking for 65/s used to starve the
                 // whole frame loop, so keep at least 2x the measured cost as a gap
                 // whatever the setting says.
-                DWORD floorMs = g_lastCaptureMs * 2;
+                DWORD floorMs = g_stripGlass.lastMs * 2;
                 if (floorMs > capMs) capMs = floorMs;
                 // Never grab mid-drag. A capture is ~15 ms and blocks the frame, and it
                 // also changes what the glass shows in the middle of a drag (visible as a
@@ -10682,6 +10975,10 @@ static void RenderTick() {
             g_renderPos.y = INT_MIN;
         }
 
+        // H3: every *other* glass window bakes here, after the strip has had its turn in this
+        // tick (the strip is the interactive one, so it gets first claim on the budget).
+        CompanionGlassTick(now);
+
         // live evidence for tuning: how many ticks / repaints actually happened
         {
             static DWORD logAt = 0;
@@ -10696,6 +10993,12 @@ static void RenderTick() {
                      L" %lu ms",
                      ticks, paints, g_captureCount, g_companionFollowMoves,
                      (unsigned long)span);
+                // H3: the second glass window is accounted for on its own line, so "glass got
+                // more expensive" can be told apart from "the strip got more expensive".
+                if (g_trayBar.glassCount)
+                    DLog(L"cadence: companion glass: %d bakes, last %lu ms, bake %dx%d",
+                         g_trayBar.glassCount, (unsigned long)g_trayBar.glass.lastMs,
+                         g_trayBar.glass.w, g_trayBar.glass.h);
                 if (g_lostSnapshot)
                     DLog(L"cadence: %d frames were painted out of a stale backdrop snapshot "
                          L"(the drag outran the %d px bake margin)",
@@ -10712,6 +11015,7 @@ static void RenderTick() {
                 g_statGlass = g_statIcons = g_statPresent = g_statBake = 0;
                 g_statPaints = g_statPresents = g_statBakes = 0;
                 g_captureCount = 0;
+                g_trayBar.glassCount = 0;
                 g_companionFollowMoves = 0;
                 g_lostSnapshot = 0;
                 ticks = 0;

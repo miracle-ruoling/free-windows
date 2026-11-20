@@ -513,8 +513,10 @@ static void ArmRepaintTimer(HWND h) {
     if (!g_timerThread) ApplyTimerResolution();
     UINT ms = g_timerThread ? 1000u : RefreshPeriodMs();
     SetTimer(h, 1, ms, nullptr);
-    DLog(L"cadence: refresh=%d Hz (%u ms), capture=%d Hz, hover=%d ms, 1ms timer=%d",
-         g_cfg.refreshHz, ms, g_cfg.captureHz, g_cfg.hoverMs, (int)g_hiResTimer);
+    DLog(L"cadence: refresh=%d Hz (%u ms), capture=%d Hz, hover=%d ms, 1ms timer=%d, "
+         L"capture budget=%d ms",
+         g_cfg.refreshHz, ms, g_cfg.captureHz, g_cfg.hoverMs, (int)g_hiResTimer,
+         g_cfg.captureBudgetMs);
 }
 
 static void CreateDefaultIni() {

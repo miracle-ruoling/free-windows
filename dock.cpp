@@ -2059,8 +2059,55 @@ static void PaintWinButton(const RECT& rc, int size) {
 }
 
 // ---- H3: picture backgrounds (bgMode = image) ------------------------------------------
-// (the bake's blur lives further down the file; the composition here reuses it)
+// The bake's blur lives further down the file; the composition here reuses it
 static void BoxBlurSmall(std::vector<uint32_t>& v, int w, int h, int radius);
+
+// Sliding-window box blur: O(1) per pixel instead of O(radius).
+// BoxBlurSmall() re-sums 2r+1 taps for every pixel, which is fine for a 200x60 bake but was 10 of
+// the 12 ms it took to compose one picture-background frame (radius 12, 71k px, two passes, twice).
+// Edges are extended by clamping, so the result is the same shape as BoxBlurSmall's.
+static void BoxBlurFast(std::vector<uint32_t>& v, int w, int h, int radius) {
+    if (radius <= 0 || w <= 0 || h <= 0) return;
+    std::vector<uint32_t> tmp((size_t)w * h);
+    const long long span = 2 * radius + 1;
+    for (int y = 0; y < h; y++) {
+        const uint32_t* row = &v[(size_t)y * w];
+        long long r = 0, g = 0, b = 0;
+        for (int k = -radius; k <= radius; k++) {
+            int x = k < 0 ? 0 : (k >= w ? w - 1 : k);
+            uint32_t c = row[x];
+            b += c & 0xFF; g += (c >> 8) & 0xFF; r += (c >> 16) & 0xFF;
+        }
+        for (int x = 0; x < w; x++) {
+            tmp[(size_t)y * w + x] = ((uint32_t)(r / span) << 16) | ((uint32_t)(g / span) << 8) |
+                                     (uint32_t)(b / span) | 0xFF000000u;
+            int xo = x - radius; if (xo < 0) xo = 0;
+            int xi = x + radius + 1; if (xi >= w) xi = w - 1;
+            uint32_t co = row[xo], ci = row[xi];
+            b += (long long)(ci & 0xFF) - (co & 0xFF);
+            g += (long long)((ci >> 8) & 0xFF) - ((co >> 8) & 0xFF);
+            r += (long long)((ci >> 16) & 0xFF) - ((co >> 16) & 0xFF);
+        }
+    }
+    for (int x = 0; x < w; x++) {
+        long long r = 0, g = 0, b = 0;
+        for (int k = -radius; k <= radius; k++) {
+            int y = k < 0 ? 0 : (k >= h ? h - 1 : k);
+            uint32_t c = tmp[(size_t)y * w + x];
+            b += c & 0xFF; g += (c >> 8) & 0xFF; r += (c >> 16) & 0xFF;
+        }
+        for (int y = 0; y < h; y++) {
+            v[(size_t)y * w + x] = ((uint32_t)(r / span) << 16) | ((uint32_t)(g / span) << 8) |
+                                   (uint32_t)(b / span) | 0xFF000000u;
+            int yo = y - radius; if (yo < 0) yo = 0;
+            int yi = y + radius + 1; if (yi >= h) yi = h - 1;
+            uint32_t co = tmp[(size_t)yo * w + x], ci = tmp[(size_t)yi * w + x];
+            b += (long long)(ci & 0xFF) - (co & 0xFF);
+            g += (long long)((ci >> 8) & 0xFF) - ((co >> 8) & 0xFF);
+            r += (long long)((ci >> 16) & 0xFF) - ((co >> 16) & 0xFF);
+        }
+    }
+}
 // A picture is decoded once per (path, size) and cached: decoding a 4K PNG on every repaint would
 // cost tens of milliseconds. It is scaled to *cover* the window - aspect ratio kept, the overflow
 // cropped, centred - which is what a wallpaper-like background is supposed to look like.
@@ -2087,15 +2134,37 @@ static std::wstring ImagePathFor(const wchar_t* section) {
     return p;
 }
 
-static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) {
-    im.ok = false;
-    // Remember what was asked for even when it fails: EnsureImage() must not retry a broken path
-    // on every single repaint (a 4K decode attempt per frame is not a debugging aid).
-    im.path = path;
-    im.w = w;
-    im.h = h;
-    im.px.clear();
-    if (path.empty() || w <= 0 || h <= 0) return false;
+// Decode cache: one WIC decode per *picture*, not per size.
+// A 4096x2386 JPEG costs ~10 ms to decode, and a window resize recomposes the picture on every
+// size change - decoding there made a resize-drag stutter. The composition never needs more than a
+// few hundred pixels, so the picture is decoded once and kept downscaled (long side <= 640);
+// composing a new window size is then a couple of milliseconds of sampling.
+static const int kImageSrcMax = 640;
+struct ImageSrc {
+    std::wstring path;
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;      // opaque 0xAARRGGBB, downscaled
+    bool ok = false;
+};
+// One slot per glass window: the strip and the float window may use different pictures.
+static ImageSrc g_imgSrc[2];
+static int g_imgSrcNext = 0;
+
+static bool EnsureImageSrc(const std::wstring& path, ImageSrc** out) {
+    for (ImageSrc& s : g_imgSrc) {
+        if (s.ok && s.path == path) {
+            *out = &s;
+            return true;
+        }
+    }
+    ImageSrc& slot = g_imgSrc[g_imgSrcNext];
+    g_imgSrcNext = (g_imgSrcNext + 1) % 2;
+    slot.ok = false;
+    slot.path.clear();
+    slot.px.clear();
+    slot.w = slot.h = 0;
+
+    const double t0 = NowMs();
     IWICImagingFactory* fac = nullptr;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_IWICImagingFactory, (void**)&fac))) {
@@ -2127,6 +2196,62 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         DLog(L"image: cannot decode %s", path.c_str());
         return false;
     }
+    // downscale so the long side is at most kImageSrcMax (bilinear, aspect kept)
+    const int longSide = sw > sh ? (int)sw : (int)sh;
+    const double k = longSide > kImageSrcMax ? (double)kImageSrcMax / longSide : 1.0;
+    const int dw = (int)(sw * k + 0.5) > 0 ? (int)(sw * k + 0.5) : 1;
+    const int dh = (int)(sh * k + 0.5) > 0 ? (int)(sh * k + 0.5) : 1;
+    slot.px.resize((size_t)dw * dh);
+    for (int y = 0; y < dh; y++) {
+        double fy = (y + 0.5) * sh / dh - 0.5;
+        int y0 = (int)floor(fy);
+        double ty = fy - y0;
+        if (y0 < 0) { y0 = 0; ty = 0; }
+        int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
+        for (int x = 0; x < dw; x++) {
+            double fx = (x + 0.5) * sw / dw - 0.5;
+            int x0 = (int)floor(fx);
+            double tx = fx - x0;
+            if (x0 < 0) { x0 = 0; tx = 0; }
+            int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
+            uint32_t p00 = src[(size_t)y0 * sw + x0], p10 = src[(size_t)y0 * sw + x1];
+            uint32_t p01 = src[(size_t)y1 * sw + x0], p11 = src[(size_t)y1 * sw + x1];
+            const double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty);
+            const double w01 = (1 - tx) * ty, w11 = tx * ty;
+            auto ch = [&](int shift) {
+                double v = (p00 >> shift & 0xFF) * w00 + (p10 >> shift & 0xFF) * w10 +
+                           (p01 >> shift & 0xFF) * w01 + (p11 >> shift & 0xFF) * w11;
+                int iv = (int)(v + 0.5);
+                return (uint32_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+            };
+            slot.px[(size_t)y * dw + x] = 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+        }
+    }
+    slot.path = path;
+    slot.w = dw;
+    slot.h = dh;
+    slot.ok = true;
+    DLog(L"image: decoded %s (%ux%u -> %dx%d) in %.1f ms", path.c_str(), sw, sh, dw, dh,
+         NowMs() - t0);
+    *out = &slot;
+    return true;
+}
+
+static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) {
+    im.ok = false;
+    // Remember what was asked for even when it fails: EnsureImage() must not retry a broken path
+    // on every single repaint (a 4K decode attempt per frame is not a debugging aid).
+    im.path = path;
+    im.w = w;
+    im.h = h;
+    im.px.clear();
+    if (path.empty() || w <= 0 || h <= 0) return false;
+    // decode cache first: a new window size must not decode the JPEG again
+    ImageSrc* cached = nullptr;
+    if (!EnsureImageSrc(path, &cached)) return false;
+    if (cached->w <= 0 || cached->h <= 0) return false;
+    const uint32_t* src = cached->px.data();
+    const int sw = cached->w, sh = cached->h;
     // ---- composition (user spec 2026-11-21) ---------------------------------------------
     // One picture, two layers:
     //   * the whole window is the same picture, cover-scaled, blurred, desaturated and tinted with
@@ -2176,8 +2301,8 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         int radius = (w < h ? w : h) / 8;
         if (radius < 3) radius = 3;
         if (radius > 40) radius = 40;
-        BoxBlurSmall(back, w, h, radius);
-        BoxBlurSmall(back, w, h, radius);
+        BoxBlurFast(back, w, h, radius);
+        BoxBlurFast(back, w, h, radius);
         for (auto& v : back) {
             double rd = (v >> 16) & 0xFF, gn = (v >> 8) & 0xFF, bl = v & 0xFF;
             const double lum = rd * 0.2126 + gn * 0.7152 + bl * 0.0722;
@@ -2193,7 +2318,7 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
     DWORD domR = 0, domG = 0, domB = 0;
     {
         long long r = 0, g = 0, b = 0, n = 0;
-        for (size_t i = 0; i < src.size(); i += 4) {
+        for (size_t i = 0, nSrc = (size_t)sw * sh; i < nSrc; i += 4) {
             uint32_t c = src[i];
             r += (c >> 16) & 0xFF;
             g += (c >> 8) & 0xFF;

@@ -2139,7 +2139,7 @@ static std::wstring ImagePathFor(const wchar_t* section) {
 // size change - decoding there made a resize-drag stutter. The composition never needs more than a
 // few hundred pixels, so the picture is decoded once and kept downscaled (long side <= 640);
 // composing a new window size is then a couple of milliseconds of sampling.
-static const int kImageSrcMax = 640;
+static const int kImageSrcMax = 1024;
 struct ImageSrc {
     std::wstring path;
     int w = 0, h = 0;
@@ -2358,24 +2358,35 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
             // sharp layer with a feathered left edge
             const int px = x - dx, py = y - dy;
             if (px >= 0 && px < sharpW && py >= 0 && py < sharpH) {
-                double fsx = (px + 0.5) / scale - 0.5;
-                double fsy = (py + 0.5) / scale - 0.5;
-                if (fsx < 0) fsx = 0;
-                if (fsy < 0) fsy = 0;
-                if (fsx > (double)sw - 1) fsx = (double)sw - 1;
-                if (fsy > (double)sh - 1) fsy = (double)sh - 1;
-                int x0 = (int)fsx, y0 = (int)fsy;
-                double tx = fsx - x0, ty = fsy - y0;
-                int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
-                int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
-                uint32_t p00 = src[(size_t)y0 * sw + x0], p10 = src[(size_t)y0 * sw + x1];
-                uint32_t p01 = src[(size_t)y1 * sw + x0], p11 = src[(size_t)y1 * sw + x1];
-                const double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty);
-                const double w01 = (1 - tx) * ty, w11 = tx * ty;
+                // ⛔ A big picture shown small with *one* bilinear tap per output pixel averages
+                // only 4 texels out of a much bigger footprint - that is the "sharp picture looks
+                // shrunk-too-small / soft" report (2026-11-21), not a blur. Average the whole
+                // footprint: k x k samples, k = the reduction factor (1 = the plain bilinear case,
+                // i.e. when the window is bigger than the cached picture).
+                int k = (int)(1.0 / scale + 0.5);
+                if (k < 1) k = 1;
+                if (k > 3) k = 3;
+                auto sampleAt = [&](double fsx, double fsy, int shift) {
+                    if (fsx < 0) fsx = 0;
+                    if (fsy < 0) fsy = 0;
+                    if (fsx > (double)sw - 1) fsx = (double)sw - 1;
+                    if (fsy > (double)sh - 1) fsy = (double)sh - 1;
+                    int x0 = (int)fsx, y0 = (int)fsy;
+                    double tx = fsx - x0, ty = fsy - y0;
+                    int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
+                    int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
+                    return ((src[(size_t)y0 * sw + x0] >> shift) & 0xFF) * (1 - tx) * (1 - ty) +
+                           ((src[(size_t)y0 * sw + x1] >> shift) & 0xFF) * tx * (1 - ty) +
+                           ((src[(size_t)y1 * sw + x0] >> shift) & 0xFF) * (1 - tx) * ty +
+                           ((src[(size_t)y1 * sw + x1] >> shift) & 0xFF) * tx * ty;
+                };
                 auto ch = [&](int shift) {
-                    double v = (p00 >> shift & 0xFF) * w00 + (p10 >> shift & 0xFF) * w10 +
-                               (p01 >> shift & 0xFF) * w01 + (p11 >> shift & 0xFF) * w11;
-                    return (int)(v + 0.5);
+                    double sum = 0;
+                    for (int j = 0; j < k; j++)
+                        for (int i = 0; i < k; i++)
+                            sum += sampleAt((px + (i + 0.5) / k) / scale - 0.5,
+                                            (py + (j + 0.5) / k) / scale - 0.5, shift);
+                    return (int)(sum / (k * k) + 0.5);
                 };
                 double a = 1.0;
                 if (px < feather) a = (px + 0.5) / feather;

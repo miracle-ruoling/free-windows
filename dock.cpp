@@ -2074,8 +2074,16 @@ static void Paint(int w, int h) {
                     g_glassCacheOx == ox && g_glassCacheOy == oy;
     if (glassHit) {
         memcpy(g_bits, g_glassCache.data(), (size_t)w * h * 4);
-    } else if (noGlass) {
-        // nothing to draw here: the icons below are the whole strip
+    } else if (noGlass || g_cfg.bgMode == 2) {
+        // H2b: a solid background paints a real slab here; with "behind" (bgMode = 0) and no
+        // glass there is nothing to draw and the icons are the whole strip.
+        if (g_cfg.bgMode == 2) {
+            int a = g_cfg.solidOpacity;
+            if (a < 3) a = 3;
+            if (a > 255) a = 255;
+            FillRound(g_memDC, RECT{0, 0, w, h}, RadiusForPercent(w, h, g_cfg.radius),
+                      ((DWORD)a << 24) | (g_cfg.color ? 0x00FFFFFFu : 0x00000000u));
+        }
     } else {
     if (g_cfg.material == 1 && g_bakeBits && g_bakeW >= w && g_bakeH >= h) {
         // baked blur + configurable tint, with a sub-pixel coverage edge so the

@@ -1209,6 +1209,42 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - `bgMode=图片`（`image=` 键 + 选图框）仍然只有界面占位。
 - §4.5 的 `WDA_EXCLUDEFROMCAPTURE` 策略复核：现在抓图期间排除的是**所有** dock 窗口（范围比之前更宽）。
 
+### 3.24 H3c 落地（2026-11-20 22:1x–22:2x）：拖动时冻结一份整工作区快照
+
+**方案就是用户 2026-11-16 19:4x 拍板的那个**（PLAN_COMPONENTS.md §3.2）：静止各抓各的小块；
+一旦有玻璃窗口开始**动**，抓**一次**整块工作区并冻结，只给"正在动"的窗口用。
+
+- `struct GlassFrozen`（`Local` 于 dock 进程）：`rect`（工作区）、`w/h`、`px`（**原始**桌面，未模糊未上色）。
+- `GlassDragActive()` = 条的拖动/拉伸 ∪ 组拖动(`DefaultGroupBusy`) ∪ 组缩放 ∪ 浮窗自己的拖动/拉伸。
+  `GlassDragTick()` 在 `RenderTick()` 开头跑，管**上升沿**（`FrozenBegin()` 抓一次）和**下降沿**
+  （`FrozenEnd()` + 把两份 bake 标脏，让它们从真实屏幕重烤一次）。
+- `FrozenBegin()`：`dragNoCapture=1` → **不抓**（日志：`drag started with dragNoCapture=1 - no picture taken`）；
+  否则 `GrabScreenExcluding()` 抓整个工作区（**排除我们所有窗口**），实测 **16 ms**（第一次 32 ms，
+  含一次 8 MB 缓冲分配）。
+- `BakeGlass(..., allowFrozen)`：移动中的窗口先试 `FrozenCropInto()`（一次 memcpy）→ 直接省掉 BitBlt；
+  `bake[tag] ... grab=3` 就是"这张来自冻结图"。**裁剪是"求交集"不是"要求全覆盖"**：
+  bake 带 256 px 边距，靠近屏幕边缘时一定越界，越界部分本来就在屏幕外，保持中性灰即可。
+- 两条"不更新"的路径都守住了：
+  - `dragNoCapture=1`（用户的旧选择）：拖动中**一张都不抓**，旧 bake 冻结，玻璃跟着窗口滑（已知代价）；
+  - `dragNoCapture=0`（用户 22:1x 现用）：拖动中只从冻结图重烤（`crop + blur + tint`），**不再有屏幕回读**。
+
+**实测（本机，1920x1080，dragNoCapture=0）**
+- 拖 500 px：冻结图 16 ms 一次，**7 张 bake** 从它读出来（`grab=3`）。
+- 拖 900 px / 3 连拖：每次拖动 1 张冻结图（16/16/32 ms），`no longer covered` 一条都没有。
+- `dragNoCapture=1`：`drag started with dragNoCapture=1 - no picture taken`，拖动中 0 次条抓图。
+- 回归：`t_winbtn_taskbar.ps1 -Mode cycle` 任务栏全程 `y=1078`；`t_groupbox.ps1 -Margin 13` 几何 `True`；
+  拖动中/拖动后条与浮窗都还是玻璃（截图确认）。
+
+**没验证的（要用户的手）**："拖动时底图钉在桌面上、不跟着窗口滑"这个观感。我这台探针拖不动条
+（`SetCursorPos`+`mouse_event` 能让 `g_dragging` 变真、能抓冻结图，但条的窗口不跟手 —— 真鼠标才行；
+组拖动 `t_groupdrag.ps1` 能拖动），所以"手感"这一条只能你亲自拖一下确认。
+
+**新探针**
+- `dev/t_glassdrag.ps1 -Dx -Steps -StepMs -Shot`：拖条的**底部内边距带**（不是图标，也不是边缘）横向来回，
+  净位移 0；`-Shot` 拍拖动中途的全屏。注意：合成输入下条不跟手（见上），组拖动请用 `t_groupdrag.ps1 -Inset 6`。
+- 坑：**测量脚本必须 DPI-aware**。不调 `SetProcessDpiAwarenessContext(-4)` 时 `GetWindowRect` 返回的是
+  虚拟化坐标（793x86 会读成 634x69），我这一轮差点以为把用户的布局改坏了。
+
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**
@@ -1308,6 +1344,7 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 | **`t_tray_watch.ps1 -Clicks -Gap`** | 【§3.17】一边点 `^` 一边 15ms 采样"任务栏 y/cloak + 所有 `TopLevelWindowForOverflowXamlIsland` 窗口（可见性/坐标）+ 前台"，用来抓"浮窗被谁关了/托盘自己又弹出来" |
 | **`t_dock_reload.ps1 [-Delay ms]`** | 【§3.23】改完 ini 让运行中的 dock 重载（EnumWindows 找 `DockStripWindow` → post `WM_TIMER 2`）。这台机器上 `FindWindowW` 从普通权限进程返回 0，所以别用 FindWindow |
 | **`hoverat.ps1 -X -Y -Out -Wait`** | 【§3.23】把光标放到指定点并**回读坐标确认**（`SetCursorPos` 会因 UIPI 静默失败），再截全屏。测玻璃/淡入都用它 |
+| **`t_glassdrag.ps1 -Dx -Steps -Shot`** | 【§3.24】拖条的底部内边距带（不是图标/边缘）横向来回，净位移 0；`-Shot` 拍中途全屏。**合成输入下条不跟手**（真鼠标才行），组拖动用 `t_groupdrag.ps1 -Inset 6` |
 
 ---
 

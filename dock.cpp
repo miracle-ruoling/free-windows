@@ -9085,6 +9085,115 @@ static bool BakeBudgetAllows() {
     return g_bakeBudgetUsedMs < g_cfg.captureBudgetMs;
 }
 
+// ---- H3c: the frozen work-area picture taken when a glass window starts moving -------------
+// The plan (PLAN_COMPONENTS.md §3.2, user decision 2026-11-16 19:4x) is: at rest every glass
+// window grabs only its own small area; the moment one *moves*, the dock takes ONE picture of
+// the whole work area and freezes it, and only the moving window reads from it. That removes
+// the two things a mid-drag screen read costs: the ~15 ms hitch, and a backdrop that jumps
+// between frames (every grab catches a different instant).
+// `dragNoCapture = 1` ("拖动时不更新背景", the user's own choice on 2026-11-17) means the
+// opposite: take no picture at all and run the drag on the old bake.
+struct GlassFrozen {
+    bool valid = false;
+    RECT rect{};                 // screen area it covers (the dragged window's work area)
+    int w = 0, h = 0;
+    DWORD at = 0;
+    std::vector<uint32_t> px;    // raw desktop; blur/tint stay per window
+};
+static GlassFrozen g_frozen;
+static int g_frozenCount = 0;        // frozen pictures taken since the last cadence line
+static int g_frozenHits = 0;         // ... and bakes served out of one
+static DWORD g_frozenTakenMs = 0;    // cost of the last one
+
+static bool AnyGlassWindowOnScreen() {
+    if (g_cfg.material == 1 && g_alpha > 0) return true;
+    if (g_trayBar.hwnd && g_trayBar.alpha > 0 && CompanionUsesGlass(g_trayBar)) return true;
+    return false;
+}
+
+// Copy w x h out of the frozen picture at capR; false when the two do not overlap at all.
+// The overlap is clamped, not required: a bake is padded by up to 256 px, so the padded rect of
+// a window near the screen edge sticks out of the work area - and those pixels are off screen,
+// i.e. they can never be looked at. They simply stay at the neutral fill.
+static bool FrozenCropInto(uint32_t* dst, int w, int h, const RECT& capR) {
+    if (!g_frozen.valid || !dst) return false;
+    RECT ov{};
+    if (!IntersectRect(&ov, &capR, &g_frozen.rect)) return false;
+    const int dx = ov.left - capR.left, dy = ov.top - capR.top;
+    const int sx = ov.left - g_frozen.rect.left, sy = ov.top - g_frozen.rect.top;
+    const int cw = ov.right - ov.left, ch = ov.bottom - ov.top;
+    if (cw <= 0 || ch <= 0) return false;
+    for (int y = 0; y < ch; y++)
+        memcpy(dst + (size_t)(dy + y) * w + dx,
+               &g_frozen.px[(size_t)(sy + y) * g_frozen.w + sx], (size_t)cw * 4);
+    g_frozenHits++;
+    return true;
+}
+
+static void FrozenBegin() {
+    g_frozen.valid = false;      // never read a picture left over from an earlier drag
+    if (g_cfg.dragNoCapture) {
+        static DWORD lastLog = 0;
+        DWORD t = GetTickCount();
+        if (t - lastLog > 5000) {
+            lastLog = t;
+            DLog(L"glass: drag started with dragNoCapture=1 - no picture taken (the old bake "
+                 L"stays frozen, as chosen)");
+        }
+        return;
+    }
+    if (!g_hwnd || !AnyGlassWindowOnScreen()) return;
+    RECT wa = WorkAreaFor(g_hwnd);
+    const int w = wa.right - wa.left, h = wa.bottom - wa.top;
+    if (w <= 0 || h <= 0) return;
+    HWND excl[8];
+    const int nExclude = CollectOurWindows(excl, 8);
+    const DWORD t0 = GetTickCount();
+    // Straight into the buffer that is already allocated: GrabScreenExcluding() assigns into it,
+    // so the 8 MB copy that a fresh vector would cost (3-5 ms on the first drag) only happens once.
+    g_frozen.px.clear();
+    if (!GrabScreenExcluding(excl, nExclude, g_frozen.px, w, h, POINT{wa.left, wa.top})) {
+        DLog(L"glass: could not freeze the work area for this drag (small bakes stay in use)");
+        return;
+    }
+    g_frozen.rect = wa;
+    g_frozen.w = w;
+    g_frozen.h = h;
+    g_frozen.at = GetTickCount();
+    g_frozen.valid = true;
+    g_frozenCount++;
+    g_frozenTakenMs = GetTickCount() - t0;
+    g_bakeBudgetUsedMs += (int)g_frozenTakenMs;      // it is a capture: it counts for this frame
+    DLog(L"glass: froze the work area %dx%d at %ld,%ld for this drag (%lu ms)", w, h,
+         (long)wa.left, (long)wa.top, (unsigned long)g_frozenTakenMs);
+}
+
+static void FrozenEnd() { g_frozen.valid = false; }
+
+// "A glass window is being moved right now" - one predicate, so the frozen picture starts and
+// ends with the gesture instead of every drag path having to remember it.
+static bool GlassDragActive() {
+    return g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling() ||
+           g_trayBar.dragging || g_trayBar.resizing;
+}
+
+// Rising/falling edge of GlassDragActive(): freeze the work area on the way in, drop it on the
+// way out. On release both bakes are marked dirty, because the window now sits somewhere new
+// and its picture is only valid for the position it was grabbed at.
+static void GlassDragTick() {
+    static bool prev = false;
+    const bool active = GlassDragActive();
+    if (active == prev) return;
+    prev = active;
+    if (active) {
+        FrozenBegin();
+    } else {
+        FrozenEnd();
+        g_bakeDirty = true;
+        g_trayBar.glass.dirty = true;
+    }
+}
+
 // What a BakeGlass() call did. The three cases need different handling by the caller, and the
 // difference matters: a *failed* capture must not be retried every frame (that is a busy loop
 // of 15 ms grabs), while one skipped for the budget *must* be retried on the next frame.
@@ -9096,7 +9205,10 @@ enum BakeResult {
 
 // Read + blur + tint the desktop behind `winRect` into `t`. `margin` pads the capture on every
 // side, so a window that moves a little keeps reading the same picture at a new offset.
-static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, const wchar_t* tag) {
+// `allowFrozen` is for windows that are *moving*: they read the frozen work-area picture
+// (H3c) instead of paying for a screen read in the middle of the gesture.
+static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, const wchar_t* tag,
+                            bool allowFrozen = false) {
     LARGE_INTEGER bq0{}, bq1{};
     QueryPerformanceCounter(&bq0);
     DWORD bakeT0 = GetTickCount();
@@ -9149,14 +9261,22 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     const bool ownPopup = g_popupOpen || g_menuOpen || g_gridVisible || g_setWnd ||
                           (g_thumbWnd && IsWindowVisible(g_thumbWnd));
     std::vector<uint32_t> fbuf((size_t)w * h, 0xFF202020);
-    HWND under = ownPopup ? WindowUnderUs(capR) : nullptr;
     bool got = false;
     int pwOk = 0;               // PrintWindow's return value
-    int grabbed = 0;            // 1 = the fallback screen grab was used
+    int grabbed = 0;            // 1 = the fallback screen grab was used, 2 = its cache, 3 = frozen
     int copied = 0;             // pixels actually copied out of the capture
     int cacheHits = 0;          // 1 = re-cropped the cached full-window capture
     int underW = 0, underH = 0;
     wchar_t ucls[64] = L"-";
+    // H3c: a moving window reads the picture that was frozen when the gesture started. This is
+    // both cheaper (a memcpy instead of a BitBlt of the screen) and steadier (the backdrop is
+    // the same instant for every frame of the drag).
+    if (allowFrozen && FrozenCropInto(fbuf.data(), w, h, capR)) {
+        got = true;
+        grabbed = 3;
+        copied = w * h;
+    }
+    HWND under = (!got && ownPopup) ? WindowUnderUs(capR) : nullptr;
     if (under) {
         RECT ur{};
         if (GetWindowRect(under, &ur)) {
@@ -9446,10 +9566,18 @@ static void CaptureBackdrop() {
     GetClientRect(g_hwnd, &rc);
     if (rc.right <= 0 || rc.bottom <= 0) return;
     const bool moving = g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling();
+    // H3c: with "拖动时不更新背景" on, a drag updates nothing at all - the bake stays exactly as
+    // it was and the glass slides along with the window until the button comes back up. That is
+    // the user's pick (2026-11-17): cheaper and predictable, at the cost of the picture "sticking"
+    // to the window for the length of the drag.
+    if (moving && g_cfg.dragNoCapture) {
+        g_bakeDirty = false;
+        return;
+    }
     const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip");
+    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", moving);
     // ⛔ A *failed* capture clears the flag even though nothing was captured (the previous
     // bake is still good). Leaving it set would retry a 15 ms grab on every single frame.
     // One skipped for the frame budget keeps it set, so the next frame picks it up again.
@@ -10199,7 +10327,12 @@ static void CompanionGlassTick(DWORD now) {
                             GroupScaling() || (c.glassWideUntil && (LONG)(c.glassWideUntil - now) > 0);
     const int M = movingSoon ? kCompanionMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
     if (movingSoon) c.glassWideUntil = now + 3000;
-    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion");
+    // H3c: "拖动时不更新背景" - during somebody's drag this window keeps the picture it has.
+    if (movingSoon && g_cfg.dragNoCapture) {
+        c.glass.dirty = false;
+        return;
+    }
+    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", movingSoon);
     if (r == kBakeNoBudget) return;              // another window took this frame's budget
     if (r == kBakeFailed) {
         // Nothing usable (or the exclusion flag is missing on this system): wait a normal
@@ -10665,6 +10798,9 @@ static void RenderTick() {
         // H3 §3.3: the capture budget is per frame. Whoever bakes first in this tick pays for
         // it; a second bake only runs if the tick is still under [dock] captureBudgetMs.
         g_bakeBudgetUsedMs = 0;
+        // H3c: start/stop the frozen work-area picture exactly with the drag. Must run before
+        // any bake in this tick (the frozen grab has to exist before a moving window reads it).
+        GlassDragTick();
         // A drag only records where the strip should go (see the WM_MOUSEMOVE branch);
         // the move itself is applied by UpdateLayeredWindow below, together with the new
         // pixels, so the two can never be seen a frame apart.
@@ -11001,10 +11137,19 @@ static void RenderTick() {
                     DLog(L"cadence: companion glass: %d bakes, last %lu ms, bake %dx%d",
                          g_trayBar.glassCount, (unsigned long)g_trayBar.glass.lastMs,
                          g_trayBar.glass.w, g_trayBar.glass.h);
+                // H3c: the drag-time frozen picture and how much of the glass it served.
+                if (g_frozenCount || g_frozenHits)
+                    DLog(L"cadence: frozen work-area picture: %d taken (last %lu ms), %d bake(s) "
+                         L"read from it",
+                         g_frozenCount, (unsigned long)g_frozenTakenMs, g_frozenHits);
                 if (g_lostSnapshot)
-                    DLog(L"cadence: %d frames were painted out of a stale backdrop snapshot "
-                         L"(the drag outran the %d px bake margin)",
-                         g_lostSnapshot, g_bakeMargin);
+                    DLog(L"cadence: %d frames painted from a backdrop that no longer covered "
+                         L"the strip (%s)",
+                         g_lostSnapshot,
+                         g_cfg.dragNoCapture
+                             ? L"expected: dragNoCapture=1 keeps the old picture by design"
+                             : L"the frozen work-area picture should have covered this; check "
+                               L"that the strip stayed inside the monitor");
                 // per-frame cost, measured with QPC
                 if (g_statPaints > 0) {
                     DLog(L"frame: n=%d paint=%.2fms (glass %.2f + icons %.2f) present=%.2fms"
@@ -11018,6 +11163,8 @@ static void RenderTick() {
                 g_statPaints = g_statPresents = g_statBakes = 0;
                 g_captureCount = 0;
                 g_trayBar.glassCount = 0;
+                g_frozenCount = 0;
+                g_frozenHits = 0;
                 g_companionFollowMoves = 0;
                 g_lostSnapshot = 0;
                 ticks = 0;

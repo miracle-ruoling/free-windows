@@ -1115,6 +1115,28 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 - group N: target -> T (shown=S box=B alpha=A)
 
 **还没做**：H2b（adeStart/fadeEnd 搬到组页 + 组矩形距离 + 浮窗 color/solidOpacity 真绘制）。
+### 3.22 H2b 落地（2026-11-20 21:0x）：距离归组 + 浮窗纯色背景
+
+**① 淡出距离搬到"组"（用户 2026-11-17 拍板：相对"组成员外接 + margin"测算）**
+- Group 新增 adeStart/fadeEnd；[group] / [group.N] 里读写；缺省值**继承 [dock] 的同名键**
+  ⇒ 老 profile 不用改 ini，手感不变。
+- 新增 GroupBounds(g)：**单成员组也成立**的组矩形（成员外接 + margin）；GroupBoxRect() 仍然要求 ≥2 成员
+  （框只画 2 成员以上），两者分工明确。
+- CompanionAlphaTarget() 重写：组内所有成员**共用同一个 alpha**（组 latch shown → 255；
+  否则用**该组自己的** fade 值，量到 GroupBounds）。groupId == 0（不属于任何组）保持旧行为（量到自己、全局值）。
+- UpdateAlpha() 里条自己的 alpha 改成 GroupFadeAlphaForStrip()（默认组的 fade 值 + 组矩形），
+  即"条也按组测算"。**副作用（已告知）**：条开始淡出的距离比"按条自身"大一圈（= margin 的余量）。
+- 面板：完全显示距离 / 完全透明距离 两行从 图标条 页搬到 组 N 页（H2a 的组件矩阵不变）。
+
+**② 浮窗纯色背景真的画出来了（只做了浮窗，条的纯色还没做）**
+- TrayRepaint() 的底层填充：[traybar] bgMode=2（纯色）时用
+  solidOpacity<<24 | (color ? white : black)；否则保持原来的 4% 白洗（= 透过背后 / 玻璃待 H3）。
+- 不透明度下限夹到 3，否则整块 alpha 0 会让窗口不可点（layered 按 alpha 命中，老坑）。
+
+**还没做（下一步/H3）**
+- 条自己的 gMode=solid（[dock]）：现在等于"无玻璃 = 透明"，没有实心块；要画实心块得改 Paint() 的底色。
+- gMode=图片（image= 键 + 文件选择框）仍只有界面占位。
+- dragNoCapture（拖动时不更新背景，用户选了"沿用冻结旧底图"）要等 H3 的抓图路径。
 ## 4. 改代码前必须知道的 12 件事
 
 1. **`presentSync=2`（`Present()` 里 ULW **之前** `DwmFlush()`）不是优化，是正确性修复。**

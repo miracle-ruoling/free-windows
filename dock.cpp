@@ -2746,6 +2746,10 @@ static void UpdateHoverFromCursor() {
 
 static bool CursorInCompanionGroup();   // defined with the companions
 
+// The strip's alpha is the default group's alpha (H2b): distance to the *group* rectangle with
+// the group's own fade distances. Defined after the group code because it needs Group.
+static int GroupFadeAlphaForStrip();
+
 static void UpdateAlpha() {
     // Settings open, or the panel/menu is up: never fade. The strip is part of the
     // interaction while the user is picking from the grid, and the user asked for it
@@ -3895,8 +3899,25 @@ static void TrayRepaint(Companion& c) {
     // hovering/clicking the middle of a speaker would fall straight through to whatever is
     // behind. This wash (4% white, invisible against any wallpaper) makes the whole bar one
     // button, which is exactly what the user asked for ("clicking anywhere opens the menu").
+    // H2: ackground=solid paints a real colour here (its opacity doubles as the clickable
+    // area, so no extra wash is needed). 透过背后 keeps the 4% wash - the glass layer that
+    // would sit on top of the desktop behind it is H3's work.
+    DWORD bgFill = 0x0AFFFFFF;
+    {
+        int bgMode = GetInt(L"traybar", L"bgMode", -1);
+        if (bgMode < 0 || bgMode > 2) bgMode = g_cfg.bgMode;
+        if (bgMode == 2) {
+            int a = GetInt(L"traybar", L"solidOpacity", -1);
+            if (a < 0) a = g_cfg.solidOpacity;
+            if (a > 255) a = 255;
+            int col = GetInt(L"traybar", L"color", -1);
+            if (col < 0) col = g_cfg.color;
+            if (a < 3) a = 3;
+            bgFill = ((DWORD)a << 24) | (col ? 0x00FFFFFFu : 0x00000000u);
+        }
+    }
     FillRound(c.dc, all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
-             0x0AFFFFFF);
+              bgFill);
 
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
@@ -4059,6 +4080,10 @@ struct Group {
     int lineAlpha = 64;
     int lineWidth = 1;
     int radius = 12;
+    // H2b: the fade distances belong to the *group* now (user 2026-11-17), and the distance is
+    // measured to the group's own rectangle. -1 = not loaded yet -> inherit [dock].
+    int fadeStart = -1;
+    int fadeEnd = -1;
     // frame window + fade
     HWND hwnd = nullptr;
     RECT rc{0, 0, 0, 0};         // screen px, empty when there is nothing to frame
@@ -4122,6 +4147,12 @@ static void GroupLoad(Group& g) {
     g.radius = GetInt(sec, L"radius", 12);
     if (g.radius < 0) g.radius = 0;
     if (g.radius > 64) g.radius = 64;
+    // H2b: fade distances per group; the defaults come from [dock] so an existing profile keeps
+    // exactly the feel it had (they used to be global).
+    g.fadeStart = GetInt(sec, L"fadeStart", g_cfg.fadeStart);
+    g.fadeEnd = GetInt(sec, L"fadeEnd", g_cfg.fadeEnd);
+    if (g.fadeStart < 0) g.fadeStart = 0;
+    if (g.fadeEnd <= g.fadeStart) g.fadeEnd = g.fadeStart + 1;
 }
 
 static void GroupSaveFlag(Group& g, const wchar_t* key, bool value) {
@@ -4158,6 +4189,19 @@ static bool GroupBoxMembers(Group& g, RECT* out) {
     if (n < 2) return false;
     *out = m[0].rc;
     for (int i = 1; i < n; i++) UnionRect(out, out, &m[i].rc);
+    return true;
+}
+
+// The group's rectangle even when it holds a single member: the *frame* needs two members (a
+// frame around one window is noise), but the fade distance is measured against the group for
+// every group (H2b), including a one-member one.
+static bool GroupBounds(Group& g, RECT* out) {
+    GroupMember m[kGroupMaxMembers];
+    int n = GroupMembers(g, m);
+    if (n < 1) return false;
+    *out = m[0].rc;
+    for (int i = 1; i < n; i++) UnionRect(out, out, &m[i].rc);
+    InflateRect(out, g.margin, g.margin);
     return true;
 }
 
@@ -4862,21 +4906,58 @@ static void CompanionShowMenu(Companion& c) {
 // only when the pointer leaves the *frame*, so travelling from the strip to a companion through
 // empty space cannot make the companion disappear under the cursor. An independent companion
 // (follow=0) fades with distance like the strip and takes no part in the frame.
-// Per-companion alpha target. A window in the default group fades with the group's latch (the
-// strip is its trigger); anything else - independent (0) or a group of its own (N>1) - has to be
-// reachable to be hovered at all, so it uses the normal distance fade, exactly like the strip.
+// Alpha for one window of a group (H2b): every member of a group shares the group's alpha.
+//   * the group's latch (`shown`) wins: the pointer is on a member, inside the frame or on our
+//     own popup - then everything in the group is fully opaque;
+//   * otherwise the distance to the *group's* rectangle (members union + margin) fades it, using
+//     that group's own fadeStart/fadeEnd. Group 1 (the strip's group) therefore fades with the
+//     group box instead of the strip alone, which is what "距离相对组测算" means.
+// A companion that is in no group (`groupId == 0`) keeps the old behaviour: distance to itself,
+// global distances - it has no group to be measured against.
 static int CompanionAlphaTarget(Companion& c, POINT p) {
     if (!c.enabled) return 0;
-    if (c.groupId == 1) return DefaultGroup().shown ? 255 : 0;
+    Group* g = GroupById(c.groupId);
+    if (g && g->shown) return 255;
+    int fs = g_cfg.fadeStart, fe = g_cfg.fadeEnd;
+    RECT ref = c.rc;
+    if (g) {
+        fs = g->fadeStart >= 0 ? g->fadeStart : g_cfg.fadeStart;
+        fe = g->fadeEnd > fs ? g->fadeEnd : (fs + 1);
+        RECT box{};
+        if (GroupBounds(*g, &box)) ref = box;
+    }
     int dx = 0, dy = 0;
-    if (p.x < c.rc.left) dx = c.rc.left - p.x;
-    else if (p.x > c.rc.right) dx = p.x - c.rc.right;
-    if (p.y < c.rc.top) dy = c.rc.top - p.y;
-    else if (p.y > c.rc.bottom) dy = p.y - c.rc.bottom;
+    if (p.x < ref.left) dx = ref.left - p.x;
+    else if (p.x > ref.right) dx = p.x - ref.right;
+    if (p.y < ref.top) dy = ref.top - p.y;
+    else if (p.y > ref.bottom) dy = p.y - ref.bottom;
     int d = (dx == 0 && dy == 0) ? 0 : (int)sqrt((double)dx * dx + (double)dy * dy);
-    if (d <= g_cfg.fadeStart) return 255;
-    if (d >= g_cfg.fadeEnd) return 0;
-    return 255 - (d - g_cfg.fadeStart) * 255 / (g_cfg.fadeEnd - g_cfg.fadeStart);
+    if (d <= fs) return 255;
+    if (d >= fe) return 0;
+    return 255 - (d - fs) * 255 / (fe - fs);
+}
+
+// The strip's own alpha: the default group's (see above). Falls back to the strip's window rect
+// and the global numbers when the group has no members yet (early start-up).
+static int GroupFadeAlphaForStrip() {
+    Group& g = DefaultGroup();
+    int fs = g.fadeStart >= 0 ? g.fadeStart : g_cfg.fadeStart;
+    int fe = g.fadeEnd > fs ? g.fadeEnd : (fs + 1);
+    POINT p{};
+    if (!GetCursorPos(&p)) return g_alpha;
+    RECT ref{};
+    if (!GroupBounds(g, &ref)) {
+        if (!g_hwnd || !GetWindowRect(g_hwnd, &ref)) return 255;
+    }
+    int dx = 0, dy = 0;
+    if (p.x < ref.left) dx = ref.left - p.x;
+    else if (p.x > ref.right) dx = p.x - ref.right;
+    if (p.y < ref.top) dy = ref.top - p.y;
+    else if (p.y > ref.bottom) dy = p.y - ref.bottom;
+    int d = (dx == 0 && dy == 0) ? 0 : (int)sqrt((double)dx * dx + (double)dy * dy);
+    if (d <= fs) return 255;
+    if (d >= fe) return 0;
+    return 255 - (d - fs) * 255 / (fe - fs);
 }
 
 // Visibility, per group (G2). Group 1 keeps the original rule; a group without the strip latches
@@ -9293,9 +9374,6 @@ static const SRow kRowsBar[] = {
     {L"maxIcon", L"最大图标", 16, 160, 0, 0, nullptr, nullptr},
     {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0, nullptr, nullptr},
     {L"scrollStep", L"滚轮翻页步长", 1, 5, 0, 0, nullptr, nullptr},
-    // These two move to the 组 page in H2b (the group owns the fade distances).
-    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
-    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
 };
 
 // Group page: the frame and its two switches.
@@ -9307,6 +9385,9 @@ static const SRow kRowsGroup[] = {
     {L"radius", L"圆角", 0, 64, 0, 0, nullptr, nullptr},
     {L"blockResize", L"屏蔽缩放", 0, 1, 0, 1, L"屏蔽", L"允许"},
     {L"blockMove", L"屏蔽位移", 0, 1, 0, 1, L"屏蔽", L"允许"},
+    // H2b: the fade distances are the group's (measured to the group's own rectangle).
+    {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
+    {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
 };
 
 static std::vector<SPage> g_pages;
@@ -9338,6 +9419,8 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     if (!wcscmp(key, L"radius")) return g.radius;
     if (!wcscmp(key, L"blockResize")) return g.blockResize ? 1 : 0;
     if (!wcscmp(key, L"blockMove")) return g.blockMove ? 1 : 0;
+    if (!wcscmp(key, L"fadeStart")) return g.fadeStart;
+    if (!wcscmp(key, L"fadeEnd")) return g.fadeEnd;
     return 0;
 }
 
@@ -9496,6 +9579,16 @@ static void PageSet(int i, int v) {
             } else if (!wcscmp(row.key, L"blockMove")) {
                 g->blockMove = v != 0;
                 GroupSaveFlag(*g, L"blockMove", g->blockMove);
+            } else if (!wcscmp(row.key, L"fadeStart") || !wcscmp(row.key, L"fadeEnd")) {
+                // H2b: the fade distances are the group's; they only feed the per-tick alpha
+                // computation, so no repaint is needed here.
+                const bool isStart = !wcscmp(row.key, L"fadeStart");
+                if (isStart) g->fadeStart = v; else g->fadeEnd = v;
+                if (g->fadeEnd <= g->fadeStart) g->fadeEnd = g->fadeStart + 1;
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                swprintf_s(buf, L"%d", isStart ? g->fadeStart : g->fadeEnd);
+                WritePrivateProfileStringW(sec, row.key, buf, g_iniPath.c_str());
             }
             break;
         }

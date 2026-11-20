@@ -2058,6 +2058,168 @@ static void PaintWinButton(const RECT& rc, int size) {
         }
 }
 
+// ---- H3: picture backgrounds (bgMode = image) ------------------------------------------
+// A picture is decoded once per (path, size) and cached: decoding a 4K PNG on every repaint would
+// cost tens of milliseconds. It is scaled to *cover* the window - aspect ratio kept, the overflow
+// cropped, centred - which is what a wallpaper-like background is supposed to look like.
+// The glass layer over a picture is "tint only", no blur: a photo is smooth already, and blurring
+// it would cost a whole bake for nothing anyone can see (PLAN_COMPONENTS.md §3.4 A10).
+struct ImageBg {
+    std::wstring path;
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;      // opaque 0xAARRGGBB, already cover-scaled
+    bool ok = false;
+    DWORD at = 0;
+};
+
+static std::wstring ImagePathFor(const wchar_t* section) {
+    std::vector<wchar_t> b(MAX_PATH * 2, 0);
+    GetPrivateProfileStringW(section, L"image", L"", b.data(), (DWORD)b.size(), g_iniPath.c_str());
+    std::wstring p = b.data();
+    if (p.empty() && wcscmp(section, L"dock") != 0) {
+        // [traybar] has no picture of its own -> inherit the strip's, like every other style key
+        GetPrivateProfileStringW(L"dock", L"image", L"", b.data(), (DWORD)b.size(),
+                                 g_iniPath.c_str());
+        p = b.data();
+    }
+    return p;
+}
+
+static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) {
+    im.ok = false;
+    // Remember what was asked for even when it fails: EnsureImage() must not retry a broken path
+    // on every single repaint (a 4K decode attempt per frame is not a debugging aid).
+    im.path = path;
+    im.w = w;
+    im.h = h;
+    im.px.clear();
+    if (path.empty() || w <= 0 || h <= 0) return false;
+    IWICImagingFactory* fac = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IWICImagingFactory, (void**)&fac))) {
+        DLog(L"image: WIC factory unavailable - picture backgrounds are off");
+        return false;
+    }
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* conv = nullptr;
+    UINT sw = 0, sh = 0;
+    std::vector<uint32_t> src;
+    bool ok = false;
+    if (SUCCEEDED(fac->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                 WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(frame->GetSize(&sw, &sh)) &&
+        SUCCEEDED(fac->CreateFormatConverter(&conv)) &&
+        SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone,
+                                   nullptr, 0, WICBitmapPaletteTypeCustom)) &&
+        sw > 0 && sh > 0) {
+        src.resize((size_t)sw * sh);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, sw * 4, (UINT)src.size() * 4,
+                                        (BYTE*)src.data()));
+    }
+    if (conv) conv->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    fac->Release();
+    if (!ok) {
+        DLog(L"image: cannot decode %s", path.c_str());
+        return false;
+    }
+    // cover: one scale for both axes, the overflow is cropped symmetrically
+    const double sx = (double)w / sw, sy = (double)h / sh;
+    const double sc = sx > sy ? sx : sy;
+    const double cropW = w / sc, cropH = h / sc;      // source pixels that end up visible
+    const double ox = (sw - cropW) / 2.0, oy = (sh - cropH) / 2.0;
+    im.px.resize((size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        double fy = oy + (y + 0.5) * cropH / h - 0.5;
+        int y0 = (int)floor(fy);
+        double ty = fy - y0;
+        int y1 = y0 + 1;
+        if (y0 < 0) { y0 = 0; ty = 0; }
+        if (y1 >= (int)sh) y1 = (int)sh - 1;
+        for (int x = 0; x < w; x++) {
+            double fx = ox + (x + 0.5) * cropW / w - 0.5;
+            int x0 = (int)floor(fx);
+            double tx = fx - x0;
+            int x1 = x0 + 1;
+            if (x0 < 0) { x0 = 0; tx = 0; }
+            if (x1 >= (int)sw) x1 = (int)sw - 1;
+            uint32_t p00 = src[(size_t)y0 * sw + x0], p10 = src[(size_t)y0 * sw + x1];
+            uint32_t p01 = src[(size_t)y1 * sw + x0], p11 = src[(size_t)y1 * sw + x1];
+            const double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty);
+            const double w01 = (1 - tx) * ty, w11 = tx * ty;
+            auto ch = [&](int shift) {
+                double v = (p00 >> shift & 0xFF) * w00 + (p10 >> shift & 0xFF) * w10 +
+                           (p01 >> shift & 0xFF) * w01 + (p11 >> shift & 0xFF) * w11;
+                int iv = (int)(v + 0.5);
+                return (uint32_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+            };
+            im.px[(size_t)y * w + x] = 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+        }
+    }
+    im.path = path;
+    im.w = w;
+    im.h = h;
+    im.ok = true;
+    im.at = GetTickCount();
+    DLog(L"image: loaded %s (%ux%u -> %dx%d cover)", path.c_str(), sw, sh, w, h);
+    return true;
+}
+
+// Load on demand, and reload when the path or the window size changed.
+static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h) {
+    if (im.ok && im.w == w && im.h == h && im.path == path) return true;
+    return LoadImageCover(im, path, w, h);
+}
+
+// One cached picture per glass-capable window (the strip and the float window may differ).
+static ImageBg g_imgStrip, g_imgTray;
+
+// Paint the picture into the current paint target (g_paintBits) through the given coverage/rim
+// masks, with the glass layer's tint applied when it is on. Same maths as the baked glass (lift +
+// tint mix) so a picture background and a "behind" background look like the same material.
+static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov, const BYTE* rim) {
+    if (!im.ok || !g_paintBits) return;
+    const bool glass = g_cfg.glassLayer != 0;
+    const double tintK = glass ? g_cfg.tintStrength / 255.0 : 0.0;
+    DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF, tb = g_cfg.tint & 0xFF;
+    if (g_cfg.lightMode) { tr = tg = tb = 255; }
+    for (int y = 0; y < dstH && y < im.h; y++) {
+        const uint32_t* srcRow = &im.px[(size_t)y * im.w];
+        const BYTE* covRow = cov ? cov + (size_t)y * dstW : nullptr;
+        const BYTE* rimRow = rim ? rim + (size_t)y * dstW : nullptr;
+        for (int x = 0; x < dstW && x < im.w; x++) {
+            const DWORD a = covRow ? covRow[x] : 255;
+            if (!a) continue;
+            uint32_t v = srcRow[x];
+            double rd = (v >> 16) & 0xFF, gn = (v >> 8) & 0xFF, bl = v & 0xFF;
+            if (tintK > 0) {
+                const double lum = rd * 0.2126 + gn * 0.7152 + bl * 0.0722;
+                const double lift = (128.0 - lum) * 0.16;
+                rd += lift; gn += lift; bl += lift;
+                if (rd < 0) rd = 0; if (rd > 255) rd = 255;
+                if (gn < 0) gn = 0; if (gn > 255) gn = 255;
+                if (bl < 0) bl = 0; if (bl > 255) bl = 255;
+                rd = rd * (1 - tintK) + tr * tintK;
+                gn = gn * (1 - tintK) + tg * tintK;
+                bl = bl * (1 - tintK) + tb * tintK;
+            }
+            SetPixelPremul(x, y, (a << 24) | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl);
+            const DWORD ea = rimRow ? rimRow[x] : 0;
+            if (ea) SetPixelPremul(x, y, (ea << 24) | 0x00FFFFFF);
+        }
+    }
+}
+
+// Paint the strip's picture background; false = no usable picture (caller falls back).
+static bool DrawImageBgStrip(int w, int h) {
+    if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h)) return false;
+    EnsureStripMasks(w, h, RadiusFor(w, h));
+    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data());
+    return true;
+}
+
 static void Paint(int w, int h) {
     LARGE_INTEGER q0{}, q1{}, q2{};
     QueryPerformanceCounter(&q0);
@@ -2108,6 +2270,8 @@ static void Paint(int w, int h) {
                     g_glassCacheOx == ox && g_glassCacheOy == oy;
     if (glassHit) {
         memcpy(g_bits, g_glassCache.data(), (size_t)w * h * 4);
+    } else if (g_cfg.bgMode == 1 && DrawImageBgStrip(w, h)) {
+        // H3: picture background (tint applied inside when the glass layer is on)
     } else if (noGlass || g_cfg.bgMode == 2) {
         // H2b: a solid background paints a real slab here; with "behind" (bgMode = 0) and no
         // glass there is nothing to draw and the icons are the whole strip.
@@ -3242,6 +3406,7 @@ static void CompanionPresent(Companion& c);
 // H3: "does this window draw the glass layer?" - defined with the component helpers further
 // down, needed by the paint path above it.
 static bool CompanionUsesGlass(const Companion& c);
+static int CompanionBgMode(const Companion& c);      // 0 behind / 1 picture / 2 solid
 // the group frame (R2) is derived geometry: "the strip + every following companion"
 static struct Group& DefaultGroup();
 static bool GroupBoxRect(Group& g, RECT* out);
@@ -4064,6 +4229,14 @@ static void TrayRepaint(Companion& c) {
     // lands on top of the fill, so the fill is still the clickable area while the first bake
     // is missing (and the wash is invisible anyway).
     if (CompanionUsesGlass(c)) CompanionPaintGlass(c);
+    else if (CompanionBgMode(c) == 1) {
+        // picture background: fill the rounded rect from the cached picture
+        if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH)) {
+            EnsureFloatMask(c.dibW, c.dibH,
+                            RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)));
+            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data());
+        }
+    }
 
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
@@ -9000,6 +9173,8 @@ static HWND WindowUnderUs(const RECT& wr) {
     return ctx.found;
 }
 
+// Cost of the last WDA_EXCLUDEFROMCAPTURE toggle round (two calls per excluded window).
+static DWORD g_lastAffinityMs = 0;
 // Read the screen area we cover while keeping ourselves out of the picture.
 // WDA_EXCLUDEFROMCAPTURE makes the compositor skip our window in captures, so
 // what comes back is the real backdrop (wallpaper, UWP, video - anything that
@@ -9040,23 +9215,49 @@ static bool GrabScreenExcluding(const HWND* exclude, int nExclude, std::vector<u
     }
     if (!bmp || !bits) return false;
 
-    HWND applied[8];
-    int nApplied = 0;
+    // H3 §3.1-4 policy, now narrow on purpose:
+    //  * only the windows that actually overlap the captured rectangle get the flag - excluding
+    //    all of them made the whole dock disappear from *other* programs' screenshots/video
+    //    during every capture, for no benefit;
+    //  * the affinity each window had before is restored, not blindly reset to WDA_NONE;
+    //  * the toggling cost is measured (it is two trips to the compositor per window per grab).
+    struct AffinitySave {
+        HWND h;
+        DWORD prev;
+    };
+    AffinitySave saved[8];
+    int nSaved = 0;
     bool excluded = true;
-    for (int i = 0; i < nExclude && i < 8; i++) {
-        if (!SetWindowDisplayAffinity(exclude[i], WDA_EXCLUDEFROMCAPTURE)) { excluded = false; break; }
-        applied[nApplied++] = exclude[i];
+    const DWORD tAff0 = GetTickCount();
+    for (int i = 0; i < nExclude && nSaved < 8; i++) {
+        RECT r{};
+        if (!GetWindowRect(exclude[i], &r)) continue;
+        if (r.right <= origin.x || r.left >= origin.x + w || r.bottom <= origin.y ||
+            r.top >= origin.y + h)
+            continue;                     // not in the picture at all: leave it untouched
+        DWORD prev = WDA_NONE;
+        GetWindowDisplayAffinity(exclude[i], &prev);
+        if (!SetWindowDisplayAffinity(exclude[i], WDA_EXCLUDEFROMCAPTURE)) {
+            excluded = false;
+            break;
+        }
+        saved[nSaved].h = exclude[i];
+        saved[nSaved].prev = prev;
+        nSaved++;
     }
     if (!excluded) {
-        for (int i = 0; i < nApplied; i++) SetWindowDisplayAffinity(applied[i], WDA_NONE);
-        nApplied = 0;
+        for (int i = 0; i < nSaved; i++) SetWindowDisplayAffinity(saved[i].h, saved[i].prev);
+        nSaved = 0;
         // Without the capture-exclusion flag the only way to keep ourselves out of the
         // picture is to hide the window for the grab. That is a visible blink, so it was
         // fine at 3 grabs/s and is not fine now that the snapshot refreshes 25-30x/s:
         // rather than flicker, keep the previous bake until the next slow moment. Only the
         // strip can do that (it is the window the picture is for); a companion would blink,
         // and skipping its capture is better than a capture nobody can look at.
-        if (nExclude <= 0 || exclude[0] != g_hwnd) return false;
+        bool stripInList = false;
+        for (int i = 0; i < nExclude; i++)
+            if (exclude[i] == g_hwnd) stripInList = true;
+        if (!stripInList) return false;
         static DWORD lastHideGrab = 0;
         DWORD t = GetTickCount();
         if (lastHideGrab && t - lastHideGrab < 500) return false;
@@ -9068,11 +9269,12 @@ static bool GrabScreenExcluding(const HWND* exclude, int nExclude, std::vector<u
     bool ok = BitBlt(mdc, 0, 0, w, h, screen, origin.x, origin.y, SRCCOPY | CAPTUREBLT) != 0;
     ReleaseDC(nullptr, screen);
 
-    for (int i = 0; i < nApplied; i++) SetWindowDisplayAffinity(applied[i], WDA_NONE);
+    for (int i = 0; i < nSaved; i++) SetWindowDisplayAffinity(saved[i].h, saved[i].prev);
     if (!excluded) {
         ShowWindow(g_hwnd, SW_SHOWNA);
         Present();
     }
+    g_lastAffinityMs = GetTickCount() - tAff0;
 
     if (ok) {
         auto* src = (uint32_t*)bits;
@@ -9082,8 +9284,9 @@ static bool GrabScreenExcluding(const HWND* exclude, int nExclude, std::vector<u
     static int logged = 0;
     if (logged < 3) {
         logged++;
-        DLog(L"bake: screen grab via %s ok=%d (excluded %d window(s))",
-             excluded ? L"capture exclusion" : L"hide/show", (int)ok, nApplied);
+        DLog(L"bake: screen grab via %s ok=%d (excluded %d of %d window(s), %lu ms)",
+             excluded ? L"capture exclusion" : L"hide/show", (int)ok, nSaved, nExclude,
+             (unsigned long)g_lastAffinityMs);
     }
     return ok;
 }

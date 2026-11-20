@@ -2059,6 +2059,8 @@ static void PaintWinButton(const RECT& rc, int size) {
 }
 
 // ---- H3: picture backgrounds (bgMode = image) ------------------------------------------
+// (the bake's blur lives further down the file; the composition here reuses it)
+static void BoxBlurSmall(std::vector<uint32_t>& v, int w, int h, int radius);
 // A picture is decoded once per (path, size) and cached: decoding a 4K PNG on every repaint would
 // cost tens of milliseconds. It is scaled to *cover* the window - aspect ratio kept, the overflow
 // cropped, centred - which is what a wallpaper-like background is supposed to look like.
@@ -2125,12 +2127,22 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         DLog(L"image: cannot decode %s", path.c_str());
         return false;
     }
-    // cover: one scale for both axes, the overflow is cropped symmetrically
+    // ---- composition (user spec 2026-11-21) ---------------------------------------------
+    // One picture, two layers:
+    //   * the whole window is the same picture, cover-scaled, blurred, desaturated and tinted with
+    //     its own dominant colour (so the left side is a natural continuation, never a hard edge);
+    //   * the *sharp* picture sits against the right edge, scaled so its short side matches the
+    //     window's short side, with its left edge feathered into the backdrop.
+    // Everything here is a pure function of (picture, window size), so it is cached in `im` and a
+    // repaint is just a masked blit - the cost only appears when the size (or the picture) changes.
+    const double tComp0 = NowMs();
+
+    // 1. backdrop: cover-scale (fills the window, overflow cropped symmetrically)
     const double sx = (double)w / sw, sy = (double)h / sh;
     const double sc = sx > sy ? sx : sy;
-    const double cropW = w / sc, cropH = h / sc;      // source pixels that end up visible
+    const double cropW = w / sc, cropH = h / sc;
     const double ox = (sw - cropW) / 2.0, oy = (sh - cropH) / 2.0;
-    im.px.resize((size_t)w * h);
+    std::vector<uint32_t> back((size_t)w * h);
     for (int y = 0; y < h; y++) {
         double fy = oy + (y + 0.5) * cropH / h - 0.5;
         int y0 = (int)floor(fy);
@@ -2155,15 +2167,110 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
                 int iv = (int)(v + 0.5);
                 return (uint32_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
             };
-            im.px[(size_t)y * w + x] = 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+            back[(size_t)y * w + x] = 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
         }
     }
+
+    // 2. blur + desaturate + slight dim, so the sharp half clearly reads as "in front"
+    {
+        int radius = (w < h ? w : h) / 8;
+        if (radius < 3) radius = 3;
+        if (radius > 40) radius = 40;
+        BoxBlurSmall(back, w, h, radius);
+        BoxBlurSmall(back, w, h, radius);
+        for (auto& v : back) {
+            double rd = (v >> 16) & 0xFF, gn = (v >> 8) & 0xFF, bl = v & 0xFF;
+            const double lum = rd * 0.2126 + gn * 0.7152 + bl * 0.0722;
+            rd = (rd * 0.55 + lum * 0.45) * 0.94;
+            gn = (gn * 0.55 + lum * 0.45) * 0.94;
+            bl = (bl * 0.55 + lum * 0.45) * 0.94;
+            v = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
+        }
+    }
+
+    // 3. dominant colour (mean of the source, cheap: every 4th pixel), laid over the backdrop as a
+    //    horizontal gradient that dies out before the middle - the "colour continuation" on the left
+    DWORD domR = 0, domG = 0, domB = 0;
+    {
+        long long r = 0, g = 0, b = 0, n = 0;
+        for (size_t i = 0; i < src.size(); i += 4) {
+            uint32_t c = src[i];
+            r += (c >> 16) & 0xFF;
+            g += (c >> 8) & 0xFF;
+            b += c & 0xFF;
+            n++;
+        }
+        if (n) { domR = (DWORD)(r / n); domG = (DWORD)(g / n); domB = (DWORD)(b / n); }
+    }
+
+    // 4. sharp picture, right-aligned, short side == window short side
+    const int winShort = w < h ? w : h;
+    const int imgShort = sw < sh ? (int)sw : (int)sh;
+    const double scale = imgShort > 0 ? (double)winShort / imgShort : 1.0;
+    int sharpW = (int)(sw * scale + 0.5), sharpH = (int)(sh * scale + 0.5);
+    if (sharpW < 1) sharpW = 1;
+    if (sharpH < 1) sharpH = 1;
+    const int dx = w - sharpW;                    // against the right edge
+    const int dy = (h - sharpH) / 2;              // vertically centred
+    int feather = sharpW / 3;
+    if (feather > 140) feather = 140;
+    if (feather < 20) feather = 20;
+
+    im.px.resize((size_t)w * h);
+    const double gradEnd = w * 0.55;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint32_t c = back[(size_t)y * w + x];
+            // gradient overlay (strongest at the left edge)
+            if (x < gradEnd) {
+                double k = 0.45 * (1.0 - x / gradEnd);
+                double rd = (c >> 16) & 0xFF, gn = (c >> 8) & 0xFF, bl = c & 0xFF;
+                rd = rd * (1 - k) + domR * k;
+                gn = gn * (1 - k) + domG * k;
+                bl = bl * (1 - k) + domB * k;
+                c = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
+            }
+            // sharp layer with a feathered left edge
+            const int px = x - dx, py = y - dy;
+            if (px >= 0 && px < sharpW && py >= 0 && py < sharpH) {
+                double fsx = (px + 0.5) / scale - 0.5;
+                double fsy = (py + 0.5) / scale - 0.5;
+                if (fsx < 0) fsx = 0;
+                if (fsy < 0) fsy = 0;
+                if (fsx > (double)sw - 1) fsx = (double)sw - 1;
+                if (fsy > (double)sh - 1) fsy = (double)sh - 1;
+                int x0 = (int)fsx, y0 = (int)fsy;
+                double tx = fsx - x0, ty = fsy - y0;
+                int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
+                int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
+                uint32_t p00 = src[(size_t)y0 * sw + x0], p10 = src[(size_t)y0 * sw + x1];
+                uint32_t p01 = src[(size_t)y1 * sw + x0], p11 = src[(size_t)y1 * sw + x1];
+                const double w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty);
+                const double w01 = (1 - tx) * ty, w11 = tx * ty;
+                auto ch = [&](int shift) {
+                    double v = (p00 >> shift & 0xFF) * w00 + (p10 >> shift & 0xFF) * w10 +
+                               (p01 >> shift & 0xFF) * w01 + (p11 >> shift & 0xFF) * w11;
+                    return (int)(v + 0.5);
+                };
+                double a = 1.0;
+                if (px < feather) a = (px + 0.5) / feather;
+                double rd = (c >> 16) & 0xFF, gn = (c >> 8) & 0xFF, bl = c & 0xFF;
+                rd = rd * (1 - a) + ch(16) * a;
+                gn = gn * (1 - a) + ch(8) * a;
+                bl = bl * (1 - a) + ch(0) * a;
+                c = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
+            }
+            im.px[(size_t)y * w + x] = c;
+        }
+    }
+
     im.path = path;
     im.w = w;
     im.h = h;
     im.ok = true;
     im.at = GetTickCount();
-    DLog(L"image: loaded %s (%ux%u -> %dx%d cover)", path.c_str(), sw, sh, w, h);
+    DLog(L"image: composed %s (%ux%u -> %dx%d, sharp %dx%d at %d,%d, feather %d) in %.1f ms",
+         path.c_str(), sw, sh, w, h, sharpW, sharpH, dx, dy, feather, NowMs() - tComp0);
     return true;
 }
 

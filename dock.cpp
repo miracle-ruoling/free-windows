@@ -10372,6 +10372,13 @@ static const SRow kRowsGlassTray[] = {
     {L"glassOpacity", L"玻璃不透明度（覆盖）", -1, 255, 0, 0, nullptr, nullptr},
     {L"tintStrength", L"色调浓度（覆盖）", -1, 255, 0, 0, nullptr, nullptr},
     {L"blurRadius", L"背景模糊半径（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
+    // The machine-wide cadence keys are shown here too (one config, editable from any glass
+    // window); they always read/write [dock], see IsSharedGlassKey(). They are locked unless this
+    // very window bakes a screen backdrop, because a picture background needs no captures.
+    {L"refreshHz", L"背景刷新帧率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureHz", L"背景截取频率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureBudgetMs", L"每帧截取预算 (ms)（共享）", 0, 100, 0, 0, nullptr, nullptr},
+    {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
 };
 
 // ---- 浮窗页 for the strip (component: kCompFloat; section [dock]) -------------------------
@@ -10473,6 +10480,14 @@ static int TrayKeyVal(const wchar_t* key) {
     return -1;
 }
 
+// The cadence keys are one machine-wide config, reachable from *every* glass window's page
+// (user, 2026-11-21: "共享的不应该只在某个窗口显示 ... 相当于只有一个配置，但是多处可改配置").
+// They always read and write [dock], whichever window's page is open.
+static bool IsSharedGlassKey(const wchar_t* key) {
+    return !wcscmp(key, L"refreshHz") || !wcscmp(key, L"captureHz") ||
+           !wcscmp(key, L"captureBudgetMs") || !wcscmp(key, L"dragNoCapture");
+}
+
 static int PageVal(int i) {
     const SPage* p = ActivePage();
     if (!p || i < 0 || i >= p->count) return 0;
@@ -10483,6 +10498,7 @@ static int PageVal(int i) {
         return g ? GroupKeyVal(*g, row.key) : 0;
     }
     if (p->kind == kPageFloatTray) return TrayKeyVal(row.key);
+    if (IsSharedGlassKey(row.key)) return GetInt(L"dock", row.key, row.minv);
     return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : 0);
 }
 
@@ -10528,8 +10544,10 @@ static void PageSet(int i, int v) {
         WritePrivateProfileStringW(p->section.c_str(), L"tint", buf, g_iniPath.c_str());
     } else {
         swprintf_s(buf, L"%d", v);
+        // the shared cadence keys always live in [dock], whichever window's page changed them
+        const wchar_t* sec = IsSharedGlassKey(row.key) ? L"dock" : p->section.c_str();
         if (p->kind != kPageGroupKind)  // group pages persist through GroupSaveFlag
-            WritePrivateProfileStringW(p->section.c_str(), row.key, buf, g_iniPath.c_str());
+            WritePrivateProfileStringW(sec, row.key, buf, g_iniPath.c_str());
     }
 
     // Switching the background to "picture" applies the last picture that was used, so the window
@@ -10558,7 +10576,7 @@ static void PageSet(int i, int v) {
                             g_rowVal[r] = g_cfg.captureHz;
                             wchar_t b2[32]{};
                             swprintf_s(b2, L"%d", g_cfg.captureHz);
-                            WritePrivateProfileStringW(p->section.c_str(), L"captureHz", b2,
+                            WritePrivateProfileStringW(L"dock", L"captureHz", b2,
                                                        g_iniPath.c_str());
                         }
                     }
@@ -10959,12 +10977,20 @@ static bool SettingsRowDisabled(const SPage* p, int i) {
     if (!p || i < 0 || i >= p->count) return false;
     const wchar_t* key = p->rows[i].key;
     if (p->kind == kPageGlass) {
-        // Nothing bakes a screen backdrop any more (every window is a picture or a solid colour):
-        // the capture-rate rows have nothing to act on. Blur and opacity stay live - with a picture
-        // background the blur applies to the sharp picture and the opacity to the whole layer.
-        if (!wcscmp(key, L"refreshHz") || !wcscmp(key, L"captureHz") ||
-            !wcscmp(key, L"captureBudgetMs") || !wcscmp(key, L"dragNoCapture"))
-            return !AnyScreenBackdrop();
+        // Shared cadence rows: adjustable wherever *this* window actually bakes a screen backdrop;
+        // locked (but still visible) for a picture background, which needs no captures at all.
+        // Blur and opacity stay live everywhere - on a picture the blur hits the sharp layer and
+        // the opacity is the whole background layer.
+        if (IsSharedGlassKey(key)) {
+            int bg = 0;
+            if (!wcscmp(p->section.c_str(), L"traybar")) {
+                bg = GetInt(L"traybar", L"bgMode", -1);      // -1 = inherit the strip's
+                if (bg < 0 || bg > 2) bg = g_cfg.bgMode;
+            } else {
+                bg = GetInt(p->section.c_str(), L"bgMode", 0);
+            }
+            return bg != 0;
+        }
         return false;
     }
     int bg = 0;

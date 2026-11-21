@@ -1622,4 +1622,43 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
   我第一次少算了 30 px，把「滚轮翻页步长」从 1 点成了 4（**已改回 1**）。
   想省事就让用户自己点，或者用 `dock.exe --settings` 启动（`main()` 里有这个开关）先把面板打开再截图。
 
+### 3.31 任务 3 落地（2026-11-22 01:5x）：贴边方角（"吸附"）变成每个窗口都有、各自能关
+
+**先把定义钉死（用户 2026-11-22 01:34 的原话）**：这一项里"吸附"**只指一件事** ——
+贴到工作区某条边时把**那条边的两个圆角**从配置半径动画收成 0。条本来就有（`UpdateSnap()` →
+`g_cornerTarget[4]` → `AnimateCorners()` → `CornerRadiusAt()`），三图标浮窗从来没有（它画的是**统一圆角**：
+`FillRound` + `EnsureFloatMask`，没有任何逐角状态）。判据沿用**长边决定**（横的只方上下、竖的只方左右，
+用户明确选的），**组框不参与**。
+
+**代码（三个改动点，都在同一条链上）**
+1. `SRow`/流程不用变，新键 **`[dock] snap`**（默认 1）、**`[traybar] snap`**（`-1` = 继承条）。
+   面板：两个「浮窗」页各一行「贴边方角」/「贴边方角（覆盖）」（`kRowsFloatDock` / `kRowsFloatTray`），
+   `TrayKeyVal()` 加了 `snap`，`PageSet()` 的 `kPageFloatTray` 分支加 `g_trayBar.snapOv = v`。
+2. `UpdateSnap()` 整体包在 `if (g_cfg.snap)` 里 —— 关掉就**永远不方角**（目标和配置半径一致）。
+3. 浮窗有了自己的逐角状态：`Companion::snapAnim[4] / snapTarget[4]`，`CompanionSnapUpdate()` 用
+   **`c.rc`（存的矩形，隐藏时也对）**、`CompanionSnapTick()` 在 `CompanionTick` 里每帧走一步（同 120 ms 缓动），
+   **隐藏的窗口直接对齐目标**（没东西可动画、也没东西要重画）。
+   绘制端把两处"统一圆角"换成逐角：`FillRound4F(rect, radius, factors, argb)`（`FillRound4` 变成它的薄壳，
+   传 `g_cornerAnim`），`EnsureFloatMask(w,h,radius,factors)`（**缓存键里加了角系数**，玻璃底图和图片背景都用它）。
+
+**又踩到两个"从 ini 改不生效"的坑，一并修了**
+- `Reload()`（就是 `dev/t_dock_reload.ps1` 发 WM_TIMER 2 走的那条）**不重算条的 snap 目标** ——
+  手改 `[dock] snap` + 重载，条一点反应都没有（验收脚本 F 段当场抓到的）。现在 `Reload()` 里调 `UpdateSnap()`。
+- `RefreshCompanionAfterReload()` **不重读 `[traybar] snap`**（它只重画）。现在它重读这个键并 `CompanionSnapUpdate()`；
+  **几何（x/y）故意还是不重读** —— 重载不该把窗口拽到别处。
+- 顺带：`PageVal()` 里 `-1`（继承）在**开关行**上没法表达（只有两个药丸），会显示成「关」而实际是开。
+  现在 `kPageFloatTray` 的开关行在读出 `-1` 时改为显示**生效值**（`GetInt(L"dock", key, row.defv)`）。
+  这也顺带修好了「玻璃层」那行在浮窗页上的同样误报。
+
+**验收**
+- `dev/t_snap.ps1`（新，9/9）：A 浮窗贴底边 → `snap: traybar corners TL=1 TR=1 BL=0 BR=0`；
+  B 它自己的开关关 → 全 1；B2 回到继承 → 又方；C `[dock] snap=0` 经继承生效 → 全 1；
+  D 恢复 → 方；E 条贴顶边（`[dock] y=0`）→ `snap: corners TL=0 TR=0 BL=1 BR=1`；F 条的开关关 → 全 1；G 恢复 → 方。
+  脚本会重启 dock 三次并把 ini 原样写回。
+- **像素级证据**（一次性脚本，已删；截图留在 `dev/snapcmp_zoom.png`，左=开 右=关）：浮窗贴底边时，
+  左下 10×10 角块亮度 **463.8（开）→ 162.6（关）**，同窗口中间对照组 **485.3 → 485.3 完全不变**
+  ⇒ 真的只有角在变，不是整块变了。
+- 条的观感回归：改了 `FillRound4` 之后重新截图（`dev/strip_now_crop.png`）与之前一致（圆角/玻璃/图标没变）。
+
+
 

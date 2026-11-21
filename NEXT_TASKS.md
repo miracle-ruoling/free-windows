@@ -62,9 +62,9 @@
 - `[dock]`：iconSize gap pad radius bg hover fadeStart fadeEnd vertical clickActiveMinimizes thumbWidth/Height/Delay
   minIcon maxIcon scrollStep allowResize upscaleSmallIcons x y w h hasPos hasSize bgMode glassLayer hue solidOpacity
   dragNoCapture blurRadius tintStrength glassOpacity refreshHz captureHz captureBudgetMs presentSync presentOrder
-  order extraPins image dumpBake debugBeacon **zWatch** **dodgeOnDoubleClick**
+  order extraPins image dumpBake debugBeacon **zWatch** **dodgeOnDoubleClick** **snap**
   **（`lightMode` / `tint` / `color` 已废弃，仅作迁移回退，待清理）**
-- `[traybar]`：enabled follow group x y w h hasPos pad gap radius bgMode glassLayer hue solidOpacity image
+- `[traybar]`：enabled follow group x y w h hasPos pad gap radius **snap** bgMode glassLayer hue solidOpacity image
   blurRadius tintStrength glassOpacity（外观类 `-1` = 继承条）
 - `[group]` / `[group.N]`：enabled margin lineAlpha lineWidth radius blockResize blockMove fadeStart fadeEnd
 - `[tray]`：doubleClick autoDoubleClick native
@@ -130,13 +130,15 @@
   关闭后这条路径直接不触发，**不要**影响其它双击语义（例如图标双击启动）。
 - `g_flip.active` 期间窗口"不重绘只移动"，所以关掉不必动这些代码，只需不进入。
 
-### 任务 3 — 每个浮窗 + 条 的"吸附"开关
+### 任务 3 — 每个浮窗 + 条 的"吸附"开关 —— ✅ **已完成（2026-11-22 01:5x，见 HANDOVER_NEXT.md §3.31）**
 
-- 要：`[dock] snap` / `[traybar] snap`（`-1` = 继承条，默认 1 = 现状）。两个「浮窗」页各加一行。
-- 现状：`UpdateSnap()`（贴到工作区边时把圆角变直角，`g_cornerTarget`/`AnimateCorners()`），
-  以及拖动/放置时的边缘贴靠逻辑。
-- ⚠️ **先读清楚"吸附"目前包含哪几件事**（贴边圆角？边缘停靠？拖动时的吸附力？），
-  如果不止一件事，**先问用户"关闭吸附"指哪几种**，别自作主张全关或全开。
+> 用户澄清："吸附"只有一件事 = **贴边把那条边的两个圆角变直角**（`UpdateSnap()` → 圆角因子动画）。
+> 条本来就有，三图标浮窗没有。现在两边都有，各自可关：`[dock] snap` / `[traybar] snap`（`-1` = 继承条），
+> 两个「浮窗」页各一行「贴边方角」。判据仍是**长边决定**（横的只方上下、竖的只方左右，用户选的），
+> 组框不参与。验收 `dev/t_snap.ps1` 9/9，另有像素级证据（贴底边时左下角方块 463.8 → 关掉后 162.6，
+> 同窗口中间对照组 485.3 → 485.3 完全不变）。
+
+**原需求（存档）**
 
 ### 任务 4 — 组的"贴边隐藏"（最大的一块）
 
@@ -203,6 +205,7 @@
 | `t_snipwatch.ps1` | 看 Win+Shift+S 覆盖层长什么样（类名/cloaked/z 位置） |
 | `t_qqsnip.ps1 -Mode flow` | **任务 1**：真 QQ 截图（Ctrl+Alt+X）全流程 —— 在 dock 上拖选区、把光标停在工具栏/浮窗/条上，逐点采样我们的 tm；`-Mode probe` 只开框选不拖 |
 | `t_dodge.ps1` | **任务 2 验收**：关掉 `dodgeOnDoubleClick` 后双击空白处条不动、无 flip 日志；打开后跳到镜像位置并来回复原（ini 用 `WritePrivateProfileStringW` 写，不碰编码） |
+| `t_snap.ps1` | **任务 3 验收**：把浮窗贴到底边 / 把条贴到顶边，逐个切换 `snap` 与继承关系，读日志里的 `snap: ... corners TL=.. TR=.. BL=.. BR=..`；会重启 dock 并把 ini 原样还原 |
 
 ⚠️ **面板自动化很不稳**：右键菜单的弹出位置随布局变，我这一轮连续点歪好几次都没打开设置面板。
 要么先 `rcshot.ps1` 截图定位再点，要么直接让用户自己点。

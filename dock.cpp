@@ -207,6 +207,10 @@ struct Config {
     // centre line ("dodge"). 0 disables *only* that path - every other double-click meaning
     // (launching an icon, the tray button) is untouched, it is a different branch.
     int dodgeOnDoubleClick = 1;
+    // task 3: "snap" = squaring off the two corners of the screen edge the window hugs. It used
+    // to be hard-wired into the strip; now every window has it and it can be switched off.
+    // [dock] snap rules the strip, a companion has its own [traybar] snap (-1 = inherit).
+    int snap = 1;
     int blurIcons = 0;           // 1 = let the icons bleed into the glass
     int blurRadius = 16;          // blur radius in full-resolution pixels
     int refreshHz = 60;           // how often the strip repaints (0..180)
@@ -458,6 +462,10 @@ static void LoadConfig() {
     g_cfg.dodgeOnDoubleClick = GetInt(L"dock", L"dodgeOnDoubleClick", 1);
     if (g_cfg.dodgeOnDoubleClick < 0) g_cfg.dodgeOnDoubleClick = 0;
     if (g_cfg.dodgeOnDoubleClick > 1) g_cfg.dodgeOnDoubleClick = 1;
+    // task 3: the snap switch (both windows default to on = the behaviour that always existed)
+    g_cfg.snap = GetInt(L"dock", L"snap", 1);
+    if (g_cfg.snap < 0) g_cfg.snap = 0;
+    if (g_cfg.snap > 1) g_cfg.snap = 1;
     g_cfg.blurIcons = GetInt(L"dock", L"blurIcons", 0);
     // `material` was read here before H2; it is derived from (bgMode, glassLayer) just above.
     if (g_cfg.material < 0 || g_cfg.material > 1) g_cfg.material = 1;
@@ -637,6 +645,7 @@ static void CreateDefaultIni() {
     WritePrivateProfileStringW(L"dock", L"bakeRefreshMs", L"900", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"zWatch", L"1", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"dodgeOnDoubleClick", L"1", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"dock", L"snap", L"1", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"tint", L"#99101010", g_iniPath.c_str());
 }
 
@@ -1401,9 +1410,22 @@ static void FillRoundRing(int w, int h, int radius, int thickness, DWORD argb) {
 }
 
 // Same as FillRound, but each corner uses its own animated radius (TL, TR, BL, BR).
+// `k` is the per-corner factor set: 1 = the full radius, 0 = square (the strip's is
+// g_cornerAnim, a companion carries its own - task 3).
 static int CornerRadiusAt(int x, int y, int w, int h, int radius);
+static int CornerRadiusAtF(const float* k, int x, int y, int w, int h, int radius);
 
-static void FillRound4(const RECT& r, int radius, DWORD argb) {
+// Corner rounding is per corner (top-left, top-right, bottom-left, bottom-right):
+// 1 = the configured radius, 0 = square. A window pushed against the screen edge
+// squares off the corners on that edge only; the other edge keeps its rounding.
+// The factors are animated (~120ms) so docking feels like the window settles into the
+// edge instead of snapping to a new shape.
+static float g_cornerAnim[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+static float g_cornerTarget[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+static void FillRound4F(const RECT& r, int radius, const float* k, DWORD argb);
+
+static void FillRound4F(const RECT& r, int radius, const float* k, DWORD argb) {
     int w = r.right - r.left, h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return;
     double cx = r.left + w / 2.0, cy = r.top + h / 2.0;
@@ -1411,7 +1433,7 @@ static void FillRound4(const RECT& r, int radius, DWORD argb) {
     DWORD baseA = (argb >> 24) & 0xFF;
     for (int y = r.top; y < r.bottom; y++) {
         for (int x = r.left; x < r.right; x++) {
-            int R = CornerRadiusAt(x - r.left, y - r.top, w, h, radius);
+            int R = CornerRadiusAtF(k, x - r.left, y - r.top, w, h, radius);
             double qx = fabs(x + 0.5 - cx) - (hw - R);
             double qy = fabs(y + 0.5 - cy) - (hh - R);
             double ax = qx > 0 ? qx : 0;
@@ -1429,6 +1451,10 @@ static void FillRound4(const RECT& r, int radius, DWORD argb) {
     }
 }
 
+static void FillRound4(const RECT& r, int radius, DWORD argb) {
+    FillRound4F(r, radius, g_cornerAnim, argb);
+}
+
 static int RadiusForPercent(int w, int h, int percent) {
     int side = w < h ? w : h;
     int r = side * percent / 200;      // radius% of (short side / 2)
@@ -1444,20 +1470,24 @@ static int RadiusFor(int w, int h) {
 // 1 = the configured radius, 0 = square. A strip pushed against the screen edge
 // squares off the corners on that edge only; the other edge keeps its rounding.
 // The factors are animated (~120ms) so docking feels like the strip settles into the
-// edge instead of snapping to a new shape.
-static float g_cornerAnim[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-static float g_cornerTarget[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+// edge instead of snapping to a new shape. (The arrays themselves are declared above
+// FillRound4F, which needs the strip's set.)
 
 static int CornerIndex(int x, int y, int w, int h) {
     return (y * 2 < h) ? (x * 2 < w ? 0 : 1) : (x * 2 < w ? 2 : 3);
 }
 
-// Effective radius for one corner at (x,y).
+// Effective radius for one corner at (x,y), for any factor set.
+static int CornerRadiusAtF(const float* k, int x, int y, int w, int h, int radius) {
+    float f = k[CornerIndex(x, y, w, h)];
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    return (int)(radius * f + 0.5f);
+}
+
+// Effective radius for one corner at (x,y), for the strip's own factors.
 static int CornerRadiusAt(int x, int y, int w, int h, int radius) {
-    float k = g_cornerAnim[CornerIndex(x, y, w, h)];
-    if (k < 0) k = 0;
-    if (k > 1) k = 1;
-    return (int)(radius * k + 0.5f);
+    return CornerRadiusAtF(g_cornerAnim, x, y, w, h, radius);
 }
 
 static RECT WorkAreaFor(HWND hwnd) {
@@ -1523,12 +1553,15 @@ static void UpdateSnap() {
     RECT wa = WorkAreaFor(g_hwnd);
     bool vertical = (wr.bottom - wr.top) > (wr.right - wr.left);
     float t[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    if (vertical) {
-        if (wr.left <= wa.left) { t[0] = 0.0f; t[2] = 0.0f; }      // left edge: TL + BL
-        if (wr.right >= wa.right) { t[1] = 0.0f; t[3] = 0.0f; }    // right edge: TR + BR
-    } else {
-        if (wr.top <= wa.top) { t[0] = 0.0f; t[1] = 0.0f; }        // top edge: TL + TR
-        if (wr.bottom >= wa.bottom) { t[2] = 0.0f; t[3] = 0.0f; }  // bottom edge: BL + BR
+    // task 3: [dock] snap=0 = never square off (the corners keep the configured radius).
+    if (g_cfg.snap) {
+        if (vertical) {
+            if (wr.left <= wa.left) { t[0] = 0.0f; t[2] = 0.0f; }      // left edge: TL + BL
+            if (wr.right >= wa.right) { t[1] = 0.0f; t[3] = 0.0f; }    // right edge: TR + BR
+        } else {
+            if (wr.top <= wa.top) { t[0] = 0.0f; t[1] = 0.0f; }        // top edge: TL + TR
+            if (wr.bottom >= wa.bottom) { t[2] = 0.0f; t[3] = 0.0f; }  // bottom edge: BL + BR
+        }
     }
     for (int i = 0; i < 4; i++) g_cornerTarget[i] = t[i];
     static float last[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -3407,6 +3440,9 @@ static void RefreshCompanionAfterReload();   // needs the paint helpers, defined
 
 static void Reload() {
     LoadConfig();
+    // task 3: [dock] snap may have changed on disk (a hand edit + dev/t_dock_reload.ps1). The
+    // targets are only recomputed when the window moves, so a reload has to do it here.
+    UpdateSnap();
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
     RefreshCompanionAfterReload();
@@ -3770,6 +3806,11 @@ struct Companion {
     // Per-window style overrides (R4): [traybar] radius/pad/gap. -1 = inherit from [dock],
     // which is the "跟随条样式" default; the plan's "独立样式" hook is exactly this.
     int padOv = -1, gapOv = -1, radiusOv = -1;
+    // task 3: [traybar] snap, -1 = inherit [dock] snap; the per-corner factors are this
+    // window's own (the strip has its own g_cornerAnim), animated the same ~120 ms way.
+    int snapOv = -1;
+    float snapAnim[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float snapTarget[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     // H3: this window's own padded backdrop bake (same pipeline as the strip, own pixels).
     // It is only filled when the window actually draws the glass layer - see CompanionGlassTick.
     GlassTarget glass;
@@ -4495,6 +4536,7 @@ static void CompanionLoad(Companion& c) {
     c.padOv = GetInt(c.iniSection, L"pad", -1);
     c.gapOv = GetInt(c.iniSection, L"gap", -1);
     c.radiusOv = GetInt(c.iniSection, L"radius", -1);
+    c.snapOv = GetInt(c.iniSection, L"snap", -1);
 
     int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
     if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
@@ -4518,14 +4560,93 @@ static void CompanionLoad(Companion& c) {
          (int)c.follow, (int)c.enabled);
 }
 
+// ---- task 3: the snap (贴边方角) for a float window --------------------------------------
+// Exactly the strip's rule (UpdateSnap): the *long* side decides, so a wide window only squares
+// off when it hugs the top or the bottom edge, a tall one when it hugs the left or the right.
+// The rect used is c.rc (the stored one), not GetWindowRect: a hidden companion has nothing on
+// screen and its stored rect is where it will be shown.
+static int CompanionSnapOn(const Companion& c) {
+    return c.snapOv >= 0 ? c.snapOv : g_cfg.snap;
+}
+
+static void CompanionSnapUpdate(Companion& c) {
+    float t[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (CompanionSnapOn(c)) {
+        RECT wa = WorkAreaFor(c.hwnd ? c.hwnd : g_hwnd);
+        bool vertical = (c.rc.bottom - c.rc.top) > (c.rc.right - c.rc.left);
+        if (vertical) {
+            if (c.rc.left <= wa.left) { t[0] = 0.0f; t[2] = 0.0f; }
+            if (c.rc.right >= wa.right) { t[1] = 0.0f; t[3] = 0.0f; }
+        } else {
+            if (c.rc.top <= wa.top) { t[0] = 0.0f; t[1] = 0.0f; }
+            if (c.rc.bottom >= wa.bottom) { t[2] = 0.0f; t[3] = 0.0f; }
+        }
+    }
+    bool changed = false;
+    for (int i = 0; i < 4; i++) {
+        if (c.snapTarget[i] != t[i]) {
+            c.snapTarget[i] = t[i];
+            changed = true;
+        }
+    }
+    if (changed)
+        DLog(L"snap: %s corners TL=%.0f TR=%.0f BL=%.0f BR=%.0f rect=%ld,%ld-%ld,%ld on=%d",
+             c.iniSection, t[0], t[1], t[2], t[3], (long)c.rc.left, (long)c.rc.top,
+             (long)c.rc.right, (long)c.rc.bottom, CompanionSnapOn(c));
+}
+
+// One animation step, same easing/duration as the strip (AnimateCorners). True = repaint.
+static bool CompanionSnapStep(Companion& c, DWORD now) {
+    static DWORD last = 0;
+    float dt = last ? (float)(now - last) : 30.0f;
+    last = now;
+    if (dt > 120.0f) dt = 120.0f;
+    float k = 1.0f - expf(-dt / 45.0f);
+    bool moved = false;
+    for (int i = 0; i < 4; i++) {
+        float d = c.snapTarget[i] - c.snapAnim[i];
+        if (d > -0.004f && d < 0.004f) {
+            if (c.snapAnim[i] != c.snapTarget[i]) {
+                c.snapAnim[i] = c.snapTarget[i];
+                moved = true;
+            }
+            continue;
+        }
+        c.snapAnim[i] += d * k;
+        moved = true;
+    }
+    return moved;
+}
+
+// Called once per housekeeping tick. A hidden window snaps straight to its target (nothing to
+// animate and nothing to repaint); a visible one steps like the strip does.
+static void CompanionSnapTick(Companion& c, DWORD now) {
+    if (!c.hwnd) return;
+    CompanionSnapUpdate(c);
+    if (!(c.alpha > 0 || c.alphaTarget > 0)) {
+        for (int i = 0; i < 4; i++) c.snapAnim[i] = c.snapTarget[i];
+        return;
+    }
+    if (CompanionSnapStep(c, now)) {
+        TrayRepaint(c);
+        CompanionPresent(c);
+    }
+}
+
 // ---- H3: the float window's glass ------------------------------------------------------
-// Rounded-rect coverage + rim for a *plain* window (no per-corner animation like the strip),
-// built once per size/radius so the per-frame pass has no sqrt in it.
+// Rounded-rect coverage + rim for a *plain* window. The per-corner factors are part of the
+// cache key, so a window that is settling into a screen edge rebuilds it and everything else
+// keeps the cached one. (One shared mask: the companions take turns by (size, radius, corners);
+// there is a single companion today.)
 static std::vector<BYTE> g_fltCov, g_fltRim;
 static int g_fltW = 0, g_fltH = 0, g_fltR = -1;
+static float g_fltK[4] = {-2, -2, -2, -2};
 
-static void EnsureFloatMask(int w, int h, int radius) {
-    if (w == g_fltW && h == g_fltH && radius == g_fltR) return;
+static void EnsureFloatMask(int w, int h, int radius, const float* k) {
+    bool same = (w == g_fltW && h == g_fltH && radius == g_fltR);
+    for (int i = 0; same && i < 4; i++)
+        if (k[i] != g_fltK[i]) same = false;
+    if (same) return;
     g_fltCov.assign((size_t)w * h, 0);
     g_fltRim.assign((size_t)w * h, 0);
     int R = radius;
@@ -4535,13 +4656,14 @@ static void EnsureFloatMask(int w, int h, int radius) {
     double cx = w / 2.0, cy = h / 2.0, hw = w / 2.0, hh = h / 2.0;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            double qx = fabs(x + 0.5 - cx) - (hw - R);
-            double qy = fabs(y + 0.5 - cy) - (hh - R);
+            double rr = CornerRadiusAtF(k, x, y, w, h, R);
+            double qx = fabs(x + 0.5 - cx) - (hw - rr);
+            double qy = fabs(y + 0.5 - cy) - (hh - rr);
             double ax = qx > 0 ? qx : 0;
             double ay = qy > 0 ? qy : 0;
             double inx = qx > qy ? qx : qy;
             if (inx > 0) inx = 0;
-            double d = sqrt(ax * ax + ay * ay) + inx - R;
+            double d = sqrt(ax * ax + ay * ay) + inx - rr;
             double cov = 0.5 - d;
             if (cov <= 0) continue;
             if (cov > 1) cov = 1;
@@ -4557,6 +4679,7 @@ static void EnsureFloatMask(int w, int h, int radius) {
         }
     }
     g_fltW = w; g_fltH = h; g_fltR = radius;
+    for (int i = 0; i < 4; i++) g_fltK[i] = k[i];
 }
 
 // Paint the baked backdrop into the companion's own DIB. The bake is a picture of the desktop
@@ -4575,7 +4698,7 @@ static bool CompanionPaintGlass(Companion& c) {
     if (oy < 0) oy = 0;
     if (ox > g.w - w) ox = g.w - w;
     if (oy > g.h - h) oy = g.h - h;
-    EnsureFloatMask(w, h, RadiusForPercent(w, h, CompanionRadiusPercent(c)));
+    EnsureFloatMask(w, h, RadiusForPercent(w, h, CompanionRadiusPercent(c)), c.snapAnim);
     for (int y = 0; y < h; y++) {
         const uint32_t* src = (const uint32_t*)g.bits + (size_t)(oy + y) * g.w + ox;
         const BYTE* covRow = &g_fltCov[(size_t)y * w];
@@ -4624,8 +4747,8 @@ static void TrayRepaint(Companion& c) {
             bgFill = ((DWORD)a << 24) | (g_hue[1] & 0x00FFFFFFu);   // the window's 色调
         }
     }
-    FillRound(c.dc, all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
-              bgFill);
+    FillRound4F(all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
+                c.snapAnim, bgFill);
     // H3: with the glass layer on, the baked backdrop replaces the wash as the background. It
     // lands on top of the fill, so the fill is still the clickable area while the first bake
     // is missing (and the wash is invisible anyway).
@@ -4634,7 +4757,8 @@ static void TrayRepaint(Companion& c) {
         // picture background: fill the rounded rect from the cached picture
         if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH, 1)) {
             EnsureFloatMask(c.dibW, c.dibH,
-                            RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)));
+                            RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)),
+                            c.snapAnim);
             PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), g_hue[1], g_glass[1]);
         }
     }
@@ -5967,6 +6091,10 @@ static void CompanionTick(DWORD now) {
             ShowWindow(g_trayBar.hwnd, SW_HIDE);
     }
 
+    // 2b. task 3: the snap (贴边方角). One animation step per frame, like the strip's
+    // AnimateCorners; a hidden window snaps instantly and costs nothing.
+    CompanionSnapTick(g_trayBar, now);
+
     // 3. every group's frame fades with its members, in the same steps
     for (int i = 0; i < g_groupCount; i++) {
         Group& g = g_groups[i];
@@ -6230,6 +6358,10 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static void CompanionCreate() {
     Companion& c = g_trayBar;
     CompanionLoad(c);
+    // task 3: start already snapped - the first paint must not show rounded corners on an edge
+    // the window has been hugging since the last session.
+    CompanionSnapUpdate(c);
+    for (int i = 0; i < 4; i++) c.snapAnim[i] = c.snapTarget[i];
     if (!c.enabled) return;
 
     static bool registered = false;
@@ -10868,6 +11000,8 @@ static const SRow kRowsFloatDock[] = {
     // open the gallery / add a new picture - there is no numeric value behind it.
     {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
+    // task 3: square off the two corners of the screen edge the window hugs.
+    {L"snap", L"贴边方角", 0, 1, 0, 1, L"开", L"关", nullptr, 0, 1},
     {L"pad", L"内边距", 0, 40, 0, 0, nullptr, nullptr},
 };
 
@@ -10881,6 +11015,8 @@ static const SRow kRowsFloatTray[] = {
     // Same picture row as the strip's (inherits [dock] image= when empty).
     {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
+    // task 3: -1 = inherit the strip's [dock] snap (the panel shows the value in force).
+    {L"snap", L"贴边方角（覆盖）", -1, 1, 0, 1, L"开", L"关", nullptr, 0, 1},
     {L"pad", L"内边距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
     {L"gap", L"格子间距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
 };
@@ -10956,6 +11092,8 @@ static int TrayKeyVal(const wchar_t* key) {
     if (!wcscmp(key, L"glassLayer")) return GetInt(L"traybar", L"glassLayer", -1);
     if (!wcscmp(key, L"color")) return GetInt(L"traybar", L"color", -1);
     if (!wcscmp(key, L"solidOpacity")) return GetInt(L"traybar", L"solidOpacity", -1);
+    // task 3: the companion's own snap switch
+    if (!wcscmp(key, L"snap")) return GetInt(L"traybar", L"snap", -1);
     return -1;
 }
 
@@ -10976,7 +11114,14 @@ static int PageVal(int i) {
         Group* g = GroupById(p->groupId);
         return g ? GroupKeyVal(*g, row.key) : 0;
     }
-    if (p->kind == kPageFloatTray) return TrayKeyVal(row.key);
+    if (p->kind == kPageFloatTray) {
+        int v = TrayKeyVal(row.key);
+        // A two-pill toggle cannot express "inherit", so show the value actually in force
+        // instead of the raw -1 - otherwise an inheriting row reads 关 while the strip's 开 is
+        // what the window is doing (task 3; same trap as SRow::defv on the strip's pages).
+        if (v < 0 && row.isToggle) return GetInt(L"dock", row.key, row.defv);
+        return v;
+    }
     if (IsSharedGlassKey(row.key)) return GetInt(L"dock", row.key, row.minv);
     return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : row.defv);
 }
@@ -10996,6 +11141,9 @@ static void PageLoad() {
 // layout, the companions' icon sizes and the group frame all derive from g_cfg.
 static void ApplyStripStyle() {
     LoadConfig();
+    // task 3: [dock] snap may have just changed; recompute the targets right away (the corners
+    // animate back in the next frames, see AnimateCorners).
+    UpdateSnap();
     g_glassCacheValid = false;
     g_bakeDirty = true;
     RECT rc{};
@@ -11090,6 +11238,8 @@ static void PageSet(int i, int v) {
             if (!wcscmp(row.key, L"radius")) g_trayBar.radiusOv = v2;
             else if (!wcscmp(row.key, L"pad")) g_trayBar.padOv = v2;
             else if (!wcscmp(row.key, L"gap")) g_trayBar.gapOv = v2;
+            // task 3: the snap override; the animation starts on the next tick (120 ms)
+            else if (!wcscmp(row.key, L"snap")) g_trayBar.snapOv = v2;
             if (g_trayBar.hwnd) {
                 TrayRepaint(g_trayBar);
                 CompanionPresent(g_trayBar);
@@ -11384,6 +11534,11 @@ static void RefreshCompanionAfterReload() {
     g_imgStrip.sig = 0;      // force a re-compose with the new parameters
     g_imgTray.sig = 0;
     g_trayBar.glass.dirty = true;
+    // task 3: the snap override is read from the ini like the other style keys, and a hand edit
+    // followed by a reload (dev/t_dock_reload.ps1) should apply without a restart. The geometry
+    // itself is NOT re-read here - a reload must never yank the window somewhere else.
+    g_trayBar.snapOv = GetInt(g_trayBar.iniSection, L"snap", -1);
+    CompanionSnapUpdate(g_trayBar);
     if (!g_trayBar.hwnd) return;
     TrayRepaint(g_trayBar);
     CompanionPresent(g_trayBar);

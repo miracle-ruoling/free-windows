@@ -4966,6 +4966,8 @@ static void GroupPaintBoard(Group& g, int w, int h, int radius) {
     }
 }
 
+static int GroupCornerSize(Group& g);      // defined with GroupEdgeAt below
+
 static void GroupPaint(Group& g, int w, int h) {
     if (!g.bits || w <= 0 || h <= 0) return;
     if (w > g.dibW || h > g.dibH) return;
@@ -4979,6 +4981,17 @@ static void GroupPaint(Group& g, int w, int h) {
     GroupPaintBoard(g, w, h, g.radius);
     int band = GroupGrabBand(g);
     if (band > 0) FillRoundRing(w, h, g.radius, band + g.lineWidth, 0x04FFFFFF);
+    // ⛔ The corner handles used to be only whatever the rounded arc left inside the band - at
+    // radius ~22 that is a sliver of a few pixels, which felt like "只有一个像素能触发"
+    // (user, 2026-11-21). A layered window is hit-tested through its alpha, so the corner squares
+    // have to be painted, not just tested for: 1.6 % white, invisible, but a 22x22 target.
+    {
+        const int cz = GroupCornerSize(g);
+        const DWORD hit = 0x04FFFFFF;
+        RECT c[4] = {RECT{0, 0, cz, cz}, RECT{w - cz, 0, w, cz}, RECT{0, h - cz, cz, h},
+                     RECT{w - cz, h - cz, w, h}};
+        for (const RECT& r : c) FillRound(g_memDC, r, 8, hit);
+    }
     if (g.enabled)
         FillRoundRing(w, h, g.radius, g.lineWidth, ((DWORD)g.lineAlpha << 24) | 0x00FFFFFF);
     g_paintBits = savePaint;
@@ -5059,10 +5072,24 @@ static void GroupDragEnd(Group& g);      // GroupScaleBegin cancels a drag if bo
 static bool GroupScaling() { return AnyGroupScaling(); }
 
 // Which frame edge(s) is the pointer on? The grab band is the margin ring painted at alpha 4.
+// The square in each corner that acts as a two-axis resize handle. Bigger than the edge band on
+// purpose: a corner is the hardest thing to hit, and the margin is the only place it can live.
+static int GroupCornerSize(Group& g) {
+    int cz = GroupGrabBand(g) + 10;
+    if (cz < 16) cz = 16;
+    if (cz > 28) cz = 28;
+    return cz;
+}
+
 static int GroupEdgeAt(Group& g, POINT pClient, const RECT& client) {
+    int w = client.right - client.left, h = client.bottom - client.top;
+    const int cz = GroupCornerSize(g);
+    const bool lx = pClient.x < cz, rx = pClient.x >= w - cz;
+    const bool ty = pClient.y < cz, by = pClient.y >= h - cz;
+    // A corner square is a resize handle as a whole, whatever the rounded outline does there.
+    if ((lx || rx) && (ty || by)) return (lx ? 1 : 2) | (ty ? 4 : 8);
     int band = GroupGrabBand(g) + g.lineWidth;
     if (band <= 0) return 0;
-    int w = client.right - client.left, h = client.bottom - client.top;
     int edges = 0;
     if (pClient.x < band) edges |= 1;
     else if (pClient.x >= w - band) edges |= 2;

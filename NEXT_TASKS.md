@@ -209,7 +209,7 @@
 
 ## 5. 存档点与回退
 
-- HEAD `（提交后填）`（= `dock.cpp.bak56_dodge`，任务 2）；上一个：`ed05131` 任务 1 修完
+- HEAD `cd576ed`（= `dock.cpp.bak56_dodge`，任务 2）；上一个：`ed05131` 任务 1 修完
   （= `dock.cpp.bak55_qqsnip`），再往前 `78aecf2`（= `dock.cpp.bak52_sharedrows` / `bak53_zwatch`）。
 - 近期 tag：`pre-glasscfg-2026-11-21`、`h3c-2026-11-20`、`h3a-2026-11-20`、
   `known-good-2026-11-17-1755 / 1720 / 1630`（最后一个 `1630` 是任务栏那套"用户确认完全符合预期"的状态）。

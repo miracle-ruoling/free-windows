@@ -2328,34 +2328,40 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         if (n) { domR = (DWORD)(r / n); domG = (DWORD)(g / n); domB = (DWORD)(b / n); }
     }
 
-    // 4. sharp picture, right-aligned, short side == window short side
+    // 4. sharp picture against the anchor edge, short side == window short side.
+    //    Landscape (w >= h): anchored right, blurred continuation on the left.
+    //    Portrait  (h >  w): the same layout rotated 90 degrees counter-clockwise - the picture
+    //    fills the top and the blur continues downwards (user, 2026-11-21).
+    const bool portrait = h > w;
     const int winShort = w < h ? w : h;
     const int imgShort = sw < sh ? (int)sw : (int)sh;
     const double scale = imgShort > 0 ? (double)winShort / imgShort : 1.0;
     int sharpW = (int)(sw * scale + 0.5), sharpH = (int)(sh * scale + 0.5);
     if (sharpW < 1) sharpW = 1;
     if (sharpH < 1) sharpH = 1;
-    const int dx = w - sharpW;                    // against the right edge
-    const int dy = (h - sharpH) / 2;              // vertically centred
-    int feather = sharpW / 3;
+    const int dx = portrait ? (w - sharpW) / 2 : (w - sharpW);   // centred / against the right edge
+    const int dy = portrait ? 0 : (h - sharpH) / 2;              // against the top / centred
+    int feather = (portrait ? sharpH : sharpW) / 3;
     if (feather > 140) feather = 140;
     if (feather < 20) feather = 20;
 
     im.px.resize((size_t)w * h);
-    const double gradEnd = w * 0.55;
+    // "far" = the edge on the opposite side of the sharp picture; the gradient is strongest there
+    const int farLen = portrait ? h : w;
+    const double gradEnd = farLen * 0.55;
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             uint32_t c = back[(size_t)y * w + x];
-            // gradient overlay (strongest at the left edge)
-            if (x < gradEnd) {
-                double k = 0.45 * (1.0 - x / gradEnd);
+            const int farPos = portrait ? (h - 1 - y) : x;
+            if (farPos < gradEnd) {
+                double k = 0.45 * (1.0 - farPos / gradEnd);
                 double rd = (c >> 16) & 0xFF, gn = (c >> 8) & 0xFF, bl = c & 0xFF;
                 rd = rd * (1 - k) + domR * k;
                 gn = gn * (1 - k) + domG * k;
                 bl = bl * (1 - k) + domB * k;
                 c = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
             }
-            // sharp layer with a feathered left edge
+            // sharp layer, feathered on its inner edge
             const int px = x - dx, py = y - dy;
             if (px >= 0 && px < sharpW && py >= 0 && py < sharpH) {
                 // ⛔ A big picture shown small with *one* bilinear tap per output pixel averages
@@ -2388,8 +2394,9 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
                                             (py + (j + 0.5) / k) / scale - 0.5, shift);
                     return (int)(sum / (k * k) + 0.5);
                 };
+                const int inner = portrait ? (sharpH - 1 - py) : px;
                 double a = 1.0;
-                if (px < feather) a = (px + 0.5) / feather;
+                if (inner < feather) a = (inner + 0.5) / feather;
                 double rd = (c >> 16) & 0xFF, gn = (c >> 8) & 0xFF, bl = c & 0xFF;
                 rd = rd * (1 - a) + ch(16) * a;
                 gn = gn * (1 - a) + ch(8) * a;
@@ -10174,6 +10181,7 @@ static void SettingsPickFromGallery();
 static void SettingsPickNewImage();
 static bool SettingsRowVisible(const SPage* p, int i);
 static bool SettingsRowDisabled(const SPage* p, int i);
+static bool AnyScreenBackdrop();      // defined with the component helpers further down
 
 // ---------------------------------------------------------------- H2: pages by component
 // A page belongs to a *component*, not to a window kind: the strip has (float + bar + glass),
@@ -10718,6 +10726,15 @@ static bool SettingsRowVisible(const SPage* p, int i) {
 static bool SettingsRowDisabled(const SPage* p, int i) {
     if (!p || i < 0 || i >= p->count) return false;
     const wchar_t* key = p->rows[i].key;
+    if (p->kind == kPageGlass) {
+        // Nothing bakes a screen backdrop any more (every window is a picture or a solid colour):
+        // blur, capture rate and the drag rule have nothing to act on.
+        if (!wcscmp(key, L"blurRadius") || !wcscmp(key, L"glassOpacity") ||
+            !wcscmp(key, L"refreshHz") || !wcscmp(key, L"captureHz") ||
+            !wcscmp(key, L"captureBudgetMs") || !wcscmp(key, L"dragNoCapture"))
+            return !AnyScreenBackdrop();
+        return false;
+    }
     int bg = 0;
     if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
     else bg = GetInt(p->section.c_str(), L"bgMode", 0);
@@ -11054,6 +11071,24 @@ static bool CompanionUsesGlass(const Companion& c) {
     return CompanionBgMode(c) == 0 && layer == 1;      // H3 gives it a real backdrop
 }
 
+// "Does this window *have* a glass layer?" - a different question from CompanionUsesGlass() above,
+// which asks "does it bake a screen backdrop". A picture background has no backdrop to bake, but
+// it does take the glass layer's tint, so its 玻璃 page exists (bug report 2026-11-21: 图片 + 玻璃层开
+// 的窗口右键里没有玻璃页).
+static bool CompanionHasGlassLayer(const Companion& c) {
+    int layer = GetInt(L"traybar", L"glassLayer", -1);
+    if (layer != 0 && layer != 1) layer = g_cfg.glassLayer;
+    return layer == 1 && CompanionBgMode(c) != 2;      // solid has no glass material at all
+}
+
+// Does *any* window still bake a screen backdrop? If not, the glass page's blur / capture rows do
+// nothing (a picture is tinted, a solid has no glass) and are greyed out.
+static bool AnyScreenBackdrop() {
+    if (g_cfg.material == 1) return true;
+    if (g_trayBar.hwnd && CompanionUsesGlass(g_trayBar)) return true;
+    return false;
+}
+
 // H3: the float window's backdrop refresh. Same rules as the strip (captureHz, a floor of 2x
 // the measured cost, never mid-drag), plus the three things the plan asks for:
 //  * a fully faded-out window costs nothing (alpha 0 -> no capture at all, §3.3.3);
@@ -11173,7 +11208,7 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
         g_pages.push_back(SPage{L"浮窗", L"traybar", kRowsFloatTray,
                                 (int)(sizeof(kRowsFloatTray) / sizeof(kRowsFloatTray[0])),
                                 kPageFloatTray, 0});
-        const bool glass = CompanionUsesGlass(g_trayBar);
+        const bool glass = CompanionHasGlassLayer(g_trayBar);
         if (glass)
             g_pages.push_back(SPage{L"玻璃", L"dock", kRowsGlass,
                                     (int)(sizeof(kRowsGlass) / sizeof(kRowsGlass[0])),
@@ -11191,7 +11226,7 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
                                 kPageFloatDock, 0});
         g_pages.push_back(SPage{L"图标条", L"dock", kRowsBar,
                                 (int)(sizeof(kRowsBar) / sizeof(kRowsBar[0])), kPageBar, 0});
-        if (g_cfg.bgMode == 0 && g_cfg.glassLayer)
+        if (g_cfg.glassLayer && g_cfg.bgMode != 2)      // solid has no glass material
             g_pages.push_back(SPage{L"玻璃", L"dock", kRowsGlass,
                                     (int)(sizeof(kRowsGlass) / sizeof(kRowsGlass[0])),
                                     kPageGlass, 0});

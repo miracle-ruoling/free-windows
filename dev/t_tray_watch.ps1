@@ -65,7 +65,7 @@ public class FW {
 "@
 [void][FW]::SetProcessDpiAwarenessContext([IntPtr](-4))
 $log = Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.log'
-$strip = IntPtr.Zero
+$strip = [IntPtr]::Zero
 $sr = New-Object FW+RECT
 [void][FW]::EnumWindows({ param($h,$l) $script:n = [FW]::Cls($h); if ($script:n -eq "DockStripWindow") { $script:strip = $h; return $false }; return $true }, [IntPtr]::Zero)
 $strip = $script:strip

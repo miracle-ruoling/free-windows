@@ -202,6 +202,7 @@ struct Config {
     int debugBeacon = 0;         // diagnostic: magenta marker at a fixed client position
     int presentSync = 0;         // 1 = DwmFlush() after each present (see Present())
     int presentOrder = 0;        // 0 = ULW+pptDst, 1 = SetWindowPos then ULW, 2 = ULW then SWP
+    int zWatch = 1;              // task 1: keep the dock on top of newly raised topmost windows
     int blurIcons = 0;           // 1 = let the icons bleed into the glass
     int blurRadius = 16;          // blur radius in full-resolution pixels
     int refreshHz = 60;           // how often the strip repaints (0..180)
@@ -445,6 +446,10 @@ static void LoadConfig() {
     g_cfg.debugBeacon = GetInt(L"dock", L"debugBeacon", 0);
     g_cfg.presentSync = GetInt(L"dock", L"presentSync", 2);   // 2 = flush before, see Present()
     g_cfg.presentOrder = GetInt(L"dock", L"presentOrder", 0);
+    // task 1: WS_EX_TOPMOST is band membership, not a rank - see the "z-order policy" block
+    g_cfg.zWatch = GetInt(L"dock", L"zWatch", 1);
+    if (g_cfg.zWatch < 0) g_cfg.zWatch = 0;
+    if (g_cfg.zWatch > 1) g_cfg.zWatch = 1;
     g_cfg.blurIcons = GetInt(L"dock", L"blurIcons", 0);
     // `material` was read here before H2; it is derived from (bgMode, glassLayer) just above.
     if (g_cfg.material < 0 || g_cfg.material > 1) g_cfg.material = 1;
@@ -622,6 +627,7 @@ static void CreateDefaultIni() {
     WritePrivateProfileStringW(L"dock", L"captureHz", L"5", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"hoverMs", L"160", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"bakeRefreshMs", L"900", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"dock", L"zWatch", L"1", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"tint", L"#99101010", g_iniPath.c_str());
 }
 
@@ -9541,6 +9547,388 @@ static int CollectOurWindows(HWND* out, int max) {
     return n;
 }
 
+// ---------------------------------------------------------------- z-order policy (task 1)
+//
+// MEASURED with dev/t_ztry.ps1 (2026-11-22), do not "simplify" this back:
+//   * WS_EX_TOPMOST is band *membership*, not a rank. A window created or raised *after* ours
+//     that claims topmost legally lands above us (probe: our strip z#20, the new window z#17),
+//     and nothing here ever took it back - Present()/CompanionSetRect()/GroupPlace() all pass
+//     SWP_NOZORDER on purpose. That is the user's report: "for a while, whatever I just opened
+//     covers the dock; the same app in the same place is fine again later". The cause comes and
+//     goes with the *other* window, not with the dock.
+//   * The way back is one SetWindowPos(HWND_TOPMOST, NOMOVE|NOSIZE|NOACTIVATE) on a window that
+//     is *already* topmost: probe z#20 -> z#17, back on top. Promoting a window that LOST the
+//     flag does not do that - it lands at the *bottom* of the topmost band (probe: z#73, still
+//     under the other topmost window) - so the restore path asserts twice.
+//   * Everything else here is a consequence: never fight the shell (the taskbar is topmost and
+//     the whole tray logic in HANDOVER_NEXT.md §3.19 depends on it), never fight a menu, and
+//     step *below* a capture tool (below).
+//
+// The capture half. QQ / WeChat / SnippingTool put a topmost full-screen window in front and
+// draw the selection box in it. While that session is live the dock must sit *below* it: it
+// would otherwise take the drag and paint itself over the box (measured: with the snip overlay
+// up, our strip was the only window above it). Demoting hides nothing - the dock keeps being
+// part of the picture, which is exactly what the user wants (2026-11-22): screenshots and
+// screen recordings must show it. Only the z relationship to the capture tool changes, and only
+// while that tool is in front. A recorder never puts a topmost full-screen window in front, so
+// recording keeps the normal behaviour bit for bit.
+static int g_zMode = 0;                 // 0 = topmost, 1 = yielding to a capture session
+static DWORD g_zCapturePid = 0;         // the capture tool we are yielding to
+static DWORD g_zCaptureSeenAt = 0;      // last poll that still looked like that session
+static HWND g_zLastCulprit = nullptr;   // diagnostics: log a given offender once per 10 s
+static DWORD g_zLastLogAt = 0;
+static int g_zReasserts = 0;            // diagnostics
+static int g_zYields = 0;               // diagnostics
+
+// System UI that is allowed to stay above the dock, i.e. never fought. The taskbar is topmost
+// and *older* than us, but the shell re-raises it all the time; covering it would break the
+// tray/taskbar state in HANDOVER_NEXT.md §3.19, which was expensive to get right.
+static bool ZExemptClass(const wchar_t* cls) {
+    static const wchar_t* list[] = {
+        // shell: taskbar, its XAML islands, start/search/Win+X, IME + notification hosts
+        L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"XamlExplorerHostIslandWindow_WASDK",
+        L"Windows.UI.Core.CoreWindow", L"Shell_InputSwitchTopLevelWindow",
+        L"MultitaskingViewFrame", L"Windows.Internal.Shell.TabProxyWindow",
+        L"NotifyIconOverflowWindow", L"TopLevelWindowForOverflowXamlIsland",
+        L"TaskListThumbnailWnd", L"ForegroundStaging", L"Windows.UI.Composition.DesktopWindowContentBridge",
+        // transient UI that is *meant* to be above everything (menus, tooltips, balloon tips)
+        L"#32768", L"#32769", L"tooltips_class32", L"DockTooltip",
+        // the desktop itself
+        L"Progman", L"WorkerW", L"SysListView32",
+    };
+    for (auto s : list)
+        if (!_wcsicmp(cls, s)) return true;
+    return false;
+}
+
+static bool ZIsOurs(HWND h) {
+    if (IsOurWindow(h)) return true;      // strip/companion/panel/settings/menu/thumb
+    for (int i = 0; i < g_groupCount; i++)
+        if (g_groups[i].hwnd == h) return true;   // the group frames are ours too
+    return false;
+}
+
+// One entry per on-screen window of ours.
+struct ZMine {
+    HWND h;
+    int idx;        // index in the global top-to-bottom order
+    RECT rc;
+    bool topmost;
+};
+
+struct ZScanOut {
+    HWND culprit = nullptr;      // a window above one of ours that overlaps it
+    HWND mine = nullptr;         // the window of ours it covers
+    wchar_t cls[64]{};
+    DWORD pid = 0;
+    bool culpritTopmost = false;
+    bool culpritFullscreen = false;
+    bool demoted = false;        // one of our on-screen windows lost WS_EX_TOPMOST
+    HWND demotedHwnd = nullptr;
+};
+
+struct ZScanCtx {
+    ZMine mine[8];
+    int nMine = 0;
+    RECT uni{};
+    bool haveUni = false;
+    int idx = 0;
+    ZScanOut out;
+};
+
+static BOOL CALLBACK ZCollectProc(HWND h, LPARAM lp) {
+    auto* c = reinterpret_cast<ZScanCtx*>(lp);
+    int i = c->idx++;
+    if (!IsWindowVisible(h) || !ZIsOurs(h)) return TRUE;
+    RECT r{};
+    if (!GetWindowRect(h, &r)) return TRUE;
+    if (c->nMine < 8) {
+        ZMine& m = c->mine[c->nMine++];
+        m.h = h;
+        m.idx = i;
+        m.rc = r;
+        m.topmost = (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        if (!c->haveUni) {
+            c->uni = r;
+            c->haveUni = true;
+        } else {
+            UnionRect(&c->uni, &c->uni, &r);
+        }
+    }
+    return TRUE;
+}
+
+static BOOL CALLBACK ZScanProc(HWND h, LPARAM lp) {
+    auto* c = reinterpret_cast<ZScanCtx*>(lp);
+    int i = c->idx++;
+    if (c->out.culprit || !c->haveUni) return TRUE;      // the highest offender is the answer
+    if (!IsWindowVisible(h) || IsIconic(h) || ZIsOurs(h)) return TRUE;
+    RECT r{};
+    if (!GetWindowRect(h, &r)) return TRUE;
+    // cheap reject first: does it come near the area our windows live in at all?
+    if (r.right <= c->uni.left || r.left >= c->uni.right || r.bottom <= c->uni.top ||
+        r.top >= c->uni.bottom)
+        return TRUE;
+    // a closed UWP/app window stays WS_VISIBLE and is only cloaked by DWM: not on screen
+    if (IsCloaked(h)) return TRUE;
+    wchar_t cls[64]{};
+    GetClassNameW(h, cls, 64);
+    if (ZExemptClass(cls)) return TRUE;
+    for (int k = 0; k < c->nMine; k++) {
+        const ZMine& m = c->mine[k];
+        if (i >= m.idx) continue;                        // below that window of ours
+        if (r.right <= m.rc.left || r.left >= m.rc.right || r.bottom <= m.rc.top ||
+            r.top >= m.rc.bottom)
+            continue;
+        c->out.culprit = h;
+        c->out.mine = m.h;
+        wcscpy_s(c->out.cls, cls);
+        GetWindowThreadProcessId(h, &c->out.pid);
+        c->out.culpritTopmost = (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        // A window that owns (nearly) a whole monitor is a fullscreen app: a game, a video, a
+        // presentation. The dock must stay behind it, and it also stays behind the capture
+        // tool - see ZCaptureActive().
+        HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(mon, &mi)) {
+            int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+            int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            c->out.culpritFullscreen = (r.right - r.left) * 10 >= mw * 9 &&
+                                       (r.bottom - r.top) * 10 >= mh * 9;
+        }
+        break;
+    }
+    return TRUE;
+}
+
+// What is above us that should not be, and did we lose the topmost flag anywhere?
+static void ZScan(ZScanOut* out) {
+    ZScanCtx c;
+    EnumWindows(ZCollectProc, (LPARAM)&c);
+    for (int k = 0; k < c.nMine; k++) {
+        if (!c.mine[k].topmost) {
+            c.out.demoted = true;
+            c.out.demotedHwnd = c.mine[k].h;
+            break;
+        }
+    }
+    c.idx = 0;
+    EnumWindows(ZScanProc, (LPARAM)&c);
+    *out = c.out;
+}
+
+// Put our own stack back on top of the topmost band, bottom-most first: the order inside the
+// stack is group frames < companion < strip < panel/settings/thumbnail, and every SetWindowPos
+// moves the window to the top of the band, so the last one asserted ends up highest.
+// `twice`: needed after a demote (the first call only lifts us off the non-topmost band).
+static void ZAssertOurs(bool twice) {
+    const int passes = twice ? 2 : 1;
+    for (int p = 0; p < passes; p++) {
+        for (int i = 0; i < g_groupCount; i++) {
+            HWND h = g_groups[i].hwnd;
+            if (h && IsWindowVisible(h))
+                SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
+            SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (g_hwnd && IsWindowVisible(g_hwnd))
+            SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // The panel, the settings page and the thumbnail preview belong above the strip - but NOT
+        // while a foreign menu is up: TrayMenuTick() demotes the panel on purpose when it cannot
+        // lift that menu above it (RaiseMenuAbovePanel), and asserting here would paint the panel
+        // back over the app's menu.
+        if (!g_menuOpen) {
+            if (g_gridWnd && IsWindowVisible(g_gridWnd))
+                SetWindowPos(g_gridWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (g_setWnd && IsWindowVisible(g_setWnd))
+                SetWindowPos(g_setWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (g_thumbWnd && IsWindowVisible(g_thumbWnd))
+                SetWindowPos(g_thumbWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        g_zReasserts++;
+    }
+}
+
+// Step *below* everything topmost (the capture tool), without hiding anything.
+static void ZDemoteOurs() {
+    HWND list[8]{};
+    int n = CollectOurWindows(list, 8);
+    for (int i = 0; i < n; i++)
+        SetWindowPos(list[i], HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    for (int i = 0; i < g_groupCount; i++) {
+        HWND h = g_groups[i].hwnd;
+        if (h && IsWindowVisible(h))
+            SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    g_zYields++;
+}
+
+// A capture tool in its "pick a region" state: topmost, and owning (nearly) a whole monitor.
+// Every snipping UI looks like this; a recorder does not.
+// NOTE (measured 2026-11-22): the window that actually holds the foreground while the snip is up
+// is SnippingTool's `SnipOverlayRootWindow`, and DWM reports it *cloaked* (the visible part is its
+// child `XamlWindow`) - so do NOT test IsCloaked() on the foreground here, or the whole capture
+// branch never runs and the dock only "happens" to be behind, until some other code path
+// re-asserts it and it pops up over the selection box.
+static bool ZIsCaptureWindow(HWND h) {
+    if (!h || !IsWindow(h) || h == GetShellWindow()) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return false;
+    // The start menu / search host are topmost full-screen `Windows.UI.Core.CoreWindow`s too
+    // (measured 2026-11-22: the dock yielded to pid 17616, which was the shell). Anything the
+    // shell owns is not a capture tool - the exempt list is exactly that distinction.
+    wchar_t cls[64]{};
+    if (!GetClassNameW(h, cls, 64)) return false;
+    if (ZExemptClass(cls)) return false;
+    if (!(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return false;
+    RECT r{};
+    if (!GetWindowRect(h, &r)) return false;
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+    int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    return (r.right - r.left) * 10 >= mw * 9 && (r.bottom - r.top) * 10 >= mh * 9;
+}
+
+// Any window of `pid` still floating above everything? That is what a capture tool looks like
+// once the region is picked: the box disappears and a small topmost toolbar ("more settings")
+// stays. Cloaked windows do not count - the overlay host keeps a cloaked root window around
+// after the session, and that must not keep us demoted forever.
+static bool ZPidTopmostVisible(DWORD pid) {
+    struct Ctx {
+        DWORD pid;
+        bool found;
+    } c{pid, false};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p != c->pid) return TRUE;
+            if (!IsWindowVisible(h) || IsCloaked(h)) return TRUE;
+            if (!(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return TRUE;
+            c->found = true;
+            return FALSE;
+        },
+        (LPARAM)&c);
+    return c.found;
+}
+
+// Are we inside a capture session? Two independent signals, because neither alone is reliable:
+//   * `overlayAboveUs` - the z-order scan found a fullscreen topmost window above one of ours
+//     (measured: SnippingTool's overlay takes the foreground only intermittently, so the
+//     foreground alone was not enough - a snip once went by with the dock still topmost);
+//   * the foreground window itself looks like one (the case where we happen to be on top of it).
+// Once detected the tool's pid is latched, which covers the phase *after* the box is drawn (a
+// small topmost toolbar, not a full-screen window any more). Released as soon as that process
+// has nothing floating any more - i.e. "the snip is done, here is the editor".
+static bool ZCaptureActive(DWORD now, bool overlayAboveUs, DWORD overlayPid) {
+    if (overlayAboveUs && overlayPid) {
+        if (g_zCapturePid != overlayPid) {
+            wchar_t cls[64]{};
+            HWND fg = GetForegroundWindow();
+            GetClassNameW(fg, cls, 64);
+            DLog(L"zwatch: capture/fullscreen overlay above us (pid=%u, fg=%s) - stepping below it",
+                 overlayPid, cls);
+        }
+        g_zCapturePid = overlayPid;
+        g_zCaptureSeenAt = now;
+        return true;
+    }
+    HWND fg = GetForegroundWindow();
+    if (fg && ZIsCaptureWindow(fg)) {
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (g_zCapturePid != fgPid) {
+            wchar_t cls[64]{};
+            GetClassNameW(fg, cls, 64);
+            DLog(L"zwatch: capture overlay in front (cls=%s pid=%u) - stepping below it", cls, fgPid);
+        }
+        g_zCapturePid = fgPid;
+        g_zCaptureSeenAt = now;
+        return true;
+    }
+    if (g_zCapturePid) {
+        if (ZPidTopmostVisible(g_zCapturePid)) {
+            g_zCaptureSeenAt = now;
+            return true;
+        }
+        // Grace: a tool blinks its own windows while it switches phases, and flapping would cost
+        // two z-order round trips for nothing.
+        if (now - g_zCaptureSeenAt < 900) return true;
+        g_zCapturePid = 0;
+    }
+    return false;
+}
+
+// Runs on the 16 ms housekeeping gate, itself gated to ~450 ms: an EnumWindows of the top level
+// costs a few hundred microseconds, and z-order does not move that fast.
+static void ZWatchTick(DWORD now) {
+    if (!g_cfg.zWatch) return;
+    static DWORD lastPoll = 0;
+    if (lastPoll && now - lastPoll < 450) return;
+    lastPoll = now;
+
+    ZScanOut out;
+    LARGE_INTEGER q0{}, q1{};
+    QueryPerformanceCounter(&q0);
+    ZScan(&out);
+    QueryPerformanceCounter(&q1);
+    const double scanMs = QpcMs(q0, q1);
+    if (scanMs >= 3.0) DLog(L"slow: zwatch scan %.1f ms", scanMs);
+
+    // A fullscreen *topmost* window above us is either a snipping UI or a fullscreen app. The
+    // topmost requirement matters: while we are demoted every maximized window is "above us",
+    // and without it a plain browser window would be mistaken for a capture tool (and latch its
+    // pid). The right answer is the same for both real cases - the dock belongs *below* it - so
+    // this needs no further distinction. What it does need is the demote: without it our own
+    // show paths (CompanionVisibilityTick, the group show path) re-assert HWND_TOPMOST and the
+    // dock pops up over the selection box in the middle of a drag.
+    if (ZCaptureActive(now, out.culprit && out.culpritFullscreen && out.culpritTopmost, out.pid)) {
+        if (g_zMode != 1) {
+            g_zMode = 1;
+            ZDemoteOurs();
+            DLog(L"zwatch: yielding to a capture/fullscreen overlay (pid=%u) - our windows are "
+                 L"non-topmost until it goes, still fully visible in the picture", g_zCapturePid);
+        }
+        return;
+    }
+    if (g_zMode == 1) {
+        g_zMode = 0;
+        ZAssertOurs(true);
+        DLog(L"zwatch: overlay gone - topmost restored (%d asserts total)", g_zReasserts);
+        return;
+    }
+    // Never move the band while the shell's tray flyout or a forwarded app menu is on screen:
+    // both are topmost and have to stay above the dock (HANDOVER_NEXT.md §3.19 - the tray and
+    // taskbar state is what the whole shell integration rests on). They live a few seconds.
+    if (OverflowFlyoutOnScreen() || g_menuOpen) return;
+
+    if (!out.culprit && !out.demoted) return;
+    // Never fight a drag: the window is moving, its band is asserted again when it lands.
+    if (g_dragging || g_dragMovePending || GroupDragging() || GroupScaling()) return;
+    ZAssertOurs(out.demoted);
+    if (out.culprit != g_zLastCulprit || !g_zLastLogAt || now - g_zLastLogAt > 10000) {
+        g_zLastCulprit = out.culprit;
+        g_zLastLogAt = now;
+        if (out.culprit)
+            DLog(L"zwatch: re-asserted topmost - %s (pid=%u topmost=%d) was above %p",
+                 out.cls, out.pid, out.culpritTopmost ? 1 : 0, (void*)out.mine);
+        else
+            DLog(L"zwatch: re-asserted topmost - %p had lost WS_EX_TOPMOST", (void*)out.demotedHwnd);
+    }
+}
+
 static HWND WindowUnderUs(const RECT& wr) {
     struct Ctx {
         const RECT* wr;
@@ -12133,6 +12521,7 @@ static void RenderTick() {
             QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();
             FocusWatchTick();
+            ZWatchTick(now);         // task 1: keep the topmost band honest (and yield to snips)
             if (g_trayRetryAt && (LONG)(now - g_trayRetryAt) >= 0) {
                 g_trayRetryAt = 0;
                 // Never rebuild the panel while it is open: the tray list is

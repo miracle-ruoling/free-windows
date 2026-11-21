@@ -12,7 +12,8 @@
   powershell -NoProfile -ExecutionPolicy Bypass -File dock\build.ps1
   Start-Process explorer.exe "$env:LOCALAPPDATA\Programs\Dock\dock.exe"
   ```
-- 当前 HEAD：**`78aecf2`**；最新源码备份：**`dock.cpp.bak52_sharedrows`**（同状态）。
+- 当前 HEAD：**`5a54862`**（任务 1 已提交）；最新源码备份：**`dock.cpp.bak54_zwatch`**（同状态），
+  任务 1 之前的原样在 `dock.cpp.bak53_zwatch`。
 - 用户当前的 ini（读出来的真值，别乱覆盖）：
   ```
   [dock]    bgMode=1(图片) glassLayer=1 blurRadius=0 glassOpacity=255 tintStrength=33
@@ -71,7 +72,15 @@
 
 ## 3. 本轮 5 件事
 
-### 任务 1 — 窗口 z 序"优先级"bug + 截图时挡选区
+### 任务 1 — 窗口 z 序"优先级"bug + 截图时挡选区 —— ✅ **已完成（2026-11-22 0x，见 HANDOVER_NEXT.md §3.29）**
+
+> 现状：这一节下面的问题描述、怀疑顺序都还留着当背景，但**结论已经落地**：
+> ① 看门狗（`ZWatchTick`，450 ms）在被非白名单 topmost 窗口压住、或自己丢了 topmost 时，
+> 按 组框<浮窗<条<面板 的顺序重新断言；② 截图覆盖层（topmost + 占满显示器）压上来时把 dock 全部降成非 topmost、
+> 锁住那个 pid，覆盖层走了再断言两遍恢复 —— **dock 仍然出现在截图/录屏里**，只是不抢选区。
+> 新键 `[dock] zWatch=1`。验收脚本 `dev/t_zfix.ps1`（3 次 5/5 通过），§3.19 判据 1/2/4 复跑通过。
+> **只剩用户自己的两项手工验收**：复现时段里 10 分钟不被挡（跑 `dev\t_zwatch.ps1 -Seconds 600 -Tag bad`
+> 留下证据），以及 Win+Shift+S 框选实际手感。
 
 **用户描述（要点）**
 - 我们的窗口有时会被**新召出的窗口**遮挡；**与时间有关**：某段时间突然开始发生，这段时间内稳定复现，
@@ -178,13 +187,18 @@
 | `t_winbtn_taskbar.ps1 -Mode cycle` | §3.19 的任务栏稳定判据（全程 `y=1078`） |
 | `t_glassdrag.ps1` / `t_circledrag.ps1` | 拖动 / 快速画圈（后者自带 lag 统计） |
 | `t_groupdrag.ps1 -Inset 6` | 真正拖动整组（会改尺寸并写 ini，用完记得复原） |
+| `t_zwatch.ps1 -Seconds 600 -Tag bad` | **任务 1**：长时间采样 z 序（z#/topmost/压在上面的类名/前台），日志 `dev\zwatch_<tag>_*.log`；`-Once` 是一次完整 dump |
+| `t_ztry.ps1` | **任务 1**：机制实验（新 topmost 窗口压上来 / 重新断言 / 降级后的行为），一次跑完自动收拾 |
+| `t_zfix.ps1` | **任务 1 验收**：A 看门狗自己爬回去、B 外部降级后恢复、C 截图覆盖层让位与恢复，5 条判据 |
+| `t_snipwatch.ps1` | 看 Win+Shift+S 覆盖层长什么样（类名/cloaked/z 位置） |
 
 ⚠️ **面板自动化很不稳**：右键菜单的弹出位置随布局变，我这一轮连续点歪好几次都没打开设置面板。
 要么先 `rcshot.ps1` 截图定位再点，要么直接让用户自己点。
 
 ## 5. 存档点与回退
 
-- HEAD `78aecf2`（= `dock.cpp.bak52_sharedrows`）。
+- HEAD `5a54862`（= `dock.cpp.bak54_zwatch`，任务 1）；任务 1 之前是 `78aecf2`
+  （= `dock.cpp.bak52_sharedrows` / `bak53_zwatch`）。
 - 近期 tag：`pre-glasscfg-2026-11-21`、`h3c-2026-11-20`、`h3a-2026-11-20`、
   `known-good-2026-11-17-1755 / 1720 / 1630`（最后一个 `1630` 是任务栏那套"用户确认完全符合预期"的状态）。
 - 回退单个文件：`git checkout <commit> -- dock.cpp`（**不要**用脚本覆盖源码）。

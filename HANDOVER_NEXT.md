@@ -1512,3 +1512,50 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 把 GBK 字节当 UTF-8 解码再写回 → **中文路径被永久毁掉**，dock 日志出现
 `image: cannot decode ...\锟斤拷幕锟斤拷图...`，图片背景整块失效（上一轮的锐度修复也因此没生效）。
 修法：**改这个 ini 必须用 `[System.Text.Encoding]::GetEncoding(936)`** 读写；改完用 Win32 `GetPrivateProfileStringW` 回读确认。
+
+### 3.29 任务 1 落地（2026-11-22 00:1x–0x）：z 序看门狗 + 截图时让位
+
+**先量再改的两条实测结论（`dev/t_ztry.ps1`，别凭直觉推翻）**
+
+1. **`WS_EX_TOPMOST` 是"带"，不是"排名"**。任何**后来**出现/被抬起的 topmost 窗口都合法地压在我们上面
+   （实测：我们的条 z#20 → 新 topmost 窗口 z#17）。而本程序里 `Present()`/`CompanionSetRect()`/`GroupPlace()`
+   全都特意带 `SWP_NOZORDER`，**没有任何一处会把它抢回来** → 这就是用户说的"某段时间起新召出的窗口总压住 dock，
+   过一阵同样的应用又好了"：变量在**对方**，不在 dock。
+2. **回来的路只有一条**：对**已经 topmost** 的窗口再调一次
+   `SetWindowPos(h, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)` → 回到带的**最顶**（实测 z#20 → z#17）。
+   对一个**丢了** topmost 的窗口做同样调用**不管用**：它会落到带的**最底**（实测 z#73，仍在另一个 topmost 之下）
+   ⇒ 所以"从降级状态恢复"必须断言**两遍**。
+
+**落地的东西（`dock.cpp` 的 "z-order policy (task 1)" 段，紧跟 `CollectOurWindows()`）**
+
+- `ZWatchTick(now)`：挂在原有 16 ms housekeeping 里，自身 450 ms 节流；每次 `EnumWindows` 两遍
+  （先收集我们的可见窗口 + 外接矩形，再从上往下找"压在我们上面、且和某个我们窗口相交"的**第一个**窗口）。
+  命中或发现"我们某个窗口丢了 topmost"→ 按 **组框 < 浮窗 < 条 < 面板/设置/缩略图** 的顺序重新断言（最后断言的最靠上）。
+- **不抢的**（`ZExemptClass`）：任务栏 `Shell_TrayWnd`/`Shell_SecondaryTrayWnd`、`XamlExplorerHostIslandWindow_WASDK`、
+  `Windows.UI.Core.CoreWindow`（开始菜单/搜索/IME/通知宿主）、托盘浮窗、`#32768`/`tooltips_class32` 等。
+  另外**托盘原生浮窗在屏上、或转发的应用菜单开着时整段不动**（§3.19 的托盘/任务栏状态全靠它）。
+- **截图这半边（用户 2026-11-22 的定义，别做错）**：dock **要出现在截图和录屏里**，
+  只是"截图过程中（框选、框选完的更多设置）要被压到后面、不能抢鼠标"。所以**没有**用
+  `WDA_EXCLUDEFROMCAPTURE` 永久隐藏自己 —— 那是另一回事，用户明确否掉了。
+  判定 = 一个**非 shell、topmost、占满≥90% 显示器**的窗口压在我们上面（或它就是前台）；
+  一旦判定成"截图/全屏覆盖层"，就把我们**全部窗口降成非 topmost**（`ZDemoteOurs`），
+  锁住那个 pid，直到它**没有可见的非 cloaked topmost 窗口**了（+900 ms 宽限）才断言两遍恢复。
+  为什么要主动降级而不只是"不去抢"：我们自己的显示路径（`CompanionVisibilityTick`、组框 show 分支）会
+  `SetWindowPos(HWND_TOPMOST)`，不降级的话 dock 会在框选拖到一半时自己弹回覆盖层上面。
+  实测：SnippingTool 的覆盖层根窗口 `SnipOverlayRootWindow` 是 **cloaked** 的（真正可见的是它的 `XamlWindow` 子窗），
+  而且它**只是间歇性地拿前台** —— 所以判定不能只看 `GetForegroundWindow()`，必须用 z 序证据（第一版踩过这个坑）。
+- 新 ini 键 **`[dock] zWatch=1`**（0 = 整个看门狗关掉，纯 A/B 用）。日志 `zwatch: ...` 记每一次变更；
+  `slow: zwatch scan X ms` 只在 >3 ms 时出现（实测平时 <3 ms，不出现）。
+
+**验收现状**
+
+- `dev/t_zfix.ps1`（新）：A 新 topmost 窗口压上来 → 看门狗自己爬回去；B 从外部把我们降级 → 恢复 topmost 且回到对方之上；
+  C Win+Shift+S 覆盖层在前 → 我们变 tm=0 且在其下，覆盖层消失 → 恢复 tm=1。**连跑 3 次全 5/5 通过**。
+- §3.19 自动化判据复跑通过：`t_winbtn_taskbar.ps1 -Mode cycle -Gap 180 -Cycles 10`（任务栏全程 y=1078）、
+  `t_winbtn_repro.ps1`（C 段 minY=1078 riseAt=-1）、`t_tray_watch.ps1 -Clicks 2`（升/收全程 y=1078，cloak 正常）。
+  第 3/5 条（开始菜单+任务栏一起出/收）仍需**用户手工验**。
+- `dev/t_tray_watch.ps1` 里 `$strip = IntPtr.Zero` 的笔误已修（之前每次都拿不到条窗口、报错退出）。
+
+**还没做的**：用户"10 分钟不被挡"的长时间验收要靠他自己在复现时段跑
+`dev\t_zwatch.ps1 -Seconds 600 -Tag bad`（日志落在 `dev\zwatch_bad_*.log`，每行有 z#/topmost/覆盖者类名/前台），
+再把它和"正常时段"的 `-Tag ok` 对照。**别在没跑过这两个日志之前改判定规则。**

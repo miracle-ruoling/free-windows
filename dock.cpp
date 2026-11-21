@@ -3800,6 +3800,16 @@ static bool PointerInDefaultGroup(POINT p);   // pointer in the strip's own grou
 // quick settings placement (defined after the companions: it needs the capture helpers)
 static void QuickSettingsBeginPlacement(const RECT& button);
 
+// Task 1, z-order policy (the whole story is in the block next to CollectOurWindows):
+// 0 = normal, every window of ours belongs in the topmost band; 1 = the dock is deliberately
+// *below* a capture tool (or a fullscreen app) and NOTHING of ours may assert HWND_TOPMOST -
+// the automatic show paths below are the ones that used to undo that in the middle of a
+// selection drag (measured by the user with QQ's snip on 2026-11-22: the toolbar/menus sit right
+// next to the dock, so moving onto them fades the companion in, and its show path lifted the
+// whole dock back over the selection box).
+static int g_zMode = 0;
+static HWND ZBandInsert() { return g_zMode == 1 ? HWND_NOTOPMOST : HWND_TOPMOST; }
+
 static int CompanionIconPx(const Companion& c) {
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
     int shortSide = w < h ? w : h;
@@ -5781,10 +5791,10 @@ static void CompanionVisibilityTick(DWORD now) {
                                  // present, so assert it once with the current value
             if (g.id == 1) {
                 if (g_trayBar.hwnd)
-                    SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SetWindowPos(g_trayBar.hwnd, ZBandInsert(), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 if (g_hwnd)
-                    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
@@ -5819,17 +5829,21 @@ static void CompanionVisibilityTick(DWORD now) {
                      now.right - now.left != c.rc.right - c.rc.left ||
                      now.bottom - now.top != c.rc.bottom - c.rc.top;
         if (moved) {
-            SetWindowPos(c.hwnd, HWND_TOPMOST, c.rc.left, c.rc.top, c.rc.right - c.rc.left,
-                         c.rc.bottom - c.rc.top, SWP_NOACTIVATE);
+            // While the dock is yielding to a capture overlay this must be a plain move: a
+            // HWND_TOPMOST insert here would lift the companion back over the selection box
+            // (task 1 - "the dock pops up when the pointer wanders into the menus next to it").
+            SetWindowPos(c.hwnd, g_zMode == 1 ? nullptr : HWND_TOPMOST, c.rc.left, c.rc.top,
+                         c.rc.right - c.rc.left, c.rc.bottom - c.rc.top,
+                         SWP_NOACTIVATE | (g_zMode == 1 ? SWP_NOZORDER : 0u));
         }
         // and publish the anchor once (the flyout may be opened before the next move).
         AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
         // z-order: group frame < companion < strip. The frame asserts itself just above, so
         // both of these are needed on every show (dropping them lets the frame paint over the
         // companion).
-        SetWindowPos(c.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(c.hwnd, ZBandInsert(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_hwnd)
-            SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         // The visible pixels are (re)built here and not while hidden: see the note in
         // TrayStateRefresh. ~1 ms, once per appearance.
@@ -9572,7 +9586,7 @@ static int CollectOurWindows(HWND* out, int max) {
 // screen recordings must show it. Only the z relationship to the capture tool changes, and only
 // while that tool is in front. A recorder never puts a topmost full-screen window in front, so
 // recording keeps the normal behaviour bit for bit.
-static int g_zMode = 0;                 // 0 = topmost, 1 = yielding to a capture session
+// (g_zMode itself is declared up with ZBandInsert - the automatic show paths need it.)
 static DWORD g_zCapturePid = 0;         // the capture tool we are yielding to
 static DWORD g_zCaptureSeenAt = 0;      // last poll that still looked like that session
 static HWND g_zLastCulprit = nullptr;   // diagnostics: log a given offender once per 10 s
@@ -9771,6 +9785,21 @@ static void ZDemoteOurs() {
     g_zYields++;
 }
 
+// Did anything of ours end up back in the topmost band while we are supposed to be below an
+// overlay? ~10 GetWindowLong calls, cheap enough for every tick.
+static bool ZAnyOursTopmost() {
+    HWND list[8]{};
+    int n = CollectOurWindows(list, 8);
+    for (int i = 0; i < n; i++)
+        if (GetWindowLongW(list[i], GWL_EXSTYLE) & WS_EX_TOPMOST) return true;
+    for (int i = 0; i < g_groupCount; i++) {
+        HWND h = g_groups[i].hwnd;
+        if (h && IsWindowVisible(h) && (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST))
+            return true;
+    }
+    return false;
+}
+
 // A capture tool in its "pick a region" state: topmost, and owning (nearly) a whole monitor.
 // Every snipping UI looks like this; a recorder does not.
 // NOTE (measured 2026-11-22): the window that actually holds the foreground while the snip is up
@@ -9875,6 +9904,27 @@ static bool ZCaptureActive(DWORD now, bool overlayAboveUs, DWORD overlayPid) {
 // costs a few hundred microseconds, and z-order does not move that fast.
 static void ZWatchTick(DWORD now) {
     if (!g_cfg.zWatch) return;
+
+    // While yielding, undo any re-assert immediately. This is the case the user hit with QQ's
+    // snip: the selection toolbar and its menus sit right next to the dock, moving onto them
+    // fades the companion in, and that show path lifted the whole dock back over the selection
+    // box. Guarding the two automatic show paths (ZBandInsert) covers the known ones - this is
+    // the net under all of them, and it runs on every tick (~16 ms) rather than on the 450 ms
+    // poll, so the dock is never above the overlay long enough to be seen.
+    if (g_zMode == 1) {
+        static DWORD lastRedemote = 0;
+        static DWORD lastRedemoteLog = 0;
+        if (ZAnyOursTopmost() && (!lastRedemote || now - lastRedemote >= 150)) {
+            lastRedemote = now;
+            ZDemoteOurs();
+            if (!lastRedemoteLog || now - lastRedemoteLog >= 5000) {
+                lastRedemoteLog = now;
+                DLog(L"zwatch: something of ours re-asserted topmost during a capture - demoted "
+                     L"again");
+            }
+        }
+    }
+
     static DWORD lastPoll = 0;
     if (lastPoll && now - lastPoll < 450) return;
     lastPoll = now;

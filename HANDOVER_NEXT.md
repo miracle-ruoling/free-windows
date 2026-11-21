@@ -1559,3 +1559,34 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 **还没做的**：用户"10 分钟不被挡"的长时间验收要靠他自己在复现时段跑
 `dev\t_zwatch.ps1 -Seconds 600 -Tag bad`（日志落在 `dev\zwatch_bad_*.log`，每行有 z#/topmost/覆盖者类名/前台），
 再把它和"正常时段"的 `-Tag ok` 对照。**别在没跑过这两个日志之前改判定规则。**
+
+#### 3.29.1 QQ 截图（Ctrl+Alt+X）实测 + "逛一下菜单 dock 就上来了"的真因（2026-11-22 01:2x）
+
+**QQ 截图长什么样**（`dev/t_qqsnip.ps1 -Mode probe`）：按下 Ctrl+Alt+X 后 QQ 会放**两个全屏 topmost 窗口**，
+同一个 pid：`QQScreenCapture Window Class`（标题 "QQScreenCapture BackView Window"）与 `Chrome_WidgetWin_1`
+（标题 "QQ"，QQNT 是 Electron 套壳）。我们的条当场 tm=1 → 0，Esc 后 → 1。
+⇒ 之前那条"非 shell + topmost + 占满显示器"的判定对 QQ 天然成立，不用为它单列白名单。
+
+**用户报的现象**：选区一旦**把 dock 框进去**，只在选区里移动鼠标时 dock 老实待在下面；可是**去选区下面的
+工具栏/菜单里逛一圈再回来，dock 就跑到选区上面了**。（选区没框住 dock 时它在上层，用户说可接受，因为那时
+本来就不干扰截图。）
+
+**真因不在看门狗**：QQ 的工具栏和它的菜单就贴在选区边上，也就是**贴着 dock**。鼠标移过去 = 进了 dock 的淡出半径
+⇒ 浮窗淡入 ⇒ `CompanionVisibilityTick` 的显示路径里那几处 `SetWindowPos(c.hwnd, HWND_TOPMOST, ...)` 把整条链
+（浮窗 + 条）重新塞回 topmost 带 ⇒ dock 立刻盖到选区上面。看门狗在整个会话里都在让位，是**我们自己的显示路径**把它拆了。
+
+**修法（两层，都必要）**
+1. 新增 `ZBandInsert()`（在 `QuickSettingsBeginPlacement` 的声明旁边，和 `g_zMode` 一起）：
+   yield 期间返回 `HWND_NOTOPMOST`，其余时候还是 `HWND_TOPMOST`。改到的那两处自动路径：
+   组框重新出现的 show 分支（两条 `SetWindowPos`）、浮窗出现的那段（移动那次在 yield 期间改成
+   `SWP_NOZORDER` 的纯移动 + 两处 z 断言）。
+2. **兜底**：`ZWatchTick` 在 yield 期间跑在**每个 tick**（~16 ms，不是 450 ms 轮询）——
+   `ZAnyOursTopmost()`（~10 次 `GetWindowLong`）发现我们的窗口又带上 topmost 了，就 `ZDemoteOurs()` 压回去，
+   150 ms 节流 + 5 s 一条日志 `zwatch: something of ours re-asserted topmost during a capture`。
+   这一层照顾的是**没被点名**的那些断言（拖动、面板、缩略图、mod 里抬栏等）。
+
+**验收**：`dev/t_qqsnip.ps1 -Mode flow` 全程实测（Ctrl+Alt+X → 在 dock 上拖一个选区 → 依次把光标停在
+"工具栏下方 / 浮窗上 / 条上 / 回到选区中心" 各 700 ms）：**每一步 strip 和 tray 都是 tm=0**（浮窗甚至会淡入显示
+vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zfix.ps1` 也加了 D 段（snip 期间从外部强行
+`HWND_TOPMOST` → 450 ms 内被压回去）和 E 段（snip 期间把光标停到浮窗上 → 两个窗口都还是 tm=0），现在 **6/6 通过**。
+

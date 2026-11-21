@@ -23,6 +23,9 @@ public class ZF {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int idx);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   public static readonly IntPtr TOPMOST = new IntPtr(-1), NOTOPMOST = new IntPtr(-2);
@@ -143,6 +146,32 @@ if (-not $SkipCapture) {
     Write-Output ("   before: " + $before)
     Write-Output ("   during: " + $during + "  above=" + $aboveDuring)
     Check "C  dock stepped below the capture overlay" ($during -match 'topmost=0') $during
+    # D: our own show paths assert HWND_TOPMOST all over the place (the companion fading in when
+    # the pointer reaches the menus next to the dock is what the user hit with QQ's snip).
+    # Simulate one of those asserts while the overlay is up: it must be undone, not left on top.
+    [void][ZF]::SetWindowPos($hStrip, [ZF]::TOPMOST, 0, 0, 0, 0, ([ZF]::NOMOVE -bor [ZF]::NOSIZE -bor [ZF]::NOACTIVATE))
+    Start-Sleep -Milliseconds 450
+    $afterAssert = [ZF]::Where($hStrip)
+    Write-Output ("   after a forced HWND_TOPMOST assert: " + $afterAssert)
+    Check "D  a re-assert during the snip is undone" ($afterAssert -match 'topmost=0') $afterAssert
+
+    # E: the reported QQ case. The toolbar / its menus sit right next to the dock, so the pointer
+    # ends up inside the dock's fade radius while the snip is still up: the companion fades in and
+    # its show path used to lift the whole dock back over the selection box. Park the cursor on the
+    # companion and make sure both stay non-topmost.
+    $hComp = [ZF]::ByClass("DockTrayBarWindow")
+    if ($hComp -ne [IntPtr]::Zero) {
+        $cr = New-Object ZF+RECT; [void][ZF]::GetWindowRect($hComp, [ref]$cr)
+        $save = New-Object ZF+POINT; [void][ZF]::GetCursorPos([ref]$save)
+        [void][ZF]::SetCursorPos([int](($cr.Left + $cr.Right) / 2), [int](($cr.Top + $cr.Bottom) / 2))
+        Start-Sleep -Milliseconds 900
+        $compNow = [ZF]::Where($hComp)
+        $stripNow = [ZF]::Where($hStrip)
+        Write-Output ("   cursor parked on the companion: companion " + $compNow)
+        Write-Output ("                                  strip     " + $stripNow)
+        Check "E  companion fading in does not lift the dock" (($compNow -match 'topmost=0') -and ($stripNow -match 'topmost=0')) $stripNow
+        [void][ZF]::SetCursorPos($save.X, $save.Y)
+    }
     # close it: SnippingTool accepts Escape; killing is the fallback
     Add-Type -AssemblyName System.Windows.Forms
     try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch {}

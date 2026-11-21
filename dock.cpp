@@ -203,6 +203,10 @@ struct Config {
     int presentSync = 0;         // 1 = DwmFlush() after each present (see Present())
     int presentOrder = 0;        // 0 = ULW+pptDst, 1 = SetWindowPos then ULW, 2 = ULW then SWP
     int zWatch = 1;              // task 1: keep the dock on top of newly raised topmost windows
+    // task 2: double-clicking the strip's empty area hops it to the other side of the monitor's
+    // centre line ("dodge"). 0 disables *only* that path - every other double-click meaning
+    // (launching an icon, the tray button) is untouched, it is a different branch.
+    int dodgeOnDoubleClick = 1;
     int blurIcons = 0;           // 1 = let the icons bleed into the glass
     int blurRadius = 16;          // blur radius in full-resolution pixels
     int refreshHz = 60;           // how often the strip repaints (0..180)
@@ -450,6 +454,10 @@ static void LoadConfig() {
     g_cfg.zWatch = GetInt(L"dock", L"zWatch", 1);
     if (g_cfg.zWatch < 0) g_cfg.zWatch = 0;
     if (g_cfg.zWatch > 1) g_cfg.zWatch = 1;
+    // task 2: the double-click dodge; 1 = the behaviour this program always had
+    g_cfg.dodgeOnDoubleClick = GetInt(L"dock", L"dodgeOnDoubleClick", 1);
+    if (g_cfg.dodgeOnDoubleClick < 0) g_cfg.dodgeOnDoubleClick = 0;
+    if (g_cfg.dodgeOnDoubleClick > 1) g_cfg.dodgeOnDoubleClick = 1;
     g_cfg.blurIcons = GetInt(L"dock", L"blurIcons", 0);
     // `material` was read here before H2; it is derived from (bgMode, glassLayer) just above.
     if (g_cfg.material < 0 || g_cfg.material > 1) g_cfg.material = 1;
@@ -628,6 +636,7 @@ static void CreateDefaultIni() {
     WritePrivateProfileStringW(L"dock", L"hoverMs", L"160", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"bakeRefreshMs", L"900", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"zWatch", L"1", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"dock", L"dodgeOnDoubleClick", L"1", g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"tint", L"#99101010", g_iniPath.c_str());
 }
 
@@ -10766,6 +10775,10 @@ struct SRow {
     // for things like "background type". nullptr = not a choice row.
     const wchar_t* const* choices = nullptr;
     int choiceCount = 0;
+    // Value to show while the key is still absent from the ini (a fresh profile). It has to agree
+    // with the default in LoadConfig(), or the panel disagrees with the running program - the
+    // trap the dodge switch fell into (behaviour on, panel reading 关). 0 = "same as before".
+    int defv = 0;
 };
 
 struct SPage {
@@ -10880,6 +10893,10 @@ static const SRow kRowsBar[] = {
     {L"maxIcon", L"最大图标", 16, 160, 0, 0, nullptr, nullptr},
     {L"hoverMs", L"图标动画时长 (ms)", 40, 600, 0, 0, nullptr, nullptr},
     {L"scrollStep", L"滚轮翻页步长", 1, 5, 0, 0, nullptr, nullptr},
+    // task 2: the double-click dodge is a strip gesture, so its switch lives here. Off only
+    // removes the path that hops the strip across the centre line; an icon's double click and
+    // the tray button are untouched.
+    {L"dodgeOnDoubleClick", L"双击空白处闪避（跳到另一侧）", 0, 1, 0, 1, L"开", L"关", nullptr, 0, 1},
 };
 
 // Group page: the frame and its two switches.
@@ -10961,7 +10978,7 @@ static int PageVal(int i) {
     }
     if (p->kind == kPageFloatTray) return TrayKeyVal(row.key);
     if (IsSharedGlassKey(row.key)) return GetInt(L"dock", row.key, row.minv);
-    return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : 0);
+    return GetInt(p->section.c_str(), row.key, row.minv < 0 ? -1 : row.defv);
 }
 
 static void PageLoad() {
@@ -12240,6 +12257,7 @@ static void FlipTick() {
 }
 
 static void StartFlip() {
+    if (!g_cfg.dodgeOnDoubleClick) return;   // task 2: [dock] dodgeOnDoubleClick=0
     if (g_flip.active) return;
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
@@ -13095,8 +13113,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ReleaseCapture();
                 DLog(L"click slot=%d hwnd=%p lnk=%s", g_pressSlot, (void*)g_pressHwnd,
                      g_pressLnk.c_str());
-                // empty strip (neither an icon nor "^"): the second quick click dodges
-                if (g_pressSlot < 0 && !g_pressHwnd && g_pressLnk.empty()) {
+                // empty strip (neither an icon nor "^"): the second quick click dodges.
+                // [dock] dodgeOnDoubleClick=0 removes just this branch - the click tracking is
+                // not even started, so nothing else can inherit a stale "last blank click".
+                if (g_pressSlot < 0 && !g_pressHwnd && g_pressLnk.empty() &&
+                    g_cfg.dodgeOnDoubleClick) {
                     if (IsBlankDoubleClick()) {
                         StartFlip();
                         return 0;

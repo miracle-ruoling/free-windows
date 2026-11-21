@@ -62,7 +62,8 @@
 - `[dock]`：iconSize gap pad radius bg hover fadeStart fadeEnd vertical clickActiveMinimizes thumbWidth/Height/Delay
   minIcon maxIcon scrollStep allowResize upscaleSmallIcons x y w h hasPos hasSize bgMode glassLayer hue solidOpacity
   dragNoCapture blurRadius tintStrength glassOpacity refreshHz captureHz captureBudgetMs presentSync presentOrder
-  order extraPins image dumpBake debugBeacon **（`lightMode` / `tint` / `color` 已废弃，仅作迁移回退，待清理）**
+  order extraPins image dumpBake debugBeacon **zWatch** **dodgeOnDoubleClick**
+  **（`lightMode` / `tint` / `color` 已废弃，仅作迁移回退，待清理）**
 - `[traybar]`：enabled follow group x y w h hasPos pad gap radius bgMode glassLayer hue solidOpacity image
   blurRadius tintStrength glassOpacity（外观类 `-1` = 继承条）
 - `[group]` / `[group.N]`：enabled margin lineAlpha lineWidth radius blockResize blockMove fadeStart fadeEnd
@@ -115,13 +116,19 @@
 **要先问清楚的**：遮挡发生时，对方窗口是不是 topmost（探针能看出来）？用户是否接受"看门狗"式的定时 re-assert
 （会有极低概率和全屏应用抢，需要白名单/黑名单）？
 
-### 任务 2 — 双击闪避做成开关
+### 任务 2 — 双击闪避做成开关 —— ✅ **已完成（2026-11-22 01:3x，见 HANDOVER_NEXT.md §3.30）**
 
-- 现状：双击**条的空白处**会"闪避"到中心线另一侧（日志 `flip: double click on empty strip -> ...`；
-  入口在 `FlipEnd()` 附近的那个函数（置 `g_flip.active = true`）+ `IsBlankDoubleClick()` + `FlipTick()`）。
+> 现状：双击**条的空白处**会"闪避"到中心线另一侧（日志 `flip: double click on empty strip -> ...`；
+> 入口 `StartFlip()`（置 `g_flip.active = true`）+ `IsBlankDoubleClick()` + `FlipTick()`）。
+> 已加 `[dock] dodgeOnDoubleClick=1/0`（默认 1）+ 「图标条」页最后一行「双击空白处闪避（跳到另一侧）」。
+> 关掉只断这一条分支，图标双击/托盘按钮双击不受影响。验收 `dev/t_dodge.ps1`（关：条不动、不产生 flip 日志；
+> 开：跳到镜像位置并来回复原），4/4 通过。
+
+**原需求（存档）**
+
 - 要：`[dock] dodgeOnDoubleClick=1/0`（默认 1 = 保持现状），「浮窗」或「图标条」页加一行开关；
   关闭后这条路径直接不触发，**不要**影响其它双击语义（例如图标双击启动）。
-- 注意：`g_flip.active` 期间窗口"不重绘只移动"，关闭后不必动这些代码，只需不进入。
+- `g_flip.active` 期间窗口"不重绘只移动"，所以关掉不必动这些代码，只需不进入。
 
 ### 任务 3 — 每个浮窗 + 条 的"吸附"开关
 
@@ -195,14 +202,15 @@
 | `t_zfix.ps1` | **任务 1 验收**：A 看门狗自己爬回去、B 外部降级后恢复、C 截图覆盖层让位与恢复，5 条判据 |
 | `t_snipwatch.ps1` | 看 Win+Shift+S 覆盖层长什么样（类名/cloaked/z 位置） |
 | `t_qqsnip.ps1 -Mode flow` | **任务 1**：真 QQ 截图（Ctrl+Alt+X）全流程 —— 在 dock 上拖选区、把光标停在工具栏/浮窗/条上，逐点采样我们的 tm；`-Mode probe` 只开框选不拖 |
+| `t_dodge.ps1` | **任务 2 验收**：关掉 `dodgeOnDoubleClick` 后双击空白处条不动、无 flip 日志；打开后跳到镜像位置并来回复原（ini 用 `WritePrivateProfileStringW` 写，不碰编码） |
 
 ⚠️ **面板自动化很不稳**：右键菜单的弹出位置随布局变，我这一轮连续点歪好几次都没打开设置面板。
 要么先 `rcshot.ps1` 截图定位再点，要么直接让用户自己点。
 
 ## 5. 存档点与回退
 
-- HEAD `5a54862`（= `dock.cpp.bak54_zwatch`，任务 1）；任务 1 之前是 `78aecf2`
-  （= `dock.cpp.bak52_sharedrows` / `bak53_zwatch`）。
+- HEAD `（提交后填）`（= `dock.cpp.bak56_dodge`，任务 2）；上一个：`ed05131` 任务 1 修完
+  （= `dock.cpp.bak55_qqsnip`），再往前 `78aecf2`（= `dock.cpp.bak52_sharedrows` / `bak53_zwatch`）。
 - 近期 tag：`pre-glasscfg-2026-11-21`、`h3c-2026-11-20`、`h3a-2026-11-20`、
   `known-good-2026-11-17-1755 / 1720 / 1630`（最后一个 `1630` 是任务栏那套"用户确认完全符合预期"的状态）。
 - 回退单个文件：`git checkout <commit> -- dock.cpp`（**不要**用脚本覆盖源码）。

@@ -223,6 +223,19 @@ struct Config {
 static Config g_cfg;
 static std::wstring g_iniPath;
 
+// ---- per-window glass parameters (user decision 2026-11-21) --------------------------------
+// Everything that decides how a glass window *looks* belongs to that window: blur radius, tint
+// strength, opacity (and the 色调 above). Only the cadence keys (refreshHz / captureHz /
+// captureBudgetMs / dragNoCapture) stay global - those are about the machine, not about one window.
+// Nothing is computed before the crop in BakeGlass(), so this split costs no extra work: two glass
+// windows already run the whole pipeline separately, and the parameter count never enters the cost.
+struct GlassCfg {
+    int blurRadius = 16;
+    int tintStrength = 110;
+    int glassOpacity = 140;
+};
+static GlassCfg g_glass[2];      // [0] the strip ([dock]), [1] the companion ([traybar], -1 = inherit)
+
 // ---- 色调 (hue): one colour per float window ------------------------------------------------
 // User decision 2026-11-21: the 色调 IS the window's colour - it paints the solid background and
 // it is the glass layer's tint colour (the old black/white `color` switch and the glass page's
@@ -293,6 +306,27 @@ static void LoadHues() {
     g_hue[0] = s.empty() ? (g_cfg.lightMode ? 0xFFFFFFu : 0x101010u) : ParseHexRgb(s, 0x101010u);
     std::wstring t = GetStr(L"traybar", L"hue");
     g_hue[1] = t.empty() ? g_hue[0] : ParseHexRgb(t, g_hue[0]);
+}
+
+// Ints from an ini section that may also inherit: a negative value means "use the strip's".
+static int GetGlassInt(const wchar_t* section, const wchar_t* key, int stripVal, int lo, int hi) {
+    int v = GetInt(section, key, -1);
+    if (v < 0) v = stripVal;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+
+// Resolve the per-window glass parameters. Must run after the strip's own values are loaded.
+static void LoadGlassCfgs() {
+    g_glass[0].blurRadius = g_cfg.blurRadius;
+    g_glass[0].tintStrength = g_cfg.tintStrength;
+    g_glass[0].glassOpacity = g_cfg.glassOpacity;
+    g_glass[1].blurRadius = GetGlassInt(L"traybar", L"blurRadius", g_glass[0].blurRadius, 0, 64);
+    g_glass[1].tintStrength =
+        GetGlassInt(L"traybar", L"tintStrength", g_glass[0].tintStrength, 0, 255);
+    g_glass[1].glassOpacity =
+        GetGlassInt(L"traybar", L"glassOpacity", g_glass[0].glassOpacity, 0, 255);
 }
 
 static COLORREF ParseColor(const std::wstring& s, BYTE* alpha) {
@@ -450,6 +484,7 @@ static void LoadConfig() {
     if (g_cfg.thumbDelay < 0) g_cfg.thumbDelay = 0;
     if (g_cfg.fadeEnd <= g_cfg.fadeStart) g_cfg.fadeEnd = g_cfg.fadeStart + 1;
     LoadHues();      // per-window 色调 (falls back to the old color / lightMode pair)
+    LoadGlassCfgs(); // per-window glass parameters ([traybar] -1 = inherit the strip's)
 
     // [tray] doubleClick=*|<exe,...>|-<exe>,...   /  [tray] autoDoubleClick=0|1
     {
@@ -2165,8 +2200,9 @@ struct ImageBg {
     DWORD sig = 1;
 };
 
-static DWORD ImageSig() {
-    return (DWORD)((g_cfg.glassLayer ? 1u : 0u) | ((DWORD)(g_cfg.blurRadius & 0xFF) << 8));
+static DWORD ImageSig(int which) {
+    return (DWORD)((g_cfg.glassLayer ? 1u : 0u) |
+                   ((DWORD)(g_glass[which & 1].blurRadius & 0xFF) << 8));
 }
 
 static std::wstring ImagePathFor(const wchar_t* section) {
@@ -2285,7 +2321,7 @@ static bool EnsureImageSrc(const std::wstring& path, ImageSrc** out) {
     return true;
 }
 
-static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) {
+static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h, int which) {
     im.ok = false;
     // Remember what was asked for even when it fails: EnsureImage() must not retry a broken path
     // on every single repaint (a 4K decode attempt per frame is not a debugging aid).
@@ -2445,10 +2481,10 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         // The radius is a full-resolution number (36 on this profile); on a 76 px tall layer that
         // is a complete wipe, so it is capped to an eighth of the short side - enough to read as
         // "softened by the glass", far from destroying the picture.
-        if (g_cfg.glassLayer != 0 && g_cfg.blurRadius > 0 && sharpW > 8 && sharpH > 8) {
+        if (g_cfg.glassLayer != 0 && g_glass[which & 1].blurRadius > 0 && sharpW > 8 && sharpH > 8) {
             int cap = (sharpW < sharpH ? sharpW : sharpH) / 8;
             if (cap < 2) cap = 2;
-            int rb = g_cfg.blurRadius;
+            int rb = g_glass[which & 1].blurRadius;
             if (rb > cap) rb = cap;
             BoxBlurFast(sharp, sharpW, sharpH, rb);
             BoxBlurFast(sharp, sharpW, sharpH, rb);
@@ -2492,7 +2528,7 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
     im.h = h;
     im.ok = true;
     im.at = GetTickCount();
-    im.sig = ImageSig();
+    im.sig = ImageSig(which);
     DLog(L"image: composed %s (%ux%u -> %dx%d, sharp %dx%d at %d,%d, feather %d) in %.1f ms",
          path.c_str(), sw, sh, w, h, sharpW, sharpH, dx, dy, feather, NowMs() - tComp0);
     if (g_cfg.dumpBake) {
@@ -2505,9 +2541,9 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
 }
 
 // Load on demand, and reload when the path or the window size changed.
-static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h) {
-    if (im.ok && im.w == w && im.h == h && im.path == path && im.sig == ImageSig()) return true;
-    return LoadImageCover(im, path, w, h);
+static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h, int which) {
+    if (im.ok && im.w == w && im.h == h && im.path == path && im.sig == ImageSig(which)) return true;
+    return LoadImageCover(im, path, w, h, which);
 }
 
 // One cached picture per glass-capable window (the strip and the float window may differ).
@@ -2517,13 +2553,13 @@ static ImageBg g_imgStrip, g_imgTray;
 // masks, with the glass layer's tint applied when it is on. Same maths as the baked glass (lift +
 // tint mix) so a picture background and a "behind" background look like the same material.
 static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov, const BYTE* rim,
-                         DWORD hueRgb) {
+                         DWORD hueRgb, const GlassCfg& gc) {
     if (!im.ok || !g_paintBits) return;
     const bool glass = g_cfg.glassLayer != 0;
-    const double tintK = glass ? g_cfg.tintStrength / 255.0 : 0.0;
+    const double tintK = glass ? gc.tintStrength / 255.0 : 0.0;
     // The whole background layer takes the glass opacity as its alpha (user, 2026-11-21): the
     // icons are drawn afterwards into the same DIB, so they stay fully opaque.
-    const double layerA = glass ? g_cfg.glassOpacity / 255.0 : 1.0;
+    const double layerA = glass ? gc.glassOpacity / 255.0 : 1.0;
     const DWORD tr = (hueRgb >> 16) & 0xFF, tg = (hueRgb >> 8) & 0xFF, tb = hueRgb & 0xFF;
     for (int y = 0; y < dstH && y < im.h; y++) {
         const uint32_t* srcRow = &im.px[(size_t)y * im.w];
@@ -2555,9 +2591,9 @@ static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov,
 
 // Paint the strip's picture background; false = no usable picture (caller falls back).
 static bool DrawImageBgStrip(int w, int h) {
-    if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h)) return false;
+    if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h, 0)) return false;
     EnsureStripMasks(w, h, RadiusFor(w, h));
-    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data(), g_hue[0]);
+    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data(), g_hue[0], g_glass[0]);
     return true;
 }
 
@@ -2568,7 +2604,7 @@ static void Paint(int w, int h) {
     // glassOpacity = tintStrength = 0 means "no glass": the composite would only be a
     // frozen copy of the backdrop, so skip the capture and the per-pixel pass and let the
     // real desktop show through.
-    const bool noGlass = (g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0);
+    const bool noGlass = (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0);
     if (g_cfg.material == 1 && g_bakeDirty && !noGlass) {
         CaptureBackdrop();
         g_glassCacheValid = false;
@@ -2583,7 +2619,7 @@ static void Paint(int w, int h) {
             logged++;
             DLog(L"paint: material=%d bake=%p bakeW=%d bakeH=%d w=%d h=%d op=%d tint=%d blur=%d",
                  g_cfg.material, g_stripGlass.bits, g_stripGlass.w, g_stripGlass.h, w, h,
-                 g_cfg.glassOpacity, g_cfg.tintStrength, g_cfg.blurRadius);
+                 g_glass[0].glassOpacity, g_glass[0].tintStrength, g_glass[0].blurRadius);
         }
     }
     // The glass depends on *where* the strip currently sits inside the padded bake, so
@@ -2635,10 +2671,7 @@ static void Paint(int w, int h) {
         //   glass = blurred * (1 - t) + tint * t
         // The (1 - a) part is free: it is simply DWM showing the real desktop
         // through our translucent pixels, so we only write the glass layer.
-        double a = g_cfg.glassOpacity / 255.0;
-        double t = g_cfg.tintStrength / 255.0;
-        DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF, tb = g_cfg.tint & 0xFF;
-        if (g_cfg.lightMode) { tr = tg = tb = 255; }
+        // (the tint/lift/opacity live in the bake already - see the comment below)
         // read the padded bake at the offset computed above (see the cache key)
         const uint32_t* bake = (const uint32_t*)g_stripGlass.bits + (size_t)oy * pw + ox;
         // The tint/lift/opacity live in the bake already, so this pass is a copy plus the
@@ -2674,7 +2707,8 @@ static void Paint(int w, int h) {
                 out = ((const uint32_t*)g_paintBits)[(size_t)(h / 2) * w + w / 2];
             }
             lastC = bake[(size_t)(h / 2) * pw + w / 2];
-            DLog(L"paint: glass a=%.2f t=%.2f bakeC=%08X -> outC=%08X", a, t, lastC, out);
+            DLog(L"paint: glass op=%d tint=%d bakeC=%08X -> outC=%08X",
+                 g_glass[0].glassOpacity, g_glass[0].tintStrength, lastC, out);
         }
     } else if (g_cfg.bgAlpha) {
         DWORD cr = GetRValue(g_cfg.bg), cg = GetGValue(g_cfg.bg), cb = GetBValue(g_cfg.bg);
@@ -3354,10 +3388,13 @@ static void RefreshItems() {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+static void RefreshCompanionAfterReload();   // needs the paint helpers, defined further down
+
 static void Reload() {
     LoadConfig();
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
+    RefreshCompanionAfterReload();
 }
 
 // ---------------------------------------------------------------- flyout anchors
@@ -4570,10 +4607,10 @@ static void TrayRepaint(Companion& c) {
     if (CompanionUsesGlass(c)) CompanionPaintGlass(c);
     else if (CompanionBgMode(c) == 1) {
         // picture background: fill the rounded rect from the cached picture
-        if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH)) {
+        if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH, 1)) {
             EnsureFloatMask(c.dibW, c.dibH,
                             RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)));
-            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), g_hue[1]);
+            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), g_hue[1], g_glass[1]);
         }
     }
 
@@ -9248,7 +9285,7 @@ static RECT IconBox() {
 }
 
 static bool FullyTransparent() {
-    return g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0;
+    return g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0;
 }
 
 static int EdgeAt(POINT p, const RECT& rcIn) {
@@ -9822,7 +9859,7 @@ enum BakeResult {
 // `allowFrozen` is for windows that are *moving*: they read the frozen work-area picture
 // (H3c) instead of paying for a screen read in the middle of the gesture.
 static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, const wchar_t* tag,
-                            DWORD tintRgb, bool allowFrozen = false) {
+                            DWORD tintRgb, const GlassCfg& gc, bool allowFrozen = false) {
     LARGE_INTEGER bq0{}, bq1{};
     QueryPerformanceCounter(&bq0);
     DWORD bakeT0 = GetTickCount();
@@ -10011,8 +10048,8 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     // backdrop - "blur 0" used to still look soft because it always went through
     // the 1/4 pipeline), at small radii 1/2, and 1/4 only where it pays off.
     int step = 4;
-    if (g_cfg.blurRadius <= 0) step = 1;
-    else if (g_cfg.blurRadius < 12) step = 2;
+    if (gc.blurRadius <= 0) step = 1;
+    else if (gc.blurRadius < 12) step = 2;
     int sw = (w + step - 1) / step, sh = (h + step - 1) / step;
     std::vector<uint32_t> qbuf;
     if (step == 1) {
@@ -10045,8 +10082,8 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     // raw value straight in made every setting above ~8 average the whole strip
     // into one flat colour.
     int rWide = 0;
-    if (g_cfg.blurRadius > 0) {
-        rWide = (g_cfg.blurRadius + step - 1) / step;      // ceil
+    if (gc.blurRadius > 0) {
+        rWide = (gc.blurRadius + step - 1) / step;      // ceil
         if (rWide < 1) rWide = 1;
         if (rWide > 64) rWide = 64;
         BoxBlurSmall(qbuf, sw, sh, rWide);
@@ -10131,8 +10168,8 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     // Lift + tint + glassOpacity are a pure function of this pixel, so they are applied
     // here - once per capture - instead of once per frame in Paint().
     {
-        double a = g_cfg.glassOpacity / 255.0;
-        double tintK = g_cfg.tintStrength / 255.0;
+        double a = gc.glassOpacity / 255.0;
+        double tintK = gc.tintStrength / 255.0;
         // The window's 色调 is the glass tint colour (2026-11-21: it replaced `tint` + 浅色/深色).
         DWORD tr = (tintRgb >> 16) & 0xFF, tg = (tintRgb >> 8) & 0xFF, tb = tintRgb & 0xFF;
         uint32_t* px = (uint32_t*)t.bits;
@@ -10187,10 +10224,10 @@ static void CaptureBackdrop() {
         g_bakeDirty = false;
         return;
     }
-    const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
+    const int M = moving ? g_bakeMargin : (g_glass[0].blurRadius > 0 ? 64 : 0);
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", g_hue[0], moving);
+    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", g_hue[0], g_glass[0], moving);
     // ⛔ A *failed* capture clears the flag even though nothing was captured (the previous
     // bake is still good). Leaving it set would retry a 15 ms grab on every single frame.
     // One skipped for the frame budget keeps it set, so the next frame picks it up again.
@@ -10320,13 +10357,21 @@ static const SRow kRowsGlass[] = {
     {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0, nullptr, nullptr},
     {L"tintStrength", L"色调浓度", 0, 255, 0, 0, nullptr, nullptr},
     {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
-    {L"refreshHz", L"背景刷新帧率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
-    {L"captureHz", L"背景截取频率 (Hz)", 0, 180, 0, 0, nullptr, nullptr},
+    {L"refreshHz", L"背景刷新帧率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureHz", L"背景截取频率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
     // H3 §3.3: how much of one frame may be spent starting captures (see Config).
-    {L"captureBudgetMs", L"每帧截取预算 (ms)", 0, 100, 0, 0, nullptr, nullptr},
+    {L"captureBudgetMs", L"每帧截取预算 (ms)（共享）", 0, 100, 0, 0, nullptr, nullptr},
     // H3: off = keep the frozen backdrop while dragging (the user picked that on 2026-11-17,
     // knowing the background "sticks" to the window for the length of the drag).
-    {L"dragNoCapture", L"拖动时不更新背景", 0, 1, 0, 1, L"不更新", L"更新"},
+    {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
+};
+
+// 玻璃页 for a *companion*: the appearance rows are its own (-1 = inherit the strip's), the
+// cadence rows are machine-wide and are therefore not repeated here (user, 2026-11-21).
+static const SRow kRowsGlassTray[] = {
+    {L"glassOpacity", L"玻璃不透明度（覆盖）", -1, 255, 0, 0, nullptr, nullptr},
+    {L"tintStrength", L"色调浓度（覆盖）", -1, 255, 0, 0, nullptr, nullptr},
+    {L"blurRadius", L"背景模糊半径（覆盖）", -1, 64, 0, 0, nullptr, nullptr},
 };
 
 // ---- 浮窗页 for the strip (component: kCompFloat; section [dock]) -------------------------
@@ -10524,6 +10569,19 @@ static void PageSet(int i, int v) {
             GetClientRect(g_hwnd, &rc);
             Paint(rc.right, rc.bottom);
             Present();
+            // Per-window glass parameters: the picture composition bakes the blur in, and a
+            // companion keeps its own bake, so both invalidate and repaint here.
+            if (!wcscmp(p->section.c_str(), L"traybar")) {
+                g_imgTray.sig = 0;
+                g_trayBar.glass.dirty = true;
+                g_trayBar.glassSig = 0;
+                if (g_trayBar.hwnd) {
+                    TrayRepaint(g_trayBar);
+                    CompanionPresent(g_trayBar);
+                }
+            } else {
+                g_imgStrip.sig = 0;
+            }
             break;
         }
         case kPageFloatDock:
@@ -10819,6 +10877,19 @@ static void SettingsPickFromGallery() {
     WriteImagePath(p->section, picked);
     LoadConfig();
     SettingsPaint();
+}
+
+// An ini edit (Reload) must reach the float window too: its picture composition is cached by
+// (picture, size, glass params) and its glass bake is a separate target, so nothing would repaint
+// it until it happened to appear again (found 2026-11-21 while testing per-window parameters).
+static void RefreshCompanionAfterReload() {
+    g_glassCacheValid = false;
+    g_imgStrip.sig = 0;      // force a re-compose with the new parameters
+    g_imgTray.sig = 0;
+    g_trayBar.glass.dirty = true;
+    if (!g_trayBar.hwnd) return;
+    TrayRepaint(g_trayBar);
+    CompanionPresent(g_trayBar);
 }
 
 // Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue`).
@@ -11315,15 +11386,14 @@ static void CompanionGlassTick(DWORD now) {
     // A settings change (reload, colour, blur ...) must not wait for the next natural capture:
     // the bake has the lift/tint/opacity burned in, so it is wrong until re-made. The signature
     // is cheap to compare and needs no notification plumbing from the panel.
-    const DWORD sig = g_cfg.tint ^ ((DWORD)g_cfg.tintStrength << 8) ^
-                      ((DWORD)g_cfg.glassOpacity << 16) ^ ((DWORD)g_cfg.blurRadius << 20) ^
-                      ((DWORD)g_cfg.lightMode << 26);
+    const DWORD sig = g_hue[1] ^ ((DWORD)g_glass[1].tintStrength << 8) ^
+                      ((DWORD)g_glass[1].glassOpacity << 16) ^ ((DWORD)g_glass[1].blurRadius << 20);
     if (sig != c.glassSig) {
         c.glassSig = sig;
         c.glass.dirty = true;
     }
     // "no glass" setting (opacity and tint both 0): the composite would only be a frozen copy
-    if (g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0) return;
+    if (g_glass[1].glassOpacity == 0 && g_glass[1].tintStrength == 0) return;
     // A window that moved only needs the *crop* to follow: the bake is anchored to the screen,
     // so re-painting from the new offset keeps the backdrop still while the window slides over
     // it. Only leaving the padded bake needs a new capture. This is what makes following the
@@ -11362,14 +11432,14 @@ static void CompanionGlassTick(DWORD now) {
     // resize (and thus re-create) the DIB.
     const bool movingSoon = justMoved || g_dragging || g_resizeEdge || DefaultGroupBusy() ||
                             GroupScaling() || (c.glassWideUntil && (LONG)(c.glassWideUntil - now) > 0);
-    const int M = movingSoon ? kCompanionMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
+    const int M = movingSoon ? kCompanionMargin : (g_glass[1].blurRadius > 0 ? 64 : 0);
     if (movingSoon) c.glassWideUntil = now + 3000;
     // H3c: "拖动时不更新背景" - during somebody's drag this window keeps the picture it has.
     if (movingSoon && g_cfg.dragNoCapture) {
         c.glass.dirty = false;
         return;
     }
-    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", g_hue[1], movingSoon);
+    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", g_hue[1], g_glass[1], movingSoon);
     if (r == kBakeNoBudget) return;              // another window took this frame's budget
     if (r == kBakeFailed) {
         // Nothing usable (or the exclusion flag is missing on this system): wait a normal
@@ -11419,8 +11489,8 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
                                 kPageFloatTray, 0});
         const bool glass = CompanionHasGlassLayer(g_trayBar);
         if (glass)
-            g_pages.push_back(SPage{L"玻璃", L"dock", kRowsGlass,
-                                    (int)(sizeof(kRowsGlass) / sizeof(kRowsGlass[0])),
+            g_pages.push_back(SPage{L"玻璃", L"traybar", kRowsGlassTray,
+                                    (int)(sizeof(kRowsGlassTray) / sizeof(kRowsGlassTray[0])),
                                     kPageGlass, 0});
         if (g_trayBar.groupId > 0) {
             wantGroup = g_trayBar.groupId;
@@ -12075,7 +12145,7 @@ static void RenderTick() {
         static RECT lastRect{};
         // no glass at all (opacity 0 + tint 0): there is nothing to capture or blend, and
         // leaving g_bakeDirty set would repaint every single frame for nothing
-        const bool noGlassTick = (g_cfg.glassOpacity == 0 && g_cfg.tintStrength == 0);
+        const bool noGlassTick = (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0);
         if (g_cfg.material == 1 && g_alpha > 0 && !g_flip.active && !noGlassTick) {
             RECT curR{};
             GetWindowRect(g_hwnd, &curR);

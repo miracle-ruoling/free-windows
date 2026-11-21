@@ -3437,12 +3437,16 @@ static void RefreshItems() {
 }
 
 static void RefreshCompanionAfterReload();   // needs the paint helpers, defined further down
+static void ReloadGroupsFromIni();            // ditto: the group code is further down
 
 static void Reload() {
     LoadConfig();
     // task 3: [dock] snap may have changed on disk (a hand edit + dev/t_dock_reload.ps1). The
     // targets are only recomputed when the window moves, so a reload has to do it here.
     UpdateSnap();
+    // task 4: the group switches (hideEdge and its three sub-rows) live in the ini too - the
+    // group code is further down, so it does its own reload there.
+    ReloadGroupsFromIni();
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
     RefreshCompanionAfterReload();
@@ -4928,6 +4932,27 @@ struct Group {
     // measured to the group's own rectangle. -1 = not loaded yet -> inherit [dock].
     int fadeStart = -1;
     int fadeEnd = -1;
+    // ---- task 4: 贴边隐藏 ----------------------------------------------------------------
+    // The group glues itself to the screen perimeter (kHideGap inside the edge) and slides out
+    // of the screen when the pointer leaves it; a thin band along that screen edge brings it
+    // back. Geometry only, applied to the members - a single-member group works with no special
+    // case (GroupBounds() covers it; GroupBoxMembers() deliberately does not, so a one-member
+    // group simply has no frame to slide off).
+    bool hideEdge = false;        // [group] hideEdge
+    int wakeExt = 4;              // [group] wakeExt 0..10: the band's thickness
+    bool wakeVisible = false;     // [group] wakeVisible: always painted / only flashing
+    bool wakeModeHover = false;   // [group] wakeMode: 0 = click the band, 1 = move into it
+    // runtime
+    int hideSide = -1;            // 0 top, 1 right, 2 bottom, 3 left; -1 = not attached yet
+    float hideSlide = 1.0f;       // 1 = awake (at the inset), 0 = fully out of the screen
+    float hideSlideTarget = 1.0f;
+    int hideShift = 0;            // px currently applied outwards along the perpendicular axis
+    bool hideWakeClick = false;   // the wake window received a click (click mode)
+    DWORD hideArmAt = 0;          // no hiding before this (seen turning the switch on)
+    DWORD hideFlashStart = 0;     // the 2 s flash (2 x 1 s) after an auto-hide / a wakeExt change
+    DWORD hideFlashUntil = 0;
+    HWND wakeHwnd = nullptr;      // the 唤出区域 window
+    RECT wakeRc{0, 0, 0, 0};      // its rect while hidden (screen px)
     // frame window + fade
     HWND hwnd = nullptr;
     RECT rc{0, 0, 0, 0};         // screen px, empty when there is nothing to frame
@@ -4997,6 +5022,13 @@ static void GroupLoad(Group& g) {
     g.fadeEnd = GetInt(sec, L"fadeEnd", g_cfg.fadeEnd);
     if (g.fadeStart < 0) g.fadeStart = 0;
     if (g.fadeEnd <= g.fadeStart) g.fadeEnd = g.fadeStart + 1;
+    // task 4: 贴边隐藏 + its three sub-settings
+    g.hideEdge = GetInt(sec, L"hideEdge", 0) != 0;
+    g.wakeExt = GetInt(sec, L"wakeExt", 4);
+    if (g.wakeExt < 0) g.wakeExt = 0;
+    if (g.wakeExt > 10) g.wakeExt = 10;
+    g.wakeVisible = GetInt(sec, L"wakeVisible", 0) != 0;
+    g.wakeModeHover = GetInt(sec, L"wakeMode", 0) != 0;
 }
 
 static void GroupSaveFlag(Group& g, const wchar_t* key, bool value) {
@@ -5496,6 +5528,378 @@ static void GroupDragEnd(Group& g) {
     DLog(L"group %d: drag done", g.id);
 }
 
+// ---------------------------------------------------------------- 贴边隐藏 (task 4)
+//
+// A group with [group] hideEdge=1 glues itself to the screen perimeter and slides out of the
+// screen when the pointer leaves it; a thin band along that screen edge (the 唤出区域) brings it
+// back. Everything here is geometry applied to the members, so a group with a *single* member
+// needs no special case: GroupBounds() already covers that case (GroupBoxMembers() deliberately
+// does not, so a one-member group simply has no frame to slide off).
+//
+// User's numbers (2026-11-22): 15 px gap to the screen edge; slide out until the whole group is
+// invisible plus 5 px; the edge is decided once (nearest of the four) and afterwards the group
+// only travels along the perimeter (it turns the corner at a screen corner); wake/hide are
+// animated but quick; the "pointer left" test gets an extra 20 px because the pointer drifts out
+// of the group while scaling; the band is x px thick (0 = not painted, but still 1 px hittable)
+// and flashes twice for 2 s total.
+#define kHideGap 15          // how far inside the screen edge the group rests while awake
+#define kHideExtra 5         // slide out until the group is this far outside the screen
+#define kHideLeavePad 20     // extra margin on the "the pointer left" test
+#define kHideAnimMs 160      // one slide, either direction ("动画要迅速")
+#define kHideFlashMs 2000    // two flashes of one second
+#define kHideFlashOnMs 550   // lit part of each 1 s cycle
+
+static RECT HideMonitorRect(HWND h) {
+    MONITORINFO mi{sizeof(mi)};
+    HMONITOR mon = MonitorFromWindow(h ? h : g_hwnd, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) return mi.rcMonitor;
+    return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+}
+
+// 0 top, 1 right, 2 bottom, 3 left - whichever screen edge the bounds are closest to.
+static int HideNearestSide(const RECT& b, const RECT& mon) {
+    int d[4] = {b.top - mon.top, mon.right - b.right, mon.bottom - b.bottom, b.left - mon.left};
+    int best = 0;
+    for (int i = 1; i < 4; i++)
+        if (d[i] < d[best]) best = i;
+    return best;
+}
+
+// The same rect `s` px further outwards along the group's edge (negative = back inside).
+static RECT HideShiftRect(const RECT& r, int side, int s) {
+    RECT o = r;
+    switch (side) {
+        case 0: OffsetRect(&o, 0, -s); break;
+        case 1: OffsetRect(&o, s, 0); break;
+        case 2: OffsetRect(&o, 0, s); break;
+        default: OffsetRect(&o, -s, 0); break;
+    }
+    return o;
+}
+
+// Move every member of the group (and therefore the frame) by (dx,dy).
+static void GroupMoveBy(Group& g, int dx, int dy) {
+    if (!dx && !dy) return;
+    if (g.id == 1 && g_hwnd) {
+        // the strip is the anchor: MoveStripNow carries the followers and re-derives the frame
+        g_cfg.x += dx;
+        g_cfg.y += dy;
+        MoveStripNow(g_cfg.x, g_cfg.y);
+        return;
+    }
+    GroupMember m[kGroupMaxMembers];
+    int n = GroupMembers(g, m);
+    for (int i = 0; i < n; i++) {
+        if (!m[i].comp) continue;
+        CompanionSetRect(*m[i].comp, m[i].rc.left + dx, m[i].rc.top + dy,
+                         m[i].rc.right - m[i].rc.left, m[i].rc.bottom - m[i].rc.top, false);
+    }
+    GroupRecompute(g);
+}
+
+// Put the group exactly kHideGap inside `side`, and keep it inside the screen along the other
+// axis (this is also what turns the corner: dragging past one pushes the nearest edge to the
+// next one, and the glue then places it along that edge).
+static void HidePlaceAtGap(Group& g, int side) {
+    RECT b{};
+    if (!GroupBounds(g, &b)) return;
+    RECT mon = HideMonitorRect(g.hwnd ? g.hwnd : g_hwnd);
+    int w = b.right - b.left, h = b.bottom - b.top;
+    int dx = 0, dy = 0;
+    switch (side) {
+        case 0: dy = (mon.top + kHideGap) - b.top; break;
+        case 1: dx = (mon.right - kHideGap) - b.right; break;
+        case 2: dy = (mon.bottom - kHideGap) - b.bottom; break;
+        default: dx = (mon.left + kHideGap) - b.left; break;
+    }
+    int nl = b.left + dx, nt = b.top + dy;
+    if (nl + w > mon.right - kHideGap) dx += (mon.right - kHideGap) - (nl + w);
+    if (nl < mon.left + kHideGap) dx += (mon.left + kHideGap) - nl;
+    if (nt + h > mon.bottom - kHideGap) dy += (mon.bottom - kHideGap) - (nt + h);
+    if (nt < mon.top + kHideGap) dy += (mon.top + kHideGap) - nt;
+    if (dx || dy)
+        DLog(L"hide: group %d glue side=%d bounds=%ld,%ld %ldx%ld move=%d,%d", g.id, side,
+             (long)b.left, (long)b.top, (long)w, (long)h, dx, dy);
+    GroupMoveBy(g, dx, dy);
+}
+
+static void HideEdgeAttach(Group& g) {
+    RECT b{};
+    if (!GroupBounds(g, &b)) {
+        g.hideSide = -1;
+        return;
+    }
+    RECT mon = HideMonitorRect(g.hwnd ? g.hwnd : g_hwnd);
+    g.hideSide = HideNearestSide(b, mon);
+    // Turning the switch on from the settings panel puts the pointer on the *panel*, not on the
+    // group - without this grace the group would slide out from under the user the very next
+    // tick (measured 2026-11-22 02:13: attach -> hide 95 ms later). Same for a restart with the
+    // feature already on: the pointer is wherever it was, which is not "the user left the group".
+    if (!g.hideArmAt) g.hideArmAt = GetTickCount() + 1500;
+    HidePlaceAtGap(g, g.hideSide);
+    DLog(L"hide: group %d attached to side %d (bounds %ld,%ld %ldx%ld)", g.id, g.hideSide,
+         (long)b.left, (long)b.top, (long)(b.right - b.left), (long)(b.bottom - b.top));
+}
+
+// The band the user clicks / moves into, built from the *awake* bounds.
+static bool HideWakeRectFor(const Group& g, const RECT& awake, const RECT& mon, RECT* out) {
+    int t = g.wakeExt > 0 ? g.wakeExt : 1;      // x=0: not painted, but 1 px stays hittable
+    switch (g.hideSide) {
+        case 0: *out = RECT{awake.left, mon.top, awake.right, mon.top + t}; break;
+        case 1: *out = RECT{mon.right - t, awake.top, mon.right, awake.bottom}; break;
+        case 2: *out = RECT{awake.left, mon.bottom - t, awake.right, mon.bottom}; break;
+        case 3: *out = RECT{mon.left, awake.top, mon.left + t, awake.bottom}; break;
+        default: return false;
+    }
+    return out->right > out->left && out->bottom > out->top;
+}
+
+static LRESULT CALLBACK HideWakeProc(HWND h, UINT m, WPARAM w, LPARAM l);
+
+static void HideWakeEnsure(Group& g) {
+    if (g.wakeHwnd) return;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = HideWakeProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"DockWakeWindow";
+        RegisterClassExW(&wc);
+    }
+    DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+    if (g.wakeModeHover) ex |= WS_EX_TRANSPARENT;   // "进入" must not eat clicks
+    g.wakeHwnd = CreateWindowExW(ex, L"DockWakeWindow", L"dock wake", WS_POPUP, 0, 0, 1, 1,
+                                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g.wakeHwnd) {
+        SetWindowLongPtrW(g.wakeHwnd, GWLP_USERDATA, (LONG_PTR)g.id);
+        DLog(L"hide: group %d wake window %p", g.id, (void*)g.wakeHwnd);
+    }
+}
+
+static void HideWakeSetMode(Group& g) {
+    if (!g.wakeHwnd) return;
+    LONG ex = GetWindowLongW(g.wakeHwnd, GWL_EXSTYLE);
+    if (g.wakeModeHover) ex |= WS_EX_TRANSPARENT;
+    else ex &= ~WS_EX_TRANSPARENT;
+    SetWindowLongW(g.wakeHwnd, GWL_EXSTYLE, ex);
+}
+
+// Paint (or hide) the band. `alpha` 0 = hidden; alpha 1 = invisible to the eye but still
+// hit-testable, which is what a layered window needs to keep receiving the click.
+static void HideWakePresent(Group& g, int alpha) {
+    if (!g.wakeHwnd) return;
+    int w = g.wakeRc.right - g.wakeRc.left, h = g.wakeRc.bottom - g.wakeRc.top;
+    if (alpha <= 0 || w <= 0 || h <= 0) {
+        if (IsWindowVisible(g.wakeHwnd)) ShowWindow(g.wakeHwnd, SW_HIDE);
+        return;
+    }
+    static HDC dc = nullptr;
+    static HBITMAP bmp = nullptr;
+    static void* bits = nullptr;
+    static int bw = 0, bh = 0;
+    if (!dc || bw != w || bh != h) {
+        if (dc) { DeleteDC(dc); dc = nullptr; }
+        if (bmp) { DeleteObject(bmp); bmp = nullptr; }
+        HDC screen = GetDC(nullptr);
+        dc = CreateCompatibleDC(screen);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(nullptr, screen);
+        if (bmp) SelectObject(dc, bmp);
+        bw = w;
+        bh = h;
+    }
+    if (!bmp || !bits) return;
+    DWORD hue = (g.id == 1 ? g_hue[0] : g_hue[1]) & 0x00FFFFFFu;
+    DWORD rr = (hue & 0xFF) * (DWORD)alpha / 255;
+    DWORD gg = ((hue >> 8) & 0xFF) * (DWORD)alpha / 255;
+    DWORD bb = ((hue >> 16) & 0xFF) * (DWORD)alpha / 255;
+    DWORD px = ((DWORD)alpha << 24) | (rr << 16) | (gg << 8) | bb;
+    DWORD* p = (DWORD*)bits;
+    for (int i = 0; i < w * h; i++) p[i] = px;
+    POINT src{0, 0};
+    SIZE sz{w, h};
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    POINT dst{g.wakeRc.left, g.wakeRc.top};
+    SetWindowPos(g.wakeHwnd, HWND_TOPMOST, dst.x, dst.y, w, h, SWP_NOACTIVATE);
+    UpdateLayeredWindow(g.wakeHwnd, nullptr, &dst, &sz, dc, &src, 0, &bf, ULW_ALPHA);
+    if (!IsWindowVisible(g.wakeHwnd)) ShowWindow(g.wakeHwnd, SW_SHOWNOACTIVATE);
+}
+
+static LRESULT CALLBACK HideWakeProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_LBUTTONUP) {
+        Group* g = GroupById((int)(INT_PTR)GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (g) g->hideWakeClick = true;      // the tick decides what to do with it
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void HideBegin(Group& g, bool waking, DWORD now) {
+    g.hideSlideTarget = waking ? 1.0f : 0.0f;
+    DLog(L"hide: group %d %s (side=%d slide=%.2f)", g.id, waking ? L"wake" : L"hide", g.hideSide,
+         g.hideSlide);
+    if (!waking && !g.wakeVisible) {
+        g.hideFlashStart = now;
+        g.hideFlashUntil = now + kHideFlashMs;
+    }
+}
+
+// Turn the feature on / off for one group. Called from the settings page and from the load path.
+// Idempotent: a repeated "on" for a group that is already attached does nothing.
+static void HideEdgeSet(Group& g, bool on) {
+    if (on) {
+        if (g.hideEdge && g.hideSide >= 0) return;
+        g.hideEdge = true;
+        g.hideSide = -1;
+        g.hideSlide = 1.0f;
+        g.hideSlideTarget = 1.0f;
+        g.hideShift = 0;
+        // Turning the switch on from the settings panel puts the pointer on the *panel*, not on
+        // the group - without this grace the group would slide out from under the user the very
+        // next tick (measured 2026-11-22 02:13: attach -> hide 95 ms later).
+        g.hideArmAt = GetTickCount() + 1500;
+        HideEdgeAttach(g);
+        HideWakeEnsure(g);
+        HideWakeSetMode(g);
+    } else {
+        if (!g.hideEdge && g.hideSide < 0 && !g.wakeHwnd) return;
+        g.hideEdge = false;
+        if (g.hideShift) {
+            int d = g.hideShift;
+            switch (g.hideSide) {
+                case 0: GroupMoveBy(g, 0, d); break;
+                case 1: GroupMoveBy(g, -d, 0); break;
+                case 2: GroupMoveBy(g, 0, -d); break;
+                default: GroupMoveBy(g, d, 0); break;
+            }
+            g.hideShift = 0;
+        }
+        g.hideSlide = 1.0f;
+        g.hideSlideTarget = 1.0f;
+        g.hideSide = -1;
+        if (g.wakeHwnd) ShowWindow(g.wakeHwnd, SW_HIDE);
+        DLog(L"hide: group %d disabled", g.id);
+    }
+}
+
+// task 4: a reload applies the group switches as well (hand edit + dev/t_dock_reload.ps1), and
+// re-glues whatever was switched on.
+static void ReloadGroupsFromIni() {
+    for (int i = 0; i < g_groupCount; i++) {
+        Group& g = g_groups[i];
+        GroupLoad(g);
+        HideEdgeSet(g, g.hideEdge);
+        GroupRecompute(g);
+        if (g.hwnd) GroupRepaint(g);
+    }
+}
+
+// Runs on the 16 ms housekeeping tick for every group.
+static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
+    RECT b{};
+    if (!GroupBounds(g, &b)) return;
+    if (g.hideSide < 0) HideEdgeAttach(g);
+
+    RECT mon = HideMonitorRect(g.hwnd ? g.hwnd : g_hwnd);
+    RECT awake = HideShiftRect(b, g.hideSide, -g.hideShift);
+    RECT wakeRc{};
+    bool hasWake = HideWakeRectFor(g, awake, mon, &wakeRc);
+    g.wakeRc = wakeRc;
+
+    // ---- pointer: inside the group (with the 20 px wobble pad) or inside the band? ----
+    POINT p{};
+    GetCursorPos(&p);
+    RECT pad = awake;
+    InflateRect(&pad, kHideLeavePad, kHideLeavePad);
+    bool inGroup = PtInRect(&pad, p) != FALSE;
+    bool inWake = hasWake && PtInRect(&wakeRc, p) != FALSE;
+
+    if (g.hideSlide == g.hideSlideTarget) {
+        if (g.hideSlideTarget >= 1.0f) {
+            // "the pointer left" - but not before the arming grace has passed (see
+            // HideEdgeAttach) and not while our own settings panel is open: turning the switch
+            // on puts the pointer on that panel, and the group must not vanish behind it.
+            bool ourUi = g_setWnd != nullptr;
+            if (!inGroup && !inWake && !ourUi && (LONG)(now - g.hideArmAt) > 0)
+                HideBegin(g, false, now);
+        } else {
+            bool wake = g.wakeModeHover ? inWake : g.hideWakeClick;
+            if (wake) {
+                g.hideWakeClick = false;
+                HideBegin(g, true, now);
+            }
+        }
+    }
+
+    // ---- glue to the perimeter whenever it is awake and at rest ----
+    if (g.hideSlide >= 1.0f && !g.drag.active && !g.scale.active && !g_dragging &&
+        !g_dragMovePending) {
+        HidePlaceAtGap(g, HideNearestSide(awake, mon));
+    }
+
+    // ---- animate, and move the group by whatever the animation gained ----
+    static DWORD lastHideTick = 0;
+    float dt = lastHideTick ? (float)(now - lastHideTick) : 16.0f;
+    lastHideTick = now;
+    if (dt > 64.0f) dt = 64.0f;
+    if (g.hideSlide != g.hideSlideTarget) {
+        float stepf = dt / (float)kHideAnimMs;
+        if (g.hideSlide < g.hideSlideTarget) {
+            g.hideSlide += stepf;
+            if (g.hideSlide > g.hideSlideTarget) g.hideSlide = g.hideSlideTarget;
+        } else {
+            g.hideSlide -= stepf;
+            if (g.hideSlide < g.hideSlideTarget) g.hideSlide = g.hideSlideTarget;
+        }
+    }
+    // How far it has to travel to be *completely* outside: the distance from the far side of the
+    // *awake* bounds to the screen edge it hugs, plus the redundancy the user asked for. (Using
+    // the bounds' own extent instead left it 15 px on screen, and using the shifted rect would
+    // feed back into itself - both measured 2026-11-22 02:13.)
+    int outDist = 0;
+    switch (g.hideSide) {
+        case 0: outDist = awake.bottom - mon.top; break;
+        case 1: outDist = mon.right - awake.left; break;
+        case 2: outDist = mon.bottom - awake.top; break;
+        default: outDist = awake.right - mon.left; break;
+    }
+    outDist += kHideExtra;
+    int wantShift = (int)((1.0f - g.hideSlide) * (float)outDist + 0.5f);
+    if (wantShift != g.hideShift) {
+        int d = wantShift - g.hideShift;
+        g.hideShift = wantShift;
+        switch (g.hideSide) {
+            case 0: GroupMoveBy(g, 0, -d); break;
+            case 1: GroupMoveBy(g, d, 0); break;
+            case 2: GroupMoveBy(g, 0, d); break;
+            default: GroupMoveBy(g, -d, 0); break;
+        }
+    }
+
+    // ---- the band ----
+    bool flashing = !g.wakeVisible && now < g.hideFlashUntil &&
+                    ((now - g.hideFlashStart) % 1000u) < kHideFlashOnMs;
+    int alpha = 0;
+    if (g.hideSlide <= 0.02f) {
+        if (g.wakeVisible) alpha = 40;          // 常显: painted, no flashing
+        else if (flashing) alpha = 96;
+        else alpha = 1;                         // invisible, still hittable
+    } else if (flashing) {
+        alpha = 96;                             // "调完 x" while it is on screen
+    }
+    HideWakeEnsure(g);
+    HideWakePresent(g, alpha);
+}
+
 // ---------------------------------------------------------------- group menu (G1/G2)
 #define kGCmdLine 11
 #define kGCmdBlockResize 12
@@ -5655,8 +6059,7 @@ static LRESULT CALLBACK GroupBoxProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // Creates every group window up front (hidden): the ids are stable, so a group that is created
 // from a menu later behaves exactly like one that existed at startup.
 static void GroupCreateAll() {
-    static bool registered = false;
-    if (!registered) {
+    static bool registered = false;    if (!registered) {
         registered = true;
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = GroupBoxProc;
@@ -5702,6 +6105,14 @@ static void GroupCreateAll() {
              (int)g.blockMove);
     }
     DLog(L"groups: %d in use (max %d)", g_groupCount, kMaxGroups);
+    // task 4: a group that was left hidden in the ini glues itself to the perimeter right away
+    for (int i = 0; i < g_groupCount; i++) {
+        Group& g = g_groups[i];
+        if (!g.hideEdge) continue;
+        HideEdgeAttach(g);
+        HideWakeEnsure(g);
+        HideWakeSetMode(g);
+    }
 }
 
 // Moves a companion into group `id` (0 = independent), updates the ini and both frames.
@@ -11047,6 +11458,12 @@ static const SRow kRowsGroup[] = {
     // H2b: the fade distances are the group's (measured to the group's own rectangle).
     {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
     {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
+    // task 4: 贴边隐藏 + its three sub-rows (they only show while the switch is on, see
+    // SettingsRowVisible).
+    {L"hideEdge", L"贴边隐藏", 0, 1, 0, 1, L"开", L"关"},
+    {L"wakeExt", L"唤出区域宽度 (px)", 0, 10, 0, 0, nullptr, nullptr},
+    {L"wakeVisible", L"唤出区域常显", 0, 1, 0, 1, L"可见", L"不可见"},
+    {L"wakeMode", L"唤出方式", 0, 1, 0, 1, L"单击", L"进入"},
 };
 
 static std::vector<SPage> g_pages;
@@ -11080,6 +11497,11 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     if (!wcscmp(key, L"blockMove")) return g.blockMove ? 1 : 0;
     if (!wcscmp(key, L"fadeStart")) return g.fadeStart;
     if (!wcscmp(key, L"fadeEnd")) return g.fadeEnd;
+    // task 4: 贴边隐藏
+    if (!wcscmp(key, L"hideEdge")) return g.hideEdge ? 1 : 0;
+    if (!wcscmp(key, L"wakeExt")) return g.wakeExt;
+    if (!wcscmp(key, L"wakeVisible")) return g.wakeVisible ? 1 : 0;
+    if (!wcscmp(key, L"wakeMode")) return g.wakeModeHover ? 1 : 0;
     return 0;
 }
 
@@ -11298,6 +11720,29 @@ static void PageSet(int i, int v) {
                 GroupSectionName(g->id, sec, 32);
                 swprintf_s(buf, L"%d", isStart ? g->fadeStart : g->fadeEnd);
                 WritePrivateProfileStringW(sec, row.key, buf, g_iniPath.c_str());
+            } else if (!wcscmp(row.key, L"hideEdge")) {
+                // task 4: the switch itself. On = glue to the nearest edge right now; the page
+                // gains the three sub-rows, so the panel has to be re-laid out (see the
+                // SettingsPaint() at the end of RowFromX / the height in SettingsBuildPages).
+                GroupSaveFlag(*g, L"hideEdge", v != 0);
+                HideEdgeSet(*g, v != 0);
+                // the page gains/loses the three sub-rows: SettingsPaint() fixes the height too
+            } else if (!wcscmp(row.key, L"wakeExt")) {
+                g->wakeExt = v;
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                swprintf_s(buf, L"%d", v);
+                WritePrivateProfileStringW(sec, L"wakeExt", buf, g_iniPath.c_str());
+                // "调完 x" flashes the band twice, in both visibility modes
+                g->hideFlashStart = GetTickCount();
+                g->hideFlashUntil = g->hideFlashStart + kHideFlashMs;
+            } else if (!wcscmp(row.key, L"wakeVisible")) {
+                g->wakeVisible = v != 0;
+                GroupSaveFlag(*g, L"wakeVisible", g->wakeVisible);
+            } else if (!wcscmp(row.key, L"wakeMode")) {
+                g->wakeModeHover = v != 0;
+                GroupSaveFlag(*g, L"wakeMode", g->wakeModeHover);
+                HideWakeSetMode(*g);
             }
             break;
         }
@@ -11598,7 +12043,14 @@ static void SettingsPickNewImage() {    const SPage* p = ActivePage();
 // A picture row is only meaningful while the background *is* a picture.
 static bool SettingsRowVisible(const SPage* p, int i) {
     if (!p || i < 0 || i >= p->count) return false;
-    if (wcscmp(p->rows[i].key, L"image")) return true;
+    const wchar_t* key = p->rows[i].key;
+    // task 4: the three sub-rows of 贴边隐藏 only exist while the group switch is on.
+    if (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") || !wcscmp(key, L"wakeMode")) {
+        if (p->kind != kPageGroupKind) return false;
+        Group* g = GroupById(p->groupId);
+        return g && g->hideEdge;
+    }
+    if (wcscmp(key, L"image")) return true;
     int bg = 0;
     if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
     else bg = GetInt(p->section.c_str(), L"bgMode", 0);
@@ -12769,6 +13221,9 @@ static void RenderTick() {
             PressWatchTick();
             FocusWatchTick();
             ZWatchTick(now);         // task 1: keep the topmost band honest (and yield to snips)
+            // task 4: 贴边隐藏 for every group - it has to run even for a group that holds no
+            // companion (a single-member group is a legal group).
+            for (int gi = 0; gi < g_groupCount; gi++) HideEdgeTick(g_groups[gi], now);
             if (g_trayRetryAt && (LONG)(now - g_trayRetryAt) >= 0) {
                 g_trayRetryAt = 0;
                 // Never rebuild the panel while it is open: the tray list is

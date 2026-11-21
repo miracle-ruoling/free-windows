@@ -124,6 +124,15 @@ State "  after open"
 Write-Output ("  above strip: " + [QQ]::Above($hStrip))
 
 if ($Mode -eq "flow") {
+    # Never drag unless QQ's overlay is really up: without it the drag would land in whatever
+    # window happens to be in front (a text selection at best, a window move at worst).
+    $ovl = [QQ]::Overlays()
+    if ($ovl -match '\(none\)') {
+        Write-Output ""
+        Write-Output "!! no fullscreen topmost window appeared - QQ's snip did not open; skipping the drag"
+        [QQ]::Key(0x1B, $false); Start-Sleep -Milliseconds 40; [QQ]::Key(0x1B, $true)
+        exit 2
+    }
     # drag a box over the empty area the dock sits in (top-left of the strip to a bit past it)
     $x0 = $sr.Left - 60; $y0 = 2
     $x1 = $sr.Right + 40; $y1 = $sr.Bottom + 60

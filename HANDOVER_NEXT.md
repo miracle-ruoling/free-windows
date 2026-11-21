@@ -1590,3 +1590,16 @@ z-order 断言 + 重画 DIB + 锚点发布；隐藏时不再每 3 秒重画了�
 vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zfix.ps1` 也加了 D 段（snip 期间从外部强行
 `HWND_TOPMOST` → 450 ms 内被压回去）和 E 段（snip 期间把光标停到浮窗上 → 两个窗口都还是 tm=0），现在 **6/6 通过**。
 
+**⚠️ 上面第 1 层并没有盖住真正出问题的那个**（2026-11-22 01:2x，用户在真 QQ 上复现、日志抓到）：
+真凶是**条自己的背景层更新**——`g_bgWnd` 那段 `UpdateBgWindow` 结尾有一句
+`SetWindowPos(g_hwnd, HWND_TOPMOST, ...)`（注释 "keep the icon layer above the background"），
+它**每次 alpha 变化都会跑**，也就是**每次淡入淡出**。光标一靠近 dock → 淡入 → 它把条塞回 topmost 带；
+日志里那条 `zwatch: something of ours re-asserted topmost during a capture - demoted again` 就是兜底网把它压回去。
+那句（和同一个函数里的 `g_bgWnd` 那句）现在都改成 `ZBandInsert()`。改完再跑真 QQ：
+`01:21:54` 开、`01:22:00` 收，**全程没有再出现那条兜底日志**，tm 全程 0 —— 也就是说现在是我们自己的路径
+一点都不抢，兜底网只是保险，不再被用到。
+
+**给以后的人**：除了这两处，`HWND_TOPMOST` 还散在拖动/翻转/面板/缩略图/收缩展开等十几处**用户手势**路径里
+（snip 期间根本点不到 dock，所以没动）。真要再收紧，就把它们一并换成 `ZBandInsert()`——它在非 yield 时
+返回值恒等于 `HWND_TOPMOST`，**行为中性**，不会改变任何现有手感。
+

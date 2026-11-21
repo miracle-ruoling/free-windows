@@ -9412,7 +9412,7 @@ static void SyncBackground() {
         return;
     }
 
-    SetWindowPos(g_bgWnd, HWND_TOPMOST, wr.left, wr.top, wr.right - wr.left,
+    SetWindowPos(g_bgWnd, ZBandInsert(), wr.left, wr.top, wr.right - wr.left,
                  wr.bottom - wr.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     // rounded corners
     HRGN rgn = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1,
@@ -9426,7 +9426,10 @@ static void SyncBackground() {
                                              : ACCENT_ENABLE_BLURBEHIND,
                 tint);
     // keep the icon layer above the background
-    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+    // ZBandInsert: this runs on *every* alpha change, so a fade-in (the pointer coming back to
+    // the dock) used to re-promote the strip in the middle of a snip - that is the "something of
+    // ours re-asserted topmost during a capture" the QQ flow produced (2026-11-22 01:20:17).
+    SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
@@ -9604,9 +9607,11 @@ static bool ZExemptClass(const wchar_t* cls) {
         L"Windows.UI.Core.CoreWindow", L"Shell_InputSwitchTopLevelWindow",
         L"MultitaskingViewFrame", L"Windows.Internal.Shell.TabProxyWindow",
         L"NotifyIconOverflowWindow", L"TopLevelWindowForOverflowXamlIsland",
-        L"TaskListThumbnailWnd", L"ForegroundStaging", L"Windows.UI.Composition.DesktopWindowContentBridge",
+        L"TaskListThumbnailWnd", L"ForegroundStaging",
         // transient UI that is *meant* to be above everything (menus, tooltips, balloon tips)
         L"#32768", L"#32769", L"tooltips_class32", L"DockTooltip",
+        // WinUI/XAML popups (flyouts, combo drops, the shell's own menus on Win11)
+        L"Xaml_WindowedPopupClass", L"Windows.UI.Composition.DesktopWindowContentBridge",
         // the desktop itself
         L"Progman", L"WorkerW", L"SysListView32",
     };
@@ -9620,6 +9625,24 @@ static bool ZIsOurs(HWND h) {
     for (int i = 0; i < g_groupCount; i++)
         if (g_groups[i].hwnd == h) return true;   // the group frames are ours too
     return false;
+}
+
+// The shell's own process owns the taskbar, the start menu, quick settings, the notification
+// host and the XAML popups/menus. Their class names change between Windows builds (measured
+// 2026-11-22: `Xaml_WindowedPopupClass` from explorer.exe was fought and covered by the dock),
+// so key on the process of GetShellWindow() instead of on an ever-growing class list.
+static bool ZIsShellWindow(HWND h) {
+    static HWND shellWnd = nullptr;
+    static DWORD shellPid = 0;
+    if (!shellWnd || !IsWindow(shellWnd)) {
+        shellWnd = GetShellWindow();
+        shellPid = 0;
+        if (shellWnd) GetWindowThreadProcessId(shellWnd, &shellPid);
+    }
+    if (!shellPid) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    return pid == shellPid;
 }
 
 // One entry per on-screen window of ours.
@@ -9688,6 +9711,7 @@ static BOOL CALLBACK ZScanProc(HWND h, LPARAM lp) {
     wchar_t cls[64]{};
     GetClassNameW(h, cls, 64);
     if (ZExemptClass(cls)) return TRUE;
+    if (ZIsShellWindow(h)) return TRUE;
     for (int k = 0; k < c->nMine; k++) {
         const ZMine& m = c->mine[k];
         if (i >= m.idx) continue;                        // below that window of ours

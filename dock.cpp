@@ -43,6 +43,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comdlg32.lib")     // ChooseColorW (the 色调 palette)
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "propsys.lib")
@@ -221,6 +222,14 @@ struct Config {
 
 static Config g_cfg;
 static std::wstring g_iniPath;
+
+// ---- 色调 (hue): one colour per float window ------------------------------------------------
+// User decision 2026-11-21: the 色调 IS the window's colour - it paints the solid background and
+// it is the glass layer's tint colour (the old black/white `color` switch and the glass page's
+// 浅色/深色 are gone). Per-window is safe: no cache bakes the tint in - the frozen work-area
+// picture, the screen grab and the PrintWindow cache all hold *raw* pixels, and the tint is applied
+// inside BakeGlass() on every bake.
+static DWORD g_hue[2] = {0x101010, 0x101010};   // [0] the strip ([dock]), [1] the companion ([traybar])
 static std::wstring g_pinDir;
 
 // ---- tray double click (H1.2, user 2026-11-16)
@@ -255,6 +264,35 @@ static void Trim(std::wstring& s) {
 
 static int GetInt(const wchar_t* sec, const wchar_t* key, int def) {
     return (int)GetPrivateProfileIntW(sec, key, def, g_iniPath.c_str());
+}
+
+static std::wstring GetStr(const wchar_t* sec, const wchar_t* key, const wchar_t* def = L"") {
+    std::vector<wchar_t> b(MAX_PATH * 2, 0);
+    GetPrivateProfileStringW(sec, key, def, b.data(), (DWORD)b.size(), g_iniPath.c_str());
+    return std::wstring(b.data());
+}
+
+// "#RRGGBB" / "RRGGBB" / "#AARRGGBB" (alpha ignored) -> 0x00RRGGBB
+static DWORD ParseHexRgb(const std::wstring& s, DWORD def) {
+    std::wstring t = s;
+    Trim(t);
+    if (t.empty()) return def;
+    if (t[0] == L'#') t.erase(0, 1);
+    if (t.size() != 6 && t.size() != 8) return def;
+    wchar_t* end = nullptr;
+    unsigned long v = wcstoul(t.c_str(), &end, 16);
+    if (end && *end) return def;
+    if (t.size() == 8) v &= 0x00FFFFFFu;      // drop the alpha
+    return (DWORD)v;
+}
+
+// The 色调 of both windows. A profile that predates the key keeps its look: it falls back to the
+// old black/white `color` switch plus the glass page's 浅色/深色.
+static void LoadHues() {
+    std::wstring s = GetStr(L"dock", L"hue");
+    g_hue[0] = s.empty() ? (g_cfg.lightMode ? 0xFFFFFFu : 0x101010u) : ParseHexRgb(s, 0x101010u);
+    std::wstring t = GetStr(L"traybar", L"hue");
+    g_hue[1] = t.empty() ? g_hue[0] : ParseHexRgb(t, g_hue[0]);
 }
 
 static COLORREF ParseColor(const std::wstring& s, BYTE* alpha) {
@@ -411,6 +449,7 @@ static void LoadConfig() {
     if (g_cfg.thumbHeight < 60) g_cfg.thumbHeight = 60;
     if (g_cfg.thumbDelay < 0) g_cfg.thumbDelay = 0;
     if (g_cfg.fadeEnd <= g_cfg.fadeStart) g_cfg.fadeEnd = g_cfg.fadeStart + 1;
+    LoadHues();      // per-window 色调 (falls back to the old color / lightMode pair)
 
     // [tray] doubleClick=*|<exe,...>|-<exe>,...   /  [tray] autoDoubleClick=0|1
     {
@@ -2346,6 +2385,56 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
     if (feather < 20) feather = 20;
 
     im.px.resize((size_t)w * h);
+    // Render the sharp layer on its own first: this is where the glass "background blur radius"
+    // now applies - it blurs the *sharp picture*, while the backdrop keeps its own big blur and
+    // must not be blurred a second time (user, 2026-11-21).
+    std::vector<uint32_t> sharp((size_t)sharpW * sharpH);
+    {
+        // ⛔ A big picture shown small with *one* bilinear tap per output pixel averages only 4
+        // texels out of a much bigger footprint - that is the "sharp picture looks shrunk-too-small
+        // / soft" report (2026-11-21), not a blur. Average the whole footprint: k x k samples,
+        // k = the reduction factor (1 = the plain bilinear case when the window is bigger than the
+        // cached picture).
+        int k = (int)(1.0 / scale + 0.5);
+        if (k < 1) k = 1;
+        if (k > 3) k = 3;
+        auto sampleAt = [&](double fsx, double fsy, int shift) {
+            if (fsx < 0) fsx = 0;
+            if (fsy < 0) fsy = 0;
+            if (fsx > (double)sw - 1) fsx = (double)sw - 1;
+            if (fsy > (double)sh - 1) fsy = (double)sh - 1;
+            int x0 = (int)fsx, y0 = (int)fsy;
+            double tx = fsx - x0, ty = fsy - y0;
+            int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
+            int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
+            return ((src[(size_t)y0 * sw + x0] >> shift) & 0xFF) * (1 - tx) * (1 - ty) +
+                   ((src[(size_t)y0 * sw + x1] >> shift) & 0xFF) * tx * (1 - ty) +
+                   ((src[(size_t)y1 * sw + x0] >> shift) & 0xFF) * (1 - tx) * ty +
+                   ((src[(size_t)y1 * sw + x1] >> shift) & 0xFF) * tx * ty;
+        };
+        for (int py = 0; py < sharpH; py++) {
+            for (int px2 = 0; px2 < sharpW; px2++) {
+                auto ch = [&](int shift) {
+                    double sum = 0;
+                    for (int j = 0; j < k; j++)
+                        for (int i = 0; i < k; i++)
+                            sum += sampleAt((px2 + (i + 0.5) / k) / scale - 0.5,
+                                            (py + (j + 0.5) / k) / scale - 0.5, shift);
+                    int v = (int)(sum / (k * k) + 0.5);
+                    return (DWORD)(v < 0 ? 0 : (v > 255 ? 255 : v));
+                };
+                sharp[(size_t)py * sharpW + px2] =
+                    0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+            }
+        }
+        if (g_cfg.blurRadius > 0 && sharpW > 4 && sharpH > 4) {
+            int rb = g_cfg.blurRadius;
+            if (rb > 60) rb = 60;
+            BoxBlurFast(sharp, sharpW, sharpH, rb);
+            BoxBlurFast(sharp, sharpW, sharpH, rb);
+        }
+    }
+
     // "far" = the edge on the opposite side of the sharp picture; the gradient is strongest there
     const int farLen = portrait ? h : w;
     const double gradEnd = farLen * 0.55;
@@ -2362,45 +2451,16 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
                 c = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
             }
             // sharp layer, feathered on its inner edge
-            const int px = x - dx, py = y - dy;
-            if (px >= 0 && px < sharpW && py >= 0 && py < sharpH) {
-                // ⛔ A big picture shown small with *one* bilinear tap per output pixel averages
-                // only 4 texels out of a much bigger footprint - that is the "sharp picture looks
-                // shrunk-too-small / soft" report (2026-11-21), not a blur. Average the whole
-                // footprint: k x k samples, k = the reduction factor (1 = the plain bilinear case,
-                // i.e. when the window is bigger than the cached picture).
-                int k = (int)(1.0 / scale + 0.5);
-                if (k < 1) k = 1;
-                if (k > 3) k = 3;
-                auto sampleAt = [&](double fsx, double fsy, int shift) {
-                    if (fsx < 0) fsx = 0;
-                    if (fsy < 0) fsy = 0;
-                    if (fsx > (double)sw - 1) fsx = (double)sw - 1;
-                    if (fsy > (double)sh - 1) fsy = (double)sh - 1;
-                    int x0 = (int)fsx, y0 = (int)fsy;
-                    double tx = fsx - x0, ty = fsy - y0;
-                    int x1 = x0 + 1 < (int)sw ? x0 + 1 : (int)sw - 1;
-                    int y1 = y0 + 1 < (int)sh ? y0 + 1 : (int)sh - 1;
-                    return ((src[(size_t)y0 * sw + x0] >> shift) & 0xFF) * (1 - tx) * (1 - ty) +
-                           ((src[(size_t)y0 * sw + x1] >> shift) & 0xFF) * tx * (1 - ty) +
-                           ((src[(size_t)y1 * sw + x0] >> shift) & 0xFF) * (1 - tx) * ty +
-                           ((src[(size_t)y1 * sw + x1] >> shift) & 0xFF) * tx * ty;
-                };
-                auto ch = [&](int shift) {
-                    double sum = 0;
-                    for (int j = 0; j < k; j++)
-                        for (int i = 0; i < k; i++)
-                            sum += sampleAt((px + (i + 0.5) / k) / scale - 0.5,
-                                            (py + (j + 0.5) / k) / scale - 0.5, shift);
-                    return (int)(sum / (k * k) + 0.5);
-                };
-                const int inner = portrait ? (sharpH - 1 - py) : px;
+            const int px2 = x - dx, py = y - dy;
+            if (px2 >= 0 && px2 < sharpW && py >= 0 && py < sharpH) {
+                const int inner = portrait ? (sharpH - 1 - py) : px2;
                 double a = 1.0;
                 if (inner < feather) a = (inner + 0.5) / feather;
+                uint32_t s = sharp[(size_t)py * sharpW + px2];
                 double rd = (c >> 16) & 0xFF, gn = (c >> 8) & 0xFF, bl = c & 0xFF;
-                rd = rd * (1 - a) + ch(16) * a;
-                gn = gn * (1 - a) + ch(8) * a;
-                bl = bl * (1 - a) + ch(0) * a;
+                rd = rd * (1 - a) + ((s >> 16) & 0xFF) * a;
+                gn = gn * (1 - a) + ((s >> 8) & 0xFF) * a;
+                bl = bl * (1 - a) + (s & 0xFF) * a;
                 c = 0xFF000000u | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl;
             }
             im.px[(size_t)y * w + x] = c;
@@ -2429,12 +2489,15 @@ static ImageBg g_imgStrip, g_imgTray;
 // Paint the picture into the current paint target (g_paintBits) through the given coverage/rim
 // masks, with the glass layer's tint applied when it is on. Same maths as the baked glass (lift +
 // tint mix) so a picture background and a "behind" background look like the same material.
-static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov, const BYTE* rim) {
+static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov, const BYTE* rim,
+                         DWORD hueRgb) {
     if (!im.ok || !g_paintBits) return;
     const bool glass = g_cfg.glassLayer != 0;
     const double tintK = glass ? g_cfg.tintStrength / 255.0 : 0.0;
-    DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF, tb = g_cfg.tint & 0xFF;
-    if (g_cfg.lightMode) { tr = tg = tb = 255; }
+    // The whole background layer takes the glass opacity as its alpha (user, 2026-11-21): the
+    // icons are drawn afterwards into the same DIB, so they stay fully opaque.
+    const double layerA = glass ? g_cfg.glassOpacity / 255.0 : 1.0;
+    const DWORD tr = (hueRgb >> 16) & 0xFF, tg = (hueRgb >> 8) & 0xFF, tb = hueRgb & 0xFF;
     for (int y = 0; y < dstH && y < im.h; y++) {
         const uint32_t* srcRow = &im.px[(size_t)y * im.w];
         const BYTE* covRow = cov ? cov + (size_t)y * dstW : nullptr;
@@ -2455,9 +2518,10 @@ static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov,
                 gn = gn * (1 - tintK) + tg * tintK;
                 bl = bl * (1 - tintK) + tb * tintK;
             }
-            SetPixelPremul(x, y, (a << 24) | ((DWORD)rd << 16) | ((DWORD)gn << 8) | (DWORD)bl);
+            SetPixelPremul(x, y, ((DWORD)(a * layerA) << 24) | ((DWORD)rd << 16) | ((DWORD)gn << 8) |
+                                     (DWORD)bl);
             const DWORD ea = rimRow ? rimRow[x] : 0;
-            if (ea) SetPixelPremul(x, y, (ea << 24) | 0x00FFFFFF);
+            if (ea) SetPixelPremul(x, y, ((DWORD)(ea * layerA) << 24) | 0x00FFFFFF);
         }
     }
 }
@@ -2466,7 +2530,7 @@ static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov,
 static bool DrawImageBgStrip(int w, int h) {
     if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h)) return false;
     EnsureStripMasks(w, h, RadiusFor(w, h));
-    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data());
+    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data(), g_hue[0]);
     return true;
 }
 
@@ -2530,7 +2594,7 @@ static void Paint(int w, int h) {
             if (a < 3) a = 3;
             if (a > 255) a = 255;
             FillRound(g_memDC, RECT{0, 0, w, h}, RadiusForPercent(w, h, g_cfg.radius),
-                      ((DWORD)a << 24) | (g_cfg.color ? 0x00FFFFFFu : 0x00000000u));
+                      ((DWORD)a << 24) | (g_hue[0] & 0x00FFFFFFu));
         }
     } else {
     if (g_cfg.material == 1 && g_stripGlass.bits && g_stripGlass.w >= w &&
@@ -4467,10 +4531,8 @@ static void TrayRepaint(Companion& c) {
             int a = GetInt(L"traybar", L"solidOpacity", -1);
             if (a < 0) a = g_cfg.solidOpacity;
             if (a > 255) a = 255;
-            int col = GetInt(L"traybar", L"color", -1);
-            if (col < 0) col = g_cfg.color;
             if (a < 3) a = 3;
-            bgFill = ((DWORD)a << 24) | (col ? 0x00FFFFFFu : 0x00000000u);
+            bgFill = ((DWORD)a << 24) | (g_hue[1] & 0x00FFFFFFu);   // the window's 色调
         }
     }
     FillRound(c.dc, all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
@@ -4484,7 +4546,7 @@ static void TrayRepaint(Companion& c) {
         if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH)) {
             EnsureFloatMask(c.dibW, c.dibH,
                             RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)));
-            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data());
+            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), g_hue[1]);
         }
     }
 
@@ -9706,7 +9768,7 @@ enum BakeResult {
 // `allowFrozen` is for windows that are *moving*: they read the frozen work-area picture
 // (H3c) instead of paying for a screen read in the middle of the gesture.
 static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, const wchar_t* tag,
-                            bool allowFrozen = false) {
+                            DWORD tintRgb, bool allowFrozen = false) {
     LARGE_INTEGER bq0{}, bq1{};
     QueryPerformanceCounter(&bq0);
     DWORD bakeT0 = GetTickCount();
@@ -9999,9 +10061,9 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
                  L"size=%dx%d small=%dx%d r=%d crop=%d took=%lu",
                  tag, (void*)under, ucls, (int)got, pwOk, grabbed, covPct, underW, underH, w, h,
                  sw, sh, rWide, cacheHits, (unsigned long)(GetTickCount() - bakeT0));
-            DLog(L"bake[%s]: pre=%08X post=%08X detail %d -> %d (tint=%d op=%d light=%d)", tag,
+            DLog(L"bake[%s]: pre=%08X post=%08X detail %d -> %d (tint=%d op=%d hue=%06X)", tag,
                  pre, post, DetailScore(fbuf.data(), w, h), DetailScore(dst, w, h),
-                 g_cfg.tintStrength, g_cfg.glassOpacity, g_cfg.lightMode);
+                 g_cfg.tintStrength, g_cfg.glassOpacity, tintRgb & 0x00FFFFFFu);
         }
     }
     if (g_cfg.dumpBake) {
@@ -10017,9 +10079,8 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     {
         double a = g_cfg.glassOpacity / 255.0;
         double tintK = g_cfg.tintStrength / 255.0;
-        DWORD tr = (g_cfg.tint >> 16) & 0xFF, tg = (g_cfg.tint >> 8) & 0xFF,
-              tb = g_cfg.tint & 0xFF;
-        if (g_cfg.lightMode) { tr = tg = tb = 255; }
+        // The window's 色调 is the glass tint colour (2026-11-21: it replaced `tint` + 浅色/深色).
+        DWORD tr = (tintRgb >> 16) & 0xFF, tg = (tintRgb >> 8) & 0xFF, tb = tintRgb & 0xFF;
         uint32_t* px = (uint32_t*)t.bits;
         const size_t n = (size_t)w * h;
         for (size_t i = 0; i < n; i++) {
@@ -10075,7 +10136,7 @@ static void CaptureBackdrop() {
     const int M = moving ? g_bakeMargin : (g_cfg.blurRadius > 0 ? 64 : 0);
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", moving);
+    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", g_hue[0], moving);
     // ⛔ A *failed* capture clears the flag even though nothing was captured (the previous
     // bake is still good). Leaving it set would retry a 15 ms grab on every single frame.
     // One skipped for the frame budget keeps it set, so the next frame picks it up again.
@@ -10179,6 +10240,8 @@ static bool g_pickBusy = false;        // a dialog is up right now
 static void SettingsPaint();
 static void SettingsPickFromGallery();
 static void SettingsPickNewImage();
+static void SetHueFor(int which, DWORD rgb);
+static void PickHue(int which);
 static bool SettingsRowVisible(const SPage* p, int i);
 static bool SettingsRowDisabled(const SPage* p, int i);
 static bool AnyScreenBackdrop();      // defined with the component helpers further down
@@ -10192,9 +10255,14 @@ enum Component { kCompFloat = 1, kCompBar = 2, kCompGlass = 4 };
 static const wchar_t* const kBgNames[] = {L"透过背后", L"图片", L"纯色"};
 static const wchar_t* const kColorNames[] = {L"黑", L"白"};
 
+// 色调 presets: soft macaron colours plus one dark, so a fresh profile can still look like the
+// old dark glass (user picked "预设七八种马卡龙淡色 + 一个调色盘", 2026-11-21).
+static const DWORD kHuePresets[] = {0xF7C8D0, 0xFAD7B0, 0xF6EDA8, 0xBFE6D0,
+                                    0xBBDDE8, 0xCFC7E8, 0xD8D8DC, 0x2B2B30};
+static const int kHueCount = (int)(sizeof(kHuePresets) / sizeof(kHuePresets[0]));
+
 // ---- 玻璃页 (component: kCompGlass; global, one copy for every glass window) --------------
 static const SRow kRowsGlass[] = {
-    {L"lightMode", L"外观", 0, 1, 0, 1, L"浅色", L"深色"},
     {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0, nullptr, nullptr},
     {L"tintStrength", L"色调浓度", 0, 255, 0, 0, nullptr, nullptr},
     {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
@@ -10211,7 +10279,9 @@ static const SRow kRowsGlass[] = {
 static const SRow kRowsFloatDock[] = {
     {L"bgMode", L"背景", 0, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
     {L"glassLayer", L"玻璃层", 0, 1, 0, 1, L"开", L"关"},
-    {L"color", L"纯色颜色", 0, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
+    // 色调 (H3, 2026-11-21): the window's colour - paints the solid background AND is the glass
+    // layer's tint colour. It replaced the old black/white switch and the glass page's 浅色/深色.
+    {L"hue", L"色调", 0, 0, 0, 0, nullptr, nullptr},
     {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
     // Only shown while the background *is* a picture (see SettingsRowVisible); its two buttons
     // open the gallery / add a new picture - there is no numeric value behind it.
@@ -10225,7 +10295,7 @@ static const SRow kRowsFloatDock[] = {
 static const SRow kRowsFloatTray[] = {
     {L"bgMode", L"背景", -1, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
     {L"glassLayer", L"玻璃层", -1, 1, 0, 1, L"开", L"关"},
-    {L"color", L"纯色颜色", -1, 1, 0, 0, nullptr, nullptr, kColorNames, 2},
+    {L"hue", L"色调", 0, 0, 0, 0, nullptr, nullptr},
     {L"solidOpacity", L"纯色不透明度", -1, 255, 0, 0, nullptr, nullptr},
     // Same picture row as the strip's (inherits [dock] image= when empty).
     {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
@@ -10697,9 +10767,46 @@ static void SettingsPickFromGallery() {
     SettingsPaint();
 }
 
+// Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue`).
+static void SetHueFor(int which, DWORD rgb) {
+    rgb &= 0x00FFFFFFu;
+    g_hue[which & 1] = rgb;
+    wchar_t b[16]{};
+    swprintf_s(b, L"#%06X", rgb);
+    WritePrivateProfileStringW(which == 0 ? L"dock" : L"traybar", L"hue", b, g_iniPath.c_str());
+    // Both the glass tint and the solid colour come from this, so refresh that window now.
+    if (which == 0) {
+        ApplyStripStyle();                       // reloads the config and repaints the strip
+    } else if (g_trayBar.hwnd) {
+        g_trayBar.glass.dirty = true;            // the tint is baked -> needs one new bake
+        TrayRepaint(g_trayBar);
+        CompanionPresent(g_trayBar);
+    }
+    DLog(L"hue: %s = #%06X", which == 0 ? L"dock" : L"traybar", rgb);
+}
+
+// The free colour picker (the palette chip). Modal, so it runs from the queued message.
+static void PickHue(int which) {
+    if (g_pickBusy) return;
+    static COLORREF custom[16]{};
+    CHOOSECOLORW cc{};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = g_setWnd;
+    cc.lpCustColors = custom;
+    const DWORD h = g_hue[which & 1];
+    cc.rgbResult = RGB((h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF);
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    g_pickBusy = true;
+    const BOOL ok = ChooseColorW(&cc);
+    g_pickBusy = false;
+    if (!ok) return;
+    SetHueFor(which, ((DWORD)GetRValue(cc.rgbResult) << 16) |
+                         ((DWORD)GetGValue(cc.rgbResult) << 8) | (DWORD)GetBValue(cc.rgbResult));
+    SettingsPaint();
+}
+
 // "Add a picture" (+): pick from anywhere, copy it into the gallery, make it the background.
-static void SettingsPickNewImage() {
-    const SPage* p = ActivePage();
+static void SettingsPickNewImage() {    const SPage* p = ActivePage();
     if (!p || g_pickBusy) return;
     std::wstring picked;
     g_pickBusy = true;
@@ -10728,9 +10835,9 @@ static bool SettingsRowDisabled(const SPage* p, int i) {
     const wchar_t* key = p->rows[i].key;
     if (p->kind == kPageGlass) {
         // Nothing bakes a screen backdrop any more (every window is a picture or a solid colour):
-        // blur, capture rate and the drag rule have nothing to act on.
-        if (!wcscmp(key, L"blurRadius") || !wcscmp(key, L"glassOpacity") ||
-            !wcscmp(key, L"refreshHz") || !wcscmp(key, L"captureHz") ||
+        // the capture-rate rows have nothing to act on. Blur and opacity stay live - with a picture
+        // background the blur applies to the sharp picture and the opacity to the whole layer.
+        if (!wcscmp(key, L"refreshHz") || !wcscmp(key, L"captureHz") ||
             !wcscmp(key, L"captureBudgetMs") || !wcscmp(key, L"dragNoCapture"))
             return !AnyScreenBackdrop();
         return false;
@@ -10739,7 +10846,7 @@ static bool SettingsRowDisabled(const SPage* p, int i) {
     if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
     else bg = GetInt(p->section.c_str(), L"bgMode", 0);
     if (!wcscmp(key, L"glassLayer")) return bg == 2;        // solid has no glass material
-    if (!wcscmp(key, L"color") || !wcscmp(key, L"solidOpacity")) return bg != 2;
+    if (!wcscmp(key, L"solidOpacity")) return bg != 2;
     if (!wcscmp(key, L"image")) return bg != 1;
     return false;
 }
@@ -10833,6 +10940,31 @@ static void SettingsPaint() {
             int pcx = (plus.left + plus.right) / 2, pcy = (plus.top + plus.bottom) / 2;
             DrawLine(pcx - 8, pcy, pcx + 8, pcy, 2, 0xFFFFFFFF);
             DrawLine(pcx, pcy - 8, pcx, pcy + 8, 2, 0xFFFFFFFF);
+            y += kRowH;
+            continue;
+        }
+        if (!wcscmp(row.key, L"hue")) {
+            // 8 preset chips + a palette chip (opens the Windows colour picker).
+            const int which = (p->kind == kPageFloatTray) ? 1 : 0;
+            const DWORD cur = g_hue[which] & 0x00FFFFFFu;
+            const int cs = 26, gap = 9;
+            int hx = 370;
+            for (int k = 0; k < kHueCount; k++) {
+                RECT chip{hx, y + 16, hx + cs, y + 16 + cs};
+                const bool on = (cur == kHuePresets[k]);
+                RECT ring{chip.left - (on ? 3 : 2), chip.top - (on ? 3 : 2),
+                          chip.right + (on ? 3 : 2), chip.bottom + (on ? 3 : 2)};
+                FillRound(g_setDC, ring, on ? 11 : 10, on ? 0xFFFFFFFF : 0x30FFFFFF);
+                FillRound(g_setDC, chip, 8, 0xFF000000u | kHuePresets[k]);
+                hx += cs + gap;
+            }
+            RECT pc{hx, y + 16, hx + cs, y + 16 + cs};
+            FillRound(g_setDC, pc, 8, 0x30FFFFFF);
+            const int mx = (pc.left + pc.right) / 2, my = (pc.top + pc.bottom) / 2;
+            FillRound(g_setDC, RECT{pc.left + 3, pc.top + 3, mx, my}, 4, 0xFFE85D75);
+            FillRound(g_setDC, RECT{mx, pc.top + 3, pc.right - 3, my}, 4, 0xFFF2C14E);
+            FillRound(g_setDC, RECT{pc.left + 3, my, mx, pc.bottom - 3}, 4, 0xFF5DB3E8);
+            FillRound(g_setDC, RECT{mx, my, pc.right - 3, pc.bottom - 3}, 4, 0xFF6FCF97);
             y += kRowH;
             continue;
         }
@@ -10930,6 +11062,28 @@ static void RowFromX(int i, int x) {
         }
         return;
     }
+    if (!wcscmp(row.key, L"hue")) {
+        int y = kRowsTop;
+        for (int k = 0; k < i; k++)
+            if (SettingsRowVisible(p, k)) y += kRowH;
+        const int which = (p->kind == kPageFloatTray) ? 1 : 0;
+        const int cs = 26, gap = 9;
+        int hx = 370;
+        for (int k = 0; k < kHueCount; k++) {
+            if (x >= hx && x < hx + cs) {
+                SetHueFor(which, kHuePresets[k]);     // no dialog: safe to run from here
+                SettingsPaint();
+                return;
+            }
+            hx += cs + gap;
+        }
+        if (x >= hx && x < hx + cs && !g_pickBusy && !g_setPickAction) {
+            // the colour picker is modal -> queue it, same rule as the picture buttons
+            g_setPickAction = 20 + which;
+            PostMessageW(g_setWnd, kSetMsgPickImage, 0, 0);
+        }
+        return;
+    }
     if (row.choices && row.choiceCount > 0) {
         const int n = row.choiceCount;
         const int seg = tw / n;
@@ -10973,6 +11127,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
             if (!g_pickBusy) {
                 if (action == 1) SettingsPickFromGallery();
                 else if (action == 2) SettingsPickNewImage();
+                else if (action == 20 || action == 21) PickHue(action - 20);
             }
             return 0;
         }
@@ -11160,7 +11315,7 @@ static void CompanionGlassTick(DWORD now) {
         c.glass.dirty = false;
         return;
     }
-    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", movingSoon);
+    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", g_hue[1], movingSoon);
     if (r == kBakeNoBudget) return;              // another window took this frame's budget
     if (r == kBakeFailed) {
         // Nothing usable (or the exclusion flag is missing on this system): wait a normal
@@ -12618,6 +12773,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // A silent death is useless: log the faulting code and its offset inside dock.exe before
+    // letting Windows Error Reporting do its thing (the dock vanished once with no trace,
+    // 2026-11-21 21:34 - this is what makes the next one diagnosable).
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        if (ep && ep->ExceptionRecord) {
+            const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+            const char* base = (const char*)GetModuleHandleW(nullptr);
+            const char* where = (const char*)r->ExceptionAddress;
+            DLog(L"!!! crash: code=%08lX at +0x%llX inside dock.exe (addr=%p)",
+                 (unsigned long)r->ExceptionCode,
+                 base && where > base ? (unsigned long long)(where - base) : 0ull,
+                 (void*)r->ExceptionAddress);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
     BuildItems();
 
     WNDCLASSEXW wc{sizeof(wc)};

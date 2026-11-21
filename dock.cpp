@@ -2100,6 +2100,7 @@ static void PaintWinButton(const RECT& rc, int size) {
 // ---- H3: picture backgrounds (bgMode = image) ------------------------------------------
 // The bake's blur lives further down the file; the composition here reuses it
 static void BoxBlurSmall(std::vector<uint32_t>& v, int w, int h, int radius);
+static void SaveBmp(const wchar_t* name, const uint32_t* px, int w, int h);   // diagnostics
 
 // Sliding-window box blur: O(1) per pixel instead of O(radius).
 // BoxBlurSmall() re-sums 2r+1 taps for every pixel, which is fine for a 200x60 bake but was 10 of
@@ -2158,7 +2159,15 @@ struct ImageBg {
     std::vector<uint32_t> px;      // opaque 0xAARRGGBB, already cover-scaled
     bool ok = false;
     DWORD at = 0;
+    // The composition bakes in the glass *blur* (it is applied to the sharp layer), so a change of
+    // glassLayer / blurRadius has to invalidate the cache - otherwise moving the slider does
+    // nothing until the window is resized (bug, 2026-11-21).
+    DWORD sig = 1;
 };
+
+static DWORD ImageSig() {
+    return (DWORD)((g_cfg.glassLayer ? 1u : 0u) | ((DWORD)(g_cfg.blurRadius & 0xFF) << 8));
+}
 
 static std::wstring ImagePathFor(const wchar_t* section) {
     std::vector<wchar_t> b(MAX_PATH * 2, 0);
@@ -2335,11 +2344,14 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         }
     }
 
-    // 2. blur + desaturate + slight dim, so the sharp half clearly reads as "in front"
+    // 2. blur + desaturate + slight dim, so the sharp half clearly reads as "in front".
+    // The backdrop is meant to be the "big blurred copy" (大模糊) - min(w,h)/8 measured only ~9 px
+    // on a 76 px tall strip, which is so mild that the sharp half did not stand out at all
+    // (user, 2026-11-21: "压根没有渲染清晰图部分"). A third of the short side reads as blur.
     {
-        int radius = (w < h ? w : h) / 8;
-        if (radius < 3) radius = 3;
-        if (radius > 40) radius = 40;
+        int radius = (w < h ? w : h) / 3;
+        if (radius < 8) radius = 8;
+        if (radius > 48) radius = 48;
         BoxBlurFast(back, w, h, radius);
         BoxBlurFast(back, w, h, radius);
         for (auto& v : back) {
@@ -2397,7 +2409,7 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
         // cached picture).
         int k = (int)(1.0 / scale + 0.5);
         if (k < 1) k = 1;
-        if (k > 3) k = 3;
+        if (k > 6) k = 6;      // 3 undersampled a 8x reduction and softened the "sharp" half
         auto sampleAt = [&](double fsx, double fsy, int shift) {
             if (fsx < 0) fsx = 0;
             if (fsy < 0) fsy = 0;
@@ -2427,9 +2439,17 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
                     0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
             }
         }
-        if (g_cfg.blurRadius > 0 && sharpW > 4 && sharpH > 4) {
+        // ⛔ Only the *glass layer* blurs the sharp picture. With the glass material off the picture
+        // must stay sharp - applying the radius regardless made the sharp half disappear at any
+        // larger setting (bug, 2026-11-21).
+        // The radius is a full-resolution number (36 on this profile); on a 76 px tall layer that
+        // is a complete wipe, so it is capped to an eighth of the short side - enough to read as
+        // "softened by the glass", far from destroying the picture.
+        if (g_cfg.glassLayer != 0 && g_cfg.blurRadius > 0 && sharpW > 8 && sharpH > 8) {
+            int cap = (sharpW < sharpH ? sharpW : sharpH) / 8;
+            if (cap < 2) cap = 2;
             int rb = g_cfg.blurRadius;
-            if (rb > 60) rb = 60;
+            if (rb > cap) rb = cap;
             BoxBlurFast(sharp, sharpW, sharpH, rb);
             BoxBlurFast(sharp, sharpW, sharpH, rb);
         }
@@ -2472,14 +2492,21 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h) 
     im.h = h;
     im.ok = true;
     im.at = GetTickCount();
+    im.sig = ImageSig();
     DLog(L"image: composed %s (%ux%u -> %dx%d, sharp %dx%d at %d,%d, feather %d) in %.1f ms",
          path.c_str(), sw, sh, w, h, sharpW, sharpH, dx, dy, feather, NowMs() - tComp0);
+    if (g_cfg.dumpBake) {
+        // diagnostic: the composed picture on its own, without icons on top
+        wchar_t name[128]{};
+        swprintf_s(name, L"dock_img_%dx%d.bmp", w, h);
+        SaveBmp(name, im.px.data(), w, h);
+    }
     return true;
 }
 
 // Load on demand, and reload when the path or the window size changed.
 static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h) {
-    if (im.ok && im.w == w && im.h == h && im.path == path) return true;
+    if (im.ok && im.w == w && im.h == h && im.path == path && im.sig == ImageSig()) return true;
     return LoadImageCover(im, path, w, h);
 }
 

@@ -1784,5 +1784,18 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
 贴纸的像素用 `PrintWindow` 抓下来看过（`dev/deco_paint.png`：图片 + 圆角，正确）。
 **没有做的**：贴纸不参与组/吸附/贴边隐藏/淡入淡出（它是桌面装饰，永远可见），也不能放图标。
 
+**用户 00:39 报的两条（已修）**
+1. **开了玻璃材质却没有玻璃页**：贴纸原来只有一页。现在它有 `kRowsGlassDeco`（玻璃不透明度 / 色调浓度 /
+   模糊半径 + 四条共享的节奏行）和一张「玻璃」页，出现条件是 `DecoHasGlassLayer()`（层开且背景不是纯色，
+   和浮窗同一条规则）。**它还有自己的玻璃参数**：`g_glass[]` 从 2 个扩到 3 个，`[2]` 是贴纸（`[deco]` 的
+   glassOpacity/tintStrength/blurRadius，`-1` = 继承 `[dock]`），`DecoPaint`/`DecoTick` 全部改用它。
+   `PageSet` 的 `kPageGlass` 分支加了 `section == "deco"` 的处理（`LoadConfig` 已经会把 `g_glass[2]` 重读一遍）。
+   实测日志：`settings: obj=3 group=0 -> 2 page(s): 贴纸 | 玻璃`。
+2. **不能调整尺寸**：贴纸现在按边/角拖动缩放（边框 8 px、角 18 px 的抓取带，1/2/4/8 位定义和条/浮窗一致），
+   最小 80x60，夹在自己的显示器内，光标形状跟着变（SIZEWE/NS/NWSE/NESW，内部是 SIZEALL），
+   松手把 `x/y/w/h` 写回 `[deco]`；缩放时 `DecoEnsureDib` 重建 DIB、重画、并把玻璃烤图标记为脏。
+   实测 400x240 → 470x280 且 ini 同步。
+   验收：`dev/t_deco2.ps1` 3/3（两条页面 + 缩放 + 落盘）。
+
 
 

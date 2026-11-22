@@ -244,7 +244,8 @@ struct GlassCfg {
     int tintStrength = 110;
     int glassOpacity = 140;
 };
-static GlassCfg g_glass[2];      // [0] the strip ([dock]), [1] the companion ([traybar], -1 = inherit)
+static GlassCfg g_glass[3];      // [0] strip ([dock]), [1] companion ([traybar]), [2] sticker ([deco]);
+                                 // -1 in the section = inherit [dock]
 
 // ---- 色调 (hue): one colour per float window ------------------------------------------------
 // User decision 2026-11-21: the 色调 IS the window's colour - it paints the solid background and
@@ -337,6 +338,12 @@ static void LoadGlassCfgs() {
         GetGlassInt(L"traybar", L"tintStrength", g_glass[0].tintStrength, 0, 255);
     g_glass[1].glassOpacity =
         GetGlassInt(L"traybar", L"glassOpacity", g_glass[0].glassOpacity, 0, 255);
+    // task 5: the desktop sticker has its own glass parameters too (-1 = inherit [dock])
+    g_glass[2].blurRadius = GetGlassInt(L"deco", L"blurRadius", g_glass[0].blurRadius, 0, 64);
+    g_glass[2].tintStrength =
+        GetGlassInt(L"deco", L"tintStrength", g_glass[0].tintStrength, 0, 255);
+    g_glass[2].glassOpacity =
+        GetGlassInt(L"deco", L"glassOpacity", g_glass[0].glassOpacity, 0, 255);
 }
 
 static COLORREF ParseColor(const std::wstring& s, BYTE* alpha) {
@@ -11578,6 +11585,19 @@ static const SRow kRowsDeco[] = {
     {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
 };
 
+// ---- 贴纸窗口的玻璃页 (task 5): [deco], -1 = inherit [dock] -------------------------------
+// Same shape as the float window's glass page (kRowsGlassTray): the window's own three values plus
+// the machine-wide cadence rows, which always read/write [dock] (IsSharedGlassKey).
+static const SRow kRowsGlassDeco[] = {
+    {L"glassOpacity", L"玻璃不透明度", -1, 255, 0, 0, nullptr, nullptr},
+    {L"tintStrength", L"色调浓度", -1, 255, 0, 0, nullptr, nullptr},
+    {L"blurRadius", L"背景模糊半径 (px)", -1, 64, 0, 0, nullptr, nullptr},
+    {L"refreshHz", L"背景刷新帧率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureHz", L"背景截取频率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureBudgetMs", L"每帧截取预算 (ms)（共享）", 0, 100, 0, 0, nullptr, nullptr},
+    {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
+};
+
 // ---- 图标条页 (component: kCompBar; things a float window has no use for) ----------------
 static const SRow kRowsBar[] = {
     {L"iconSize", L"默认图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
@@ -11800,6 +11820,10 @@ static void PageSet(int i, int v) {
                     TrayRepaint(g_trayBar);
                     CompanionPresent(g_trayBar);
                 }
+            } else if (!wcscmp(p->section.c_str(), L"deco")) {
+                // task 5: the sticker's own glass parameters (it bakes its own backdrop)
+                DecoInvalidateImage();
+                DecoApplyStyle();          // re-reads the style, repaints, marks the bake dirty
             } else {
                 g_imgStrip.sig = 0;
             }
@@ -12812,6 +12836,11 @@ struct Deco {
     DWORD glassWideUntil = 0;
     bool dragging = false;
     POINT dragGrab{};
+    // task 5: edge resize (the sticker is a plain window, so it resizes like one)
+    bool resizing = false;
+    int resizeEdge = 0;          // 1 left, 2 right, 4 top, 8 bottom
+    RECT resizeRc0{};
+    POINT resizeOrigin{};
     // style: -1 = inherit [dock], exactly like a float window's overrides
     int bgMode = -1, glassLayer = -1, radiusOv = -1, solidOpacity = -1;
     bool enabled = false;
@@ -12835,6 +12864,10 @@ static int DecoSolidAlpha() {
 // A picture background has no backdrop to bake - it is drawn from the picture and still takes the
 // glass tint (see DecoPaint's picture branch).
 static bool DecoUsesGlass() { return DecoBgMode() == 0 && DecoGlassLayer() == 1; }
+
+// "Does it *have* a glass layer?" - a picture background bakes no backdrop but still takes the
+// tint, so its 玻璃 page exists (same split as CompanionHasGlassLayer).
+static bool DecoHasGlassLayer() { return DecoGlassLayer() == 1 && DecoBgMode() != 2; }
 
 static void DecoEnsureDib(int w, int h) {
     Deco& d = g_deco;
@@ -12915,7 +12948,7 @@ static void DecoPaint() {
     } else if (DecoBgMode() == 1) {
         if (EnsureImage(g_imgDeco, ImagePathFor(L"deco"), w, h, 0)) {
             EnsureFloatMask(w, h, radius, kDecoNoSnap);
-            PaintImageBg(g_imgDeco, w, h, g_fltCov.data(), g_fltRim.data(), g_hue[0], g_glass[0]);
+            PaintImageBg(g_imgDeco, w, h, g_fltCov.data(), g_fltRim.data(), g_hue[0], g_glass[2]);
         }
     }
     g_paintBits = savePaint;
@@ -13025,13 +13058,13 @@ static void DecoTick(DWORD now) {
         d.glass.dirty = false;
         return;
     }
-    const DWORD sig = g_hue[0] ^ ((DWORD)g_glass[0].tintStrength << 8) ^
-                      ((DWORD)g_glass[0].glassOpacity << 16) ^ ((DWORD)g_glass[0].blurRadius << 20);
+    const DWORD sig = g_hue[0] ^ ((DWORD)g_glass[2].tintStrength << 8) ^
+                      ((DWORD)g_glass[2].glassOpacity << 16) ^ ((DWORD)g_glass[2].blurRadius << 20);
     if (sig != d.glassSig) {
         d.glassSig = sig;
         d.glass.dirty = true;
     }
-    if (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0) return;
+    if (g_glass[2].glassOpacity == 0 && g_glass[2].tintStrength == 0) return;
     const bool justMoved = d.glassMovedAt != 0;
     if (justMoved && d.glass.valid && d.bits) {
         const int w = d.rc.right - d.rc.left, h = d.rc.bottom - d.rc.top;
@@ -13055,13 +13088,13 @@ static void DecoTick(DWORD now) {
         return;
     }
     const bool movingSoon = justMoved || (d.glassWideUntil && (LONG)(d.glassWideUntil - now) > 0);
-    const int M = movingSoon ? kCompanionMargin : (g_glass[0].blurRadius > 0 ? 64 : 0);
+    const int M = movingSoon ? kCompanionMargin : (g_glass[2].blurRadius > 0 ? 64 : 0);
     if (movingSoon) d.glassWideUntil = now + 3000;
     if (movingSoon && g_cfg.dragNoCapture) {
         d.glass.dirty = false;
         return;
     }
-    const BakeResult r = BakeGlass(d.glass, d.rc, M, L"deco", g_hue[0], g_glass[0], movingSoon);
+    const BakeResult r = BakeGlass(d.glass, d.rc, M, L"deco", g_hue[0], g_glass[2], movingSoon);
     if (r == kBakeNoBudget) return;
     if (r == kBakeFailed) {
         d.glass.at = now;
@@ -13097,41 +13130,148 @@ static void DecoProcMenu(HWND h) {
     }
 }
 
+// Which edge/corner of the sticker the pointer is on (same bit order as the strip and the float
+// window: 1 left, 2 right, 4 top, 8 bottom; 0 = not on a border, i.e. a plain drag).
+static int DecoEdgeAt(POINT client) {
+    const int w = g_deco.rc.right - g_deco.rc.left, h = g_deco.rc.bottom - g_deco.rc.top;
+    if (w <= 0 || h <= 0) return 0;
+    const int band = 8, corner = 18;
+    if (client.x < 0 || client.y < 0 || client.x >= w || client.y >= h) return 0;
+    const bool lx = client.x < corner, rx = client.x >= w - corner;
+    const bool ty = client.y < corner, by = client.y >= h - corner;
+    if ((lx || rx) && (ty || by)) return (lx ? 1 : 2) | (ty ? 4 : 8);
+    int e = 0;
+    if (client.x < band) e |= 1;
+    else if (client.x >= w - band) e |= 2;
+    if (client.y < band) e |= 4;
+    else if (client.y >= h - band) e |= 8;
+    return e;
+}
+
+static void DecoSetCursorForEdge(int edge) {
+    LPCWSTR id = IDC_ARROW;
+    switch (edge) {
+        case 1: case 2: id = IDC_SIZEWE; break;
+        case 4: case 8: id = IDC_SIZENS; break;
+        case 1 | 4: case 2 | 8: id = IDC_SIZENWSE; break;
+        case 2 | 4: case 1 | 8: id = IDC_SIZENESW; break;
+        case 0: default: id = IDC_SIZEALL; break;    // inside: it is draggable
+    }
+    SetCursor(LoadCursorW(nullptr, id));
+}
+
 static LRESULT CALLBACK DecoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     Deco& d = g_deco;
     switch (m) {
         case WM_LBUTTONDOWN: {
-            if (d.dragging) return 0;
+            if (d.dragging || d.resizing) return 0;
             POINT p{};
             GetCursorPos(&p);
+            POINT cp = p;
+            ScreenToClient(h, &cp);
+            const int edge = DecoEdgeAt(cp);
+            if (edge) {
+                d.resizing = true;
+                d.resizeEdge = edge;
+                d.resizeRc0 = d.rc;
+                d.resizeOrigin = p;
+                SetCapture(h);
+                DLog(L"deco: resize start edge=%d", edge);
+                return 0;
+            }
             d.dragging = true;
             d.dragGrab.x = p.x - d.rc.left;
             d.dragGrab.y = p.y - d.rc.top;
             SetCapture(h);
             return 0;
         }
-        case WM_MOUSEMOVE: {
-            if (!d.dragging) return 0;
+        case WM_SETCURSOR: {
+            if (LOWORD(l) != HTCLIENT) break;
             POINT p{};
             GetCursorPos(&p);
-            const int w2 = d.rc.right - d.rc.left, h2 = d.rc.bottom - d.rc.top;
-            const int x = p.x - d.dragGrab.x, y = p.y - d.dragGrab.y;
-            if (x == d.rc.left && y == d.rc.top) return 0;
-            d.rc = RECT{x, y, x + w2, y + h2};
+            ScreenToClient(h, &p);
+            DecoSetCursorForEdge(d.dragging ? 0 : DecoEdgeAt(p));
+            return TRUE;
+        }
+        case WM_MOUSEMOVE: {
+            if (d.dragging) {
+                POINT p{};
+                GetCursorPos(&p);
+                const int w2 = d.rc.right - d.rc.left, h2 = d.rc.bottom - d.rc.top;
+                const int x = p.x - d.dragGrab.x, y = p.y - d.dragGrab.y;
+                if (x == d.rc.left && y == d.rc.top) return 0;
+                d.rc = RECT{x, y, x + w2, y + h2};
+                d.glassMovedAt = GetTickCount();
+                SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                return 0;
+            }
+            if (!d.resizing) return 0;
+            POINT p{};
+            GetCursorPos(&p);
+            const int dx = p.x - d.resizeOrigin.x, dy = p.y - d.resizeOrigin.y;
+            RECT r = d.resizeRc0;
+            if (d.resizeEdge & 1) r.left += dx;
+            if (d.resizeEdge & 2) r.right += dx;
+            if (d.resizeEdge & 4) r.top += dy;
+            if (d.resizeEdge & 8) r.bottom += dy;
+            const int minW = 80, minH = 60;
+            if (r.right - r.left < minW) {
+                if (d.resizeEdge & 1) r.left = r.right - minW;
+                else r.right = r.left + minW;
+            }
+            if (r.bottom - r.top < minH) {
+                if (d.resizeEdge & 4) r.top = r.bottom - minH;
+                else r.bottom = r.top + minH;
+            }
+            // keep it on the monitor it lives on
+            RECT mon = HideMonitorRect(h);
+            if (r.left < mon.left) r.left = mon.left;
+            if (r.top < mon.top) r.top = mon.top;
+            if (r.right > mon.right) r.right = mon.right;
+            if (r.bottom > mon.bottom) r.bottom = mon.bottom;
+            if (r.right - r.left < minW) r.right = r.left + minW;
+            if (r.bottom - r.top < minH) r.bottom = r.top + minH;
+            if (r.left == d.rc.left && r.top == d.rc.top && r.right == d.rc.right &&
+                r.bottom == d.rc.bottom)
+                return 0;
+            d.rc = r;
+            const int w2 = r.right - r.left, h2 = r.bottom - r.top;
+            DecoEnsureDib(w2, h2);
+            DecoPaint();
+            DecoPresent();
             d.glassMovedAt = GetTickCount();
-            SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            d.glass.dirty = true;          // the bake has to cover the new size
+            SetWindowPos(h, nullptr, r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
         case WM_LBUTTONUP: {
-            if (!d.dragging) return 0;
-            d.dragging = false;
-            ReleaseCapture();
-            wchar_t b[32];
-            swprintf_s(b, L"%d", d.rc.left);
-            WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
-            swprintf_s(b, L"%d", d.rc.top);
-            WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
-            DLog(L"deco: moved to %ld,%ld", (long)d.rc.left, (long)d.rc.top);
+            if (d.dragging) {
+                d.dragging = false;
+                ReleaseCapture();
+                wchar_t b[32];
+                swprintf_s(b, L"%d", d.rc.left);
+                WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
+                swprintf_s(b, L"%d", d.rc.top);
+                WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
+                DLog(L"deco: moved to %ld,%ld", (long)d.rc.left, (long)d.rc.top);
+                return 0;
+            }
+            if (d.resizing) {
+                d.resizing = false;
+                ReleaseCapture();
+                wchar_t b[32];
+                swprintf_s(b, L"%d", d.rc.right - d.rc.left);
+                WritePrivateProfileStringW(L"deco", L"w", b, g_iniPath.c_str());
+                swprintf_s(b, L"%d", d.rc.bottom - d.rc.top);
+                WritePrivateProfileStringW(L"deco", L"h", b, g_iniPath.c_str());
+                swprintf_s(b, L"%d", d.rc.left);
+                WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
+                swprintf_s(b, L"%d", d.rc.top);
+                WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
+                DLog(L"deco: resized to %ldx%ld at %ld,%ld", (long)(d.rc.right - d.rc.left),
+                     (long)(d.rc.bottom - d.rc.top), (long)d.rc.left, (long)d.rc.top);
+                return 0;
+            }
             return 0;
         }
         case WM_RBUTTONUP:
@@ -13162,10 +13302,15 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
         wantGroup = hintId;
         addGroupPage(hintId);
     } else if (hintObj == kObjDeco) {
-        // task 5: the sticker has exactly one page - background, glass layer, radius
+        // task 5: the sticker gets the same two pages a glass float window has - 贴纸 (its
+        // background) and, when it really has a glass layer, 玻璃 (its own glass parameters).
         wantKind = kPageDeco;
         g_pages.push_back(SPage{L"贴纸", L"deco", kRowsDeco,
                                 (int)(sizeof(kRowsDeco) / sizeof(kRowsDeco[0])), kPageDeco, 0});
+        if (DecoHasGlassLayer())
+            g_pages.push_back(SPage{L"玻璃", L"deco", kRowsGlassDeco,
+                                    (int)(sizeof(kRowsGlassDeco) / sizeof(kRowsGlassDeco[0])),
+                                    kPageGlass, 0});
     } else if (hintObj == kObjCompanion) {
         // A companion owns "float" always, "glass" only when its own background is the glass
         // layer, and the 组 page of the group it belongs to (groupId 0 = in no group).

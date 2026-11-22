@@ -3385,7 +3385,9 @@ static bool CursorInCompanionGroup();   // defined with the companions
 
 // The strip's alpha is the default group's alpha (H2b): distance to the *group* rectangle with
 // the group's own fade distances. Defined after the group code because it needs Group.
-static int GroupFadeAlphaForStrip();
+// The group's shared fade value (H2b): the strip and every companion of a group read this one
+// number, so they cannot fade independently any more (user, 2026-11-22).
+static int DefaultGroupFadeAlpha();
 
 static void UpdateAlpha() {
     // Settings open, or the panel/menu is up: never fade. The strip is part of the
@@ -3405,12 +3407,13 @@ static void UpdateAlpha() {
         }
         return;
     }
-    int d = DistanceToWindow();
-    int a;
-    if (d <= g_cfg.fadeStart) a = 255;
-    else if (d >= g_cfg.fadeEnd) a = 0;
-    else a = 255 - (d - g_cfg.fadeStart) * 255 / (g_cfg.fadeEnd - g_cfg.fadeStart);
+    // The fade belongs to the *group* now (H2b): the distance is measured to the group's own
+    // rectangle with the group's numbers, and every member of the group shows the same value.
+    // This used to be DistanceToWindow() with the global numbers, which is why the strip and the
+    // companion visibly faded on their own (user, 2026-11-22).
+    int a = DefaultGroupFadeAlpha();
     if (a == g_alpha) return;
+    DLog(L"fade: strip %d -> %d", g_alpha, a);     // TEMP: verifying the shared group fade
     g_alpha = a;
     bool wantThrough = (a == 0);
     if (wantThrough) ThumbHide();          // invisible dock: no preview either
@@ -4953,6 +4956,15 @@ struct Group {
     DWORD hideFlashUntil = 0;
     HWND wakeHwnd = nullptr;      // the 唤出区域 window
     RECT wakeRc{0, 0, 0, 0};      // its rect while hidden (screen px)
+    // The 唤出区域's colour. A group has no tone of its own (the tone belongs to a *window*, see
+    // g_hue[]), so it carries one here; unset = use the strip's tone.
+    DWORD hue = 0;
+    bool hasHue = false;
+    // One fade for the whole group (H2b): the strip and the companions used to compute their own,
+    // which made them visibly fade independently (user, 2026-11-22). fadeTarget is recomputed on
+    // the housekeeping tick, fadeNow steps towards it - both read by every member of the group.
+    int fadeTarget = 255;
+    int fadeNow = 255;
     // frame window + fade
     HWND hwnd = nullptr;
     RECT rc{0, 0, 0, 0};         // screen px, empty when there is nothing to frame
@@ -5029,6 +5041,12 @@ static void GroupLoad(Group& g) {
     if (g.wakeExt > 10) g.wakeExt = 10;
     g.wakeVisible = GetInt(sec, L"wakeVisible", 0) != 0;
     g.wakeModeHover = GetInt(sec, L"wakeMode", 0) != 0;
+    // task 4: the 唤出区域 colour; empty = follow the strip's tone (see HueFor())
+    {
+        std::wstring hs = GetStr(sec, L"hue");
+        g.hasHue = !hs.empty();
+        if (g.hasHue) g.hue = ParseHexRgb(hs, g_hue[0]) & 0x00FFFFFFu;
+    }
 }
 
 static void GroupSaveFlag(Group& g, const wchar_t* key, bool value) {
@@ -5718,10 +5736,14 @@ static void HideWakePresent(Group& g, int alpha) {
         bh = h;
     }
     if (!bmp || !bits) return;
-    DWORD hue = (g.id == 1 ? g_hue[0] : g_hue[1]) & 0x00FFFFFFu;
-    DWORD rr = (hue & 0xFF) * (DWORD)alpha / 255;
+    // the band's colour: the group's own 色调 when it has one, else the strip's tone
+    DWORD hue = (g.hasHue ? g.hue : g_hue[0]) & 0x00FFFFFFu;
+    // hue is 0x00RRGGBB (the convention every other 色调 site uses); the DIB word is 0xAARRGGBB,
+    // so red goes in bits 16..23. Getting this backwards swaps red and blue - invisible for a
+    // green tone, obvious for anything else (found 2026-11-22 by the two-hue band test).
+    DWORD rr = ((hue >> 16) & 0xFF) * (DWORD)alpha / 255;
     DWORD gg = ((hue >> 8) & 0xFF) * (DWORD)alpha / 255;
-    DWORD bb = ((hue >> 16) & 0xFF) * (DWORD)alpha / 255;
+    DWORD bb = (hue & 0xFF) * (DWORD)alpha / 255;
     DWORD px = ((DWORD)alpha << 24) | (rr << 16) | (gg << 8) | bb;
     DWORD* p = (DWORD*)bits;
     for (int i = 0; i < w * h; i++) p[i] = px;
@@ -5823,13 +5845,21 @@ static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
     bool inGroup = PtInRect(&pad, p) != FALSE;
     bool inWake = hasWake && PtInRect(&wakeRc, p) != FALSE;
 
+    // "Anything that means the user is interacting with us must not fold the group up" (user,
+    // 2026-11-22): our own context menus (TrackPopupMenu runs a nested loop and the render tick
+    // keeps firing, so the pointer going to a menu item used to count as "left the group"), the
+    // settings panel that opens right after, the tray grid, a forwarded app menu, the thumbnail
+    // preview. While any of them is up the arming time is pushed forward, which also leaves a
+    // grace period after it closes.
+    bool interacting = g_popupOpen || g_menuOpen || g_setWnd != nullptr || g_gridVisible ||
+                       (g_thumbWnd && IsWindowVisible(g_thumbWnd));
+    if (interacting) g.hideArmAt = now + 600;
+
     if (g.hideSlide == g.hideSlideTarget) {
         if (g.hideSlideTarget >= 1.0f) {
-            // "the pointer left" - but not before the arming grace has passed (see
-            // HideEdgeAttach) and not while our own settings panel is open: turning the switch
-            // on puts the pointer on that panel, and the group must not vanish behind it.
-            bool ourUi = g_setWnd != nullptr;
-            if (!inGroup && !inWake && !ourUi && (LONG)(now - g.hideArmAt) > 0)
+            // "the pointer left" - not before the arming grace has passed (see HideEdgeAttach),
+            // and never while the user is working with our own UI
+            if (!inGroup && !inWake && !interacting && (LONG)(now - g.hideArmAt) > 0)
                 HideBegin(g, false, now);
         } else {
             bool wake = g.wakeModeHover ? inWake : g.hideWakeClick;
@@ -6252,14 +6282,15 @@ static int CompanionAlphaTarget(Companion& c, POINT p) {
     return 255 - (d - fs) * 255 / (fe - fs);
 }
 
-// The strip's own alpha: the default group's (see above). Falls back to the strip's window rect
-// and the global numbers when the group has no members yet (early start-up).
-static int GroupFadeAlphaForStrip() {
-    Group& g = DefaultGroup();
+// The group's shared fade value (H2b/task 4): distance to the group's own bounds with the group's
+// numbers, 255 while it is latched (pointer on a member / in the frame / our UI in use) and 255
+// while 贴边隐藏 is on - that feature replaces the distance fade entirely, and the two together
+// felt wrong (user, 2026-11-22).
+static int GroupFadeTarget(Group& g, POINT p) {
+    if (g.hideEdge) return 255;
+    if (g.shown) return 255;
     int fs = g.fadeStart >= 0 ? g.fadeStart : g_cfg.fadeStart;
     int fe = g.fadeEnd > fs ? g.fadeEnd : (fs + 1);
-    POINT p{};
-    if (!GetCursorPos(&p)) return g_alpha;
     RECT ref{};
     if (!GroupBounds(g, &ref)) {
         if (!g_hwnd || !GetWindowRect(g_hwnd, &ref)) return 255;
@@ -6274,6 +6305,8 @@ static int GroupFadeAlphaForStrip() {
     if (d >= fe) return 0;
     return 255 - (d - fs) * 255 / (fe - fs);
 }
+
+static int DefaultGroupFadeAlpha() { return DefaultGroup().fadeNow; }
 
 // Visibility, per group (G2). Group 1 keeps the original rule; a group without the strip latches
 // on when the pointer is on one of its members (or inside its frame) and releases when it leaves.
@@ -6321,6 +6354,15 @@ static void CompanionVisibilityTick(DWORD now) {
         if (onMember || inBox || ourUi) g.shown = true;
         else if (!inBox && !g.scale.active && !g.drag.active) g.shown = false;
 
+        // one fade for the whole group: target here, the value every member shows
+        g.fadeTarget = GroupFadeTarget(g, p);
+        if (g.fadeNow != g.fadeTarget) {
+            int step = (int)(255 * 16 / 120);        // ~120 ms for a full fade at 60 fps
+            if (step < 1) step = 1;
+            int diff = g.fadeTarget - g.fadeNow;
+            g.fadeNow += (diff > 0) ? (step < diff ? step : diff) : ((-step) > diff ? -step : diff);
+        }
+
         bool wantShown = g.shown && haveBox;      // a group of one has no frame at all
         if (g.hwnd && (wantShown ? 255 : 0) != g.alphaTarget) {
             DLog(L"group %d: target -> %d (shown=%d box=%d alpha=%d)", g.id,
@@ -6353,7 +6395,10 @@ static void CompanionVisibilityTick(DWORD now) {
 
     // ---- companions: alpha target + show/hide ----
     Companion& c = g_trayBar;
-    int target = CompanionAlphaTarget(c, p);
+    // The companion shows its group's fade value (one fade for the whole group). A companion
+    // with no group at all (groupId 0) keeps its own distance fade.
+    Group* cg = GroupById(c.groupId);
+    int target = cg ? cg->fadeTarget : CompanionAlphaTarget(c, p);
     bool wasVisible = c.visible;
     c.visible = (target > 0);
     if (c.visible && !wasVisible && c.hwnd) {
@@ -6487,12 +6532,22 @@ static void CompanionTick(DWORD now) {
         if (dState >= 3.0) DLog(L"slow: state+visibility %.1f ms", dState);
     }
 
-    if (g_trayBar.alpha != g_trayBar.alphaTarget) {
+    // The companion's alpha *is* its group's fade value - no independent stepping, otherwise the
+    // strip (which takes the value straight away) and the companion drift apart while fading,
+    // which is exactly what the user saw (2026-11-22). A companion with no group keeps the old
+    // eased behaviour.
+    Group* cFade = GroupById(g_trayBar.groupId);
+    int wantAlpha = cFade ? cFade->fadeNow : g_trayBar.alphaTarget;
+    if (!cFade && g_trayBar.alpha != g_trayBar.alphaTarget) {
         int diff = g_trayBar.alphaTarget - g_trayBar.alpha;
         int step = (int)(255 * 16 / 120);        // ~120 ms for a full fade at 60 fps
         if (step < 1) step = 1;
         if (diff > 0) g_trayBar.alpha += step < diff ? step : diff;
         else g_trayBar.alpha += (-step) > diff ? -step : diff;
+    }
+    if (g_trayBar.alpha != wantAlpha) {
+        DLog(L"fade: tray %d -> %d", g_trayBar.alpha, wantAlpha);   // TEMP: shared group fade
+        g_trayBar.alpha = wantAlpha;
         const double tPresent = NowMs();
         CompanionPresent(g_trayBar);
         const double dPresent = NowMs() - tPresent;
@@ -11461,9 +11516,14 @@ static const SRow kRowsGroup[] = {
     // task 4: 贴边隐藏 + its three sub-rows (they only show while the switch is on, see
     // SettingsRowVisible).
     {L"hideEdge", L"贴边隐藏", 0, 1, 0, 1, L"开", L"关"},
+    // The band's colour: a group has no tone of its own, so it gets one here (falls back to the
+    // strip's tone until it is set).
+    {L"hue", L"唤醒区域色调", 0, 0, 0, 0, nullptr, nullptr},
     {L"wakeExt", L"唤出区域宽度 (px)", 0, 10, 0, 0, nullptr, nullptr},
     {L"wakeVisible", L"唤出区域常显", 0, 1, 0, 1, L"可见", L"不可见"},
-    {L"wakeMode", L"唤出方式", 0, 1, 0, 1, L"单击", L"进入"},
+    // task 4: 0 = click the band, 1 = move into it. The toggle's left pill is "value 1", so the
+    // labels have to be (1, 0) in that order - the first version had them swapped (user, 2026-11-22).
+    {L"wakeMode", L"唤出方式", 0, 1, 0, 1, L"进入", L"单击"},
 };
 
 static std::vector<SPage> g_pages;
@@ -11502,6 +11562,7 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     if (!wcscmp(key, L"wakeExt")) return g.wakeExt;
     if (!wcscmp(key, L"wakeVisible")) return g.wakeVisible ? 1 : 0;
     if (!wcscmp(key, L"wakeMode")) return g.wakeModeHover ? 1 : 0;
+    if (!wcscmp(key, L"hue")) return 0;      // edited as swatches, not as a number
     return 0;
 }
 
@@ -11989,9 +12050,35 @@ static void RefreshCompanionAfterReload() {
     CompanionPresent(g_trayBar);
 }
 
-// Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue`).
+// Task 4: a group has no tone of its own, so it carries one for its 唤出区域. `which` is
+// 0 = strip, 1 = companion, 2 = the group whose page is open (g_hueGroup); an unset group falls
+// back to the strip's tone so the band never looks out of place.
+static int g_hueGroup = 1;
+
+static DWORD HueFor(int which) {
+    if (which == 2) {
+        Group* g = GroupById(g_hueGroup);
+        return (g && g->hasHue) ? g->hue : g_hue[0];
+    }
+    return g_hue[which & 1];
+}
+
+// Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue` / `[group.N] hue`).
 static void SetHueFor(int which, DWORD rgb) {
     rgb &= 0x00FFFFFFu;
+    if (which == 2) {
+        Group* g = GroupById(g_hueGroup);
+        if (!g) return;
+        g->hue = rgb;
+        g->hasHue = true;
+        wchar_t sec[32];
+        GroupSectionName(g->id, sec, 32);
+        wchar_t b[16]{};
+        swprintf_s(b, L"#%06X", rgb);
+        WritePrivateProfileStringW(sec, L"hue", b, g_iniPath.c_str());
+        DLog(L"hue: %s = #%06X (group wake band)", sec, rgb);
+        return;      // the band re-reads it on the next tick, see HideWakePresent
+    }
     g_hue[which & 1] = rgb;
     wchar_t b[16]{};
     swprintf_s(b, L"#%06X", rgb);
@@ -12015,7 +12102,7 @@ static void PickHue(int which) {
     cc.lStructSize = sizeof(cc);
     cc.hwndOwner = g_setWnd;
     cc.lpCustColors = custom;
-    const DWORD h = g_hue[which & 1];
+    const DWORD h = HueFor(which);
     cc.rgbResult = RGB((h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF);
     cc.Flags = CC_FULLOPEN | CC_RGBINIT;
     g_pickBusy = true;
@@ -12044,9 +12131,11 @@ static void SettingsPickNewImage() {    const SPage* p = ActivePage();
 static bool SettingsRowVisible(const SPage* p, int i) {
     if (!p || i < 0 || i >= p->count) return false;
     const wchar_t* key = p->rows[i].key;
-    // task 4: the three sub-rows of 贴边隐藏 only exist while the group switch is on.
-    if (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") || !wcscmp(key, L"wakeMode")) {
-        if (p->kind != kPageGroupKind) return false;
+    // task 4: on a *group* page the wake-band rows (and the band's colour) only exist while the
+    // group switch is on. The float pages keep their own 色调 row unconditionally.
+    if (p->kind == kPageGroupKind &&
+        (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") || !wcscmp(key, L"wakeMode") ||
+         !wcscmp(key, L"hue"))) {
         Group* g = GroupById(p->groupId);
         return g && g->hideEdge;
     }
@@ -12182,8 +12271,9 @@ static void SettingsPaint() {
         }
         if (!wcscmp(row.key, L"hue")) {
             // 8 preset chips + a palette chip (opens the Windows colour picker).
-            const int which = (p->kind == kPageFloatTray) ? 1 : 0;
-            const DWORD cur = g_hue[which] & 0x00FFFFFFu;
+            // 0 = the strip, 1 = the companion, 2 = the group whose page this is (task 4).
+            const int which = (p->kind == kPageFloatTray) ? 1 : (p->kind == kPageGroupKind ? 2 : 0);
+            const DWORD cur = HueFor(which) & 0x00FFFFFFu;
             const int cs = 26, gap = 9;
             int hx = 370;
             for (int k = 0; k < kHueCount; k++) {
@@ -12303,7 +12393,7 @@ static void RowFromX(int i, int x) {
         int y = kRowsTop;
         for (int k = 0; k < i; k++)
             if (SettingsRowVisible(p, k)) y += kRowH;
-        const int which = (p->kind == kPageFloatTray) ? 1 : 0;
+        const int which = (p->kind == kPageFloatTray) ? 1 : (p->kind == kPageGroupKind ? 2 : 0);
         const int cs = 26, gap = 9;
         int hx = 370;
         for (int k = 0; k < kHueCount; k++) {
@@ -12364,7 +12454,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
             if (!g_pickBusy) {
                 if (action == 1) SettingsPickFromGallery();
                 else if (action == 2) SettingsPickNewImage();
-                else if (action == 20 || action == 21) PickHue(action - 20);
+                else if (action == 20 || action == 21 || action == 22) PickHue(action - 20);
             }
             return 0;
         }
@@ -12583,6 +12673,8 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     auto addGroupPage = [](int id) {
         wchar_t title[32];
         swprintf_s(title, L"组 %d", id);
+        // task 4: the 色调 row on a group page edits that group's wake-band colour
+        g_hueGroup = id;
         g_pages.push_back(SPage{title, L"", kRowsGroup,
                                 (int)(sizeof(kRowsGroup) / sizeof(kRowsGroup[0])),
                                 kPageGroupKind, id});
@@ -13217,6 +13309,10 @@ static void RenderTick() {
                 }
             }
             CompanionTick(now);      // attached windows: follow, fade, tray state
+            // The group fade animates over ~120 ms, but the strip's alpha used to be sampled only
+            // when the cursor moved - with one shared (animated) value it would freeze at the last
+            // sample and never follow the fade (found 2026-11-22 while unifying the fade).
+            if (g_alpha != DefaultGroupFadeAlpha()) UpdateAlpha();
             QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();
             FocusWatchTick();

@@ -1702,5 +1702,30 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
 - **没自动化验过的**：闪烁的观感（2 s 两下）、屏幕角转弯的手感、开着隐藏时拖动的跟随感、组页那几行的实际排版。
   这几样请用户过一眼；不对再调常数（都在那一段顶部 `#define`）。
 
+#### 3.32.1 当天晚上的五个修正（2026-11-22 23:3x–24:0x，用户逐条报的）
+
+1. **`唤出方式` 的单击/进入接反了**：`wakeMode` 的值 1 是"进入"，而开关行左边那颗药丸 = **值 1**，所以
+   `onText/offText` 必须写成 `(L"进入", L"单击")`。改的是 `kRowsGroup` 里那一行的两个标签。
+2. **开了贴边隐藏就不再有按距离的淡入淡出**（两套叠在一起手感很怪）：`GroupFadeTarget()` 里
+   `if (g.hideEdge) return 255;` —— 贴边隐藏接管了显隐，距离淡出整个让位。
+3. **"两个窗口还是各淡各的" 是真 bug**（H2b 只做了浮窗那一半）：
+   - `UpdateAlpha()` 里条用的还是 `DistanceToWindow()` + **全局** `fadeStart/fadeEnd`，而浮窗用的是**组矩形 + 组的**距离
+     ⇒ 两条完全独立的曲线。顺带发现 `GroupFadeAlphaForStrip()` 写了但**从来没人调用**（死代码）。
+   - 现在一组一个值：`Group::fadeTarget`（每 tick 由 `GroupFadeTarget()` 算，距离量到 `GroupBounds()`、用组的数）
+     + `Group::fadeNow`（按同一个 ~120 ms 步进缓动）。条读 `DefaultGroupFadeAlpha()`，浮窗直接取自己组的 `fadeNow`
+     （不再自己缓动）。`dev/t_fadefix`/日志实测两者逐帧同步：`tray 255→221→187→160` 与 `strip 255→221→187→160` 一模一样。
+   - ⚠️ 顺带修掉一个隐藏坑：条的 alpha 原来**只在光标移动时才采样**，换成一个会动画的值后条会卡在最后一次采样值上
+     （日志里根本没有 `fade: strip` 行）。现在 housekeeping 里每 tick 比一次 `g_alpha != DefaultGroupFadeAlpha()` 就
+     `UpdateAlpha()`。
+4. **右键去点菜单项的路上把组收起来了**：`TrackPopupMenu` 跑嵌套消息循环、渲染 tick 照样在跑，所以指针走向菜单项时
+   被算成"离开组"。现在 `HideEdgeTick` 里 `interacting = g_popupOpen || g_menuOpen || g_setWnd || g_gridVisible || 缩略图可见`
+   ⇒ 期间**不收起**并把 `hideArmAt` 一直往后推（关掉后再留 600 ms 宽限）。实测 `t_menuhold.ps1` 2/2：
+   菜单开着时指针跑到 (300,800) 组不动，菜单关掉后 2.5 s 正常滑出。
+   （探针里关菜单要用 `PostMessage(WM_CANCELMODE)` —— 合成的 ESC **不会**送到弹出菜单自己的循环里，我第一次白查半天。）
+5. **唤醒区域需要自己的色调**（组本来没有色调属性）：新键 `[group] hue`（缺省 = 用条的颜色），组页多一行
+   **唤醒区域色调**（复用浮窗那套预设色块 + 取色器：`HueFor(2)` / `SetHueFor(2,..)` / 拾色器 action 22，`g_hueGroup` 由页面设置）。
+   顺带抓到 `HideWakePresent()` 里 **R/B 通道写反了**（`hue` 是 0x00RRGGBB，而 DIB 字是 0xAARRGGBB）——
+   绿色看不出来，红色会渲染成蓝色。用"绿/蓝两个色调对比色带"的像素测试才揪出来（`t_hidehue.ps1` 3/3）。
+
 
 

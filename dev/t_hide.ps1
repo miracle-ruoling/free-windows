@@ -1,11 +1,11 @@
-# Task 4 acceptance: 贴边隐藏 (group glues to the screen edge, slides out, comes back).
+﻿# Task 4 acceptance: 璐磋竟闅愯棌 (group glues to the screen edge, slides out, comes back).
 #
 #   .\t_hide.ps1              # full run on group 1; restores the ini and restarts dock at the end
 #
 # What it checks, from geometry + the dock's own log:
 #   1  switching it on glues the group to the nearest screen edge, kHideGap (15 px) inside
 #   2  the pointer leaving the group slides it fully off the screen
-#   3  the 唤出区域 band exists at that edge (DockWakeWindow) and matches the group's extent
+#   3  the 鍞ゅ嚭鍖哄煙 band exists at that edge (DockWakeWindow) and matches the group's extent
 #   4  moving into the band (wakeMode=enter) brings it back to exactly the same place
 #   5  switching it off brings it back and forgets the attachment
 $ErrorActionPreference = 'Stop'
@@ -81,7 +81,7 @@ function Restart { Stop-Process -Name dock -ErrorAction SilentlyContinue; Start-
 function LogTail([int]$n = 8) { Get-Content $log -Tail 300 | Where-Object { $_ -match 'hide: ' } | Select-Object -Last $n }
 
 $orig = @{
-    hideEdge = [HD]::Get('group', 'hideEdge', $null, $ini)
+    hideMode = [HD]::Get('group', 'hideMode', $null, $ini)
     wakeExt = [HD]::Get('group', 'wakeExt', $null, $ini)
     wakeVisible = [HD]::Get('group', 'wakeVisible', $null, $ini)
     wakeMode = [HD]::Get('group', 'wakeMode', $null, $ini)
@@ -91,14 +91,14 @@ $orig = @{
 }
 $mg = $orig.margin
 function Restore {
-    foreach ($k in @('hideEdge', 'wakeExt', 'wakeVisible', 'wakeMode')) {
+    foreach ($k in @('hideMode', 'wakeExt', 'wakeVisible', 'wakeMode')) {
         [void][HD]::Set('group', $k, $orig[$k], $ini)
     }
 }
 try {
     $h = Strip
     # start from a clean, visible state (a previous run may have left the group hidden)
-    [void][HD]::Set('group', 'hideEdge', '0', $ini)
+    [void][HD]::Set('group', 'hideMode', '0', $ini)
     Restart
     $h = Strip
     $mon = [HD]::Monitor($h)
@@ -109,7 +109,7 @@ try {
 
     Write-Output ""
     Write-Output "== 1. switch it on (nearest edge = top here) =="
-    [void][HD]::Set('group', 'hideEdge', '1', $ini)
+    [void][HD]::Set('group', 'hideMode', '1', $ini)
     [void][HD]::Set('group', 'wakeExt', '6', $ini)
     [void][HD]::Set('group', 'wakeMode', '1', $ini)      # enter to wake
     [void][HD]::Set('group', 'wakeVisible', '0', $ini)
@@ -139,7 +139,7 @@ try {
     Check "2  and the bounds sit 5 px past the edge" ($bo.Bottom -eq ($mon.Top - 5)) ("bounds.bottom=" + $bo.Bottom)
 
     Write-Output ""
-    Write-Output "== 3. the 唤出区域 band =="
+    Write-Output "== 3. the 鍞ゅ嚭鍖哄煙 band =="
     $w = [HD]::Find('DockWakeWindow')
     $wr = if ($w -ne [IntPtr]::Zero) { RectOf $w } else { $null }
     Write-Output ("  wake window " + $(if ($w -ne [IntPtr]::Zero) { (RectStr $wr) + " visible=" + [HD]::IsWindowVisible($w) } else { '(none)' }))
@@ -157,7 +157,7 @@ try {
 
     Write-Output ""
     Write-Output "== 5. switch it off =="
-    [void][HD]::Set('group', 'hideEdge', '0', $ini)
+    [void][HD]::Set('group', 'hideMode', '0', $ini)
     Reload
     Start-Sleep -Milliseconds 400
     $r4 = RectOf (Strip)
@@ -178,3 +178,4 @@ finally {
 Write-Output ""
 Write-Output ("done: $pass passed, $fail failed")
 if ($fail -gt 0) { exit 1 }
+

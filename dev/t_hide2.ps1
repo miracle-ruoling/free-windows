@@ -1,5 +1,5 @@
 # Task 4, part 2: a group with a *single* member (the 3-icon window alone) must work through the
-# same group settings - no special case. Also: click mode, 甯告樉 band, and that group 1 is untouched.
+# same group settings - no special case. Also: click mode, 鐢憡妯?band, and that group 1 is untouched.
 #
 #   .\t_hide2.ps1
 param([int]$Settle = 1200)
@@ -54,8 +54,8 @@ function LogTail([int]$n = 6) { Get-Content $log -Tail 200 | Where-Object { $_ -
 
 $orig = @{
     trayGroup = [H2]::Get('traybar', 'group', $null, $ini)
-    g1hide = [H2]::Get('group', 'hideEdge', $null, $ini)
-    g2hide = [H2]::Get('group.2', 'hideEdge', $null, $ini)
+    g1hide = [H2]::Get('group', 'hideMode', $null, $ini)
+    g2hide = [H2]::Get('group.2', 'hideMode', $null, $ini)
     g2ext = [H2]::Get('group.2', 'wakeExt', $null, $ini)
     g2vis = [H2]::Get('group.2', 'wakeVisible', $null, $ini)
     g2mode = [H2]::Get('group.2', 'wakeMode', $null, $ini)
@@ -63,20 +63,20 @@ $orig = @{
 }
 $mg2 = [int]$orig.g2margin
 function Restore {
-    [void][H2]::Set('group.2', 'hideEdge', $orig.g2hide, $ini)
+    [void][H2]::Set('group.2', 'hideMode', $orig.g2hide, $ini)
     [void][H2]::Set('group.2', 'wakeExt', $orig.g2ext, $ini)
     [void][H2]::Set('group.2', 'wakeVisible', $orig.g2vis, $ini)
     [void][H2]::Set('group.2', 'wakeMode', $orig.g2mode, $ini)
-    [void][H2]::Set('group', 'hideEdge', $orig.g1hide, $ini)
+    [void][H2]::Set('group', 'hideMode', $orig.g1hide, $ini)
     [void][H2]::Set('traybar', 'group', $orig.trayGroup, $ini)
 }
 try {
-    Write-Output ("before: [traybar] group='" + $orig.trayGroup + "'  [group.2] hideEdge='" + $orig.g2hide + "'")
+    Write-Output ("before: [traybar] group='" + $orig.trayGroup + "'  [group.2] hideMode='" + $orig.g2hide + "'")
     $stripBefore = RectOf (Strip)
     # the 3-icon window gets its own group, and that group (one member) turns hiding on
     [void][H2]::Set('traybar', 'group', '2', $ini)
-    [void][H2]::Set('group', 'hideEdge', '0', $ini)
-    [void][H2]::Set('group.2', 'hideEdge', '1', $ini)
+    [void][H2]::Set('group', 'hideMode', '0', $ini)
+    [void][H2]::Set('group.2', 'hideMode', '1', $ini)
     [void][H2]::Set('group.2', 'wakeExt', '8', $ini)
     [void][H2]::Set('group.2', 'wakeVisible', '1', $ini)
     [void][H2]::Set('group.2', 'wakeMode', '0', $ini)      # click to wake
@@ -92,7 +92,7 @@ try {
     Write-Output ("== single-member group glued:  tray " + (RStr $c1) + "  (bounds top should be " + ($mon.Top + 15) + ")")
     Write-Output ("  log: " + ((LogTail 3) -join ' | '))
     Check "1  one-member group glues itself (bounds 15 px inset)" (($c1.Top - $mg2) -eq ($mon.Top + 15)) ("bounds.top=" + ($c1.Top - $mg2))
-    Check "1  and the strip (group 1, switched off) was left alone" ((RectOf (Strip)).Top -eq $stripBefore.Top) ("strip " + (RectOf (Strip)).Top + " was " + $stripBefore.Top)
+    Check "1  and the strip (group 1, 距离 mode) was left alone" ((RectOf (Strip)).Top -eq [int][H2]::Get('dock', 'y', '0', $ini)) ("strip " + (RectOf (Strip)).Top + " vs ini y " + [H2]::Get('dock', 'y', '0', $ini))
 
     Write-Output ""
     Write-Output "== click on the band wakes it =="
@@ -104,7 +104,7 @@ try {
     $w = [H2]::Find('DockWakeWindow')
     $wr = if ($w -ne [IntPtr]::Zero) { RectOf $w } else { $null }
     Write-Output ("  band " + $(if ($wr) { (RStr $wr) + " visible=" + [H2]::IsWindowVisible($w) } else { '(none)' }))
-    Check "2  the band is painted (甯告樉) and 8 px thick" ($wr -and $wr.Bottom -eq ($mon.Top + 8) -and [H2]::IsWindowVisible($w)) $(if ($wr) { RStr $wr } else { '' })
+    Check "2  the band is painted (鐢憡妯? and 8 px thick" ($wr -and $wr.Bottom -eq ($mon.Top + 8) -and [H2]::IsWindowVisible($w)) $(if ($wr) { RStr $wr } else { '' })
     # a click only makes sense with the pointer on the band (with the pointer far away the group wakes
 # and is "left" again at once, which is correct behaviour - just not what this checks)
 [void][H2]::SetCursorPos([int](($wr.Left + $wr.Right) / 2), [int]($mon.Top + 4))
@@ -127,4 +127,5 @@ finally {
 Write-Output ""
 Write-Output ("done: $pass passed, $fail failed")
 if ($fail -gt 0) { exit 1 }
+
 

@@ -3389,13 +3389,22 @@ static bool CursorInCompanionGroup();   // defined with the companions
 // number, so they cannot fade independently any more (user, 2026-11-22).
 static int DefaultGroupFadeAlpha();
 
+// Is any of our own UI in use right now? While it is, the dock must not fade out and a group must
+// not fold up: the pointer has to leave the group to reach a menu item or the settings panel, and
+// that trip is not "the user walked away" (user, 2026-11-22, twice: once for the hide, once for
+// the distance fade).
+static bool OurUiBusy() {
+    if (g_popupOpen || g_menuOpen || g_setWnd || g_gridVisible) return true;
+    return g_thumbWnd && IsWindowVisible(g_thumbWnd) != FALSE;
+}
+
 static void UpdateAlpha() {
     // Settings open, or the panel/menu is up: never fade. The strip is part of the
     // interaction while the user is picking from the grid, and the user asked for it
     // to stay at full strength no matter where the pointer wanders.
     // Same for "the pointer is somewhere in the group": if the attached windows are up,
     // the strip they belong to must not fade out from under the cursor (user, 2026-11-15).
-    if (g_setWnd || g_gridVisible || g_menuOpen || CursorInCompanionGroup()) {
+    if (OurUiBusy() || CursorInCompanionGroup()) {
         if (g_alpha != 255) {
             g_alpha = 255;
             if (g_clickThrough) {
@@ -4941,7 +4950,10 @@ struct Group {
     // back. Geometry only, applied to the members - a single-member group works with no special
     // case (GroupBounds() covers it; GroupBoxMembers() deliberately does not, so a one-member
     // group simply has no frame to slide off).
-    bool hideEdge = false;        // [group] hideEdge
+    bool hideEdge = false;        // [group] hideEdge (= hideMode 1), kept as the runtime mirror
+    // 隐藏方案 (user, 2026-11-23): 0 = 鼠标距离 (the fade), 1 = 贴边隐藏, 2 = 从不 (always visible).
+    // It replaces the old boolean switch and decides which sub-rows the group page shows.
+    int hideMode = 0;
     int wakeExt = 4;              // [group] wakeExt 0..10: the band's thickness
     bool wakeVisible = false;     // [group] wakeVisible: always painted / only flashing
     bool wakeModeHover = false;   // [group] wakeMode: 0 = click the band, 1 = move into it
@@ -5035,7 +5047,12 @@ static void GroupLoad(Group& g) {
     if (g.fadeStart < 0) g.fadeStart = 0;
     if (g.fadeEnd <= g.fadeStart) g.fadeEnd = g.fadeStart + 1;
     // task 4: 贴边隐藏 + its three sub-settings
-    g.hideEdge = GetInt(sec, L"hideEdge", 0) != 0;
+    g.hideMode = GetInt(sec, L"hideMode", -1);
+    if (g.hideMode < 0 || g.hideMode > 2) {
+        // a profile from before 隐藏方案 只 has the boolean switch
+        g.hideMode = GetInt(sec, L"hideEdge", 0) != 0 ? 1 : 0;
+    }
+    g.hideEdge = (g.hideMode == 1);
     g.wakeExt = GetInt(sec, L"wakeExt", 4);
     if (g.wakeExt < 0) g.wakeExt = 0;
     if (g.wakeExt > 10) g.wakeExt = 10;
@@ -5567,6 +5584,11 @@ static void GroupDragEnd(Group& g) {
 #define kHideFlashMs 2000    // two flashes of one second
 #define kHideFlashOnMs 550   // lit part of each 1 s cycle
 
+// The group whose settings page is open (0 = none): its wake band is painted faintly while the
+// page is up, so adjusting its width/colour can be seen at all (user, 2026-11-23: "实时设置看不见").
+// Set by SettingsPaint().
+static int g_previewGroupId = 0;
+
 static RECT HideMonitorRect(HWND h) {
     MONITORINFO mi{sizeof(mi)};
     HMONITOR mon = MonitorFromWindow(h ? h : g_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -5916,15 +5938,22 @@ static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
     }
 
     // ---- the band ----
-    bool flashing = !g.wakeVisible && now < g.hideFlashUntil &&
-                    ((now - g.hideFlashStart) % 1000u) < kHideFlashOnMs;
+    // Two things can light it up: a flash (a fixed 2 s, two 1 s cycles - armed by an auto-hide in
+    // 不可见 mode, and by every 唤出区域宽度 / 色调 edit in *both* modes so the change can be seen),
+    // and 常显 while the group is hidden. While its settings page is open the band is also painted
+    // faintly, even in 不可见 mode, because otherwise "调完 x / 调颜色" has no visible effect at all
+    // (user, 2026-11-23).
+    bool flashOn = g.hideFlashUntil && now < g.hideFlashUntil &&
+                   ((now - g.hideFlashStart) % 1000u) < kHideFlashOnMs;
+    bool previewing = (g_setWnd != nullptr && g_previewGroupId == g.id);
     int alpha = 0;
-    if (g.hideSlide <= 0.02f) {
-        if (g.wakeVisible) alpha = 40;          // 常显: painted, no flashing
-        else if (flashing) alpha = 96;
-        else alpha = 1;                         // invisible, still hittable
-    } else if (flashing) {
-        alpha = 96;                             // "调完 x" while it is on screen
+    if (g.hideSlide <= 0.02f) {                 // hidden: the band lives
+        if (g.wakeVisible) alpha = flashOn ? 96 : 40;
+        else alpha = flashOn ? 96 : 1;
+    } else if (flashOn) {                       // awake, just adjusted: show what changed
+        alpha = 96;
+    } else if (previewing) {
+        alpha = 40;
     }
     HideWakeEnsure(g);
     HideWakePresent(g, alpha);
@@ -6287,7 +6316,8 @@ static int CompanionAlphaTarget(Companion& c, POINT p) {
 // while 贴边隐藏 is on - that feature replaces the distance fade entirely, and the two together
 // felt wrong (user, 2026-11-22).
 static int GroupFadeTarget(Group& g, POINT p) {
-    if (g.hideEdge) return 255;
+    if (g.hideMode == 1 || g.hideMode == 2) return 255;   // 贴边隐藏 takes over / 从不
+    if (OurUiBusy()) return 255;                          // walking to a menu item is not leaving
     if (g.shown) return 255;
     int fs = g.fadeStart >= 0 ? g.fadeStart : g_cfg.fadeStart;
     int fe = g.fadeEnd > fs ? g.fadeEnd : (fs + 1);
@@ -11418,6 +11448,8 @@ enum Component { kCompFloat = 1, kCompBar = 2, kCompGlass = 4 };
 
 static const wchar_t* const kBgNames[] = {L"透过背后", L"图片", L"纯色"};
 static const wchar_t* const kColorNames[] = {L"黑", L"白"};
+// 隐藏方案 (group page): the three ways a group may get out of the way.
+static const wchar_t* const kHideModeNames[] = {L"距离", L"贴边", L"从不"};
 
 // 色调 presets: soft macaron colours plus one dark, so a fresh profile can still look like the
 // old dark glass (user picked "预设七八种马卡龙淡色 + 一个调色盘", 2026-11-21).
@@ -11510,12 +11542,12 @@ static const SRow kRowsGroup[] = {
     {L"radius", L"圆角", 0, 64, 0, 0, nullptr, nullptr},
     {L"blockResize", L"屏蔽缩放", 0, 1, 0, 1, L"屏蔽", L"允许"},
     {L"blockMove", L"屏蔽位移", 0, 1, 0, 1, L"屏蔽", L"允许"},
-    // H2b: the fade distances are the group's (measured to the group's own rectangle).
+    // H2b: the fade distances are the group's (measured to the group's own rectangle). They only
+    // exist in 隐藏方案=鼠标距离 (see SettingsRowVisible).
+    // task 4: 隐藏方案 decides the whole tail of this page: distance fade, 贴边隐藏, or never.
+    {L"hideMode", L"隐藏方案", 0, 2, 0, 0, nullptr, nullptr, kHideModeNames, 3},
     {L"fadeStart", L"完全显示距离", 0, 200, 0, 0, nullptr, nullptr},
     {L"fadeEnd", L"完全透明距离", 20, 400, 0, 0, nullptr, nullptr},
-    // task 4: 贴边隐藏 + its three sub-rows (they only show while the switch is on, see
-    // SettingsRowVisible).
-    {L"hideEdge", L"贴边隐藏", 0, 1, 0, 1, L"开", L"关"},
     // The band's colour: a group has no tone of its own, so it gets one here (falls back to the
     // strip's tone until it is set).
     {L"hue", L"唤醒区域色调", 0, 0, 0, 0, nullptr, nullptr},
@@ -11558,7 +11590,8 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     if (!wcscmp(key, L"fadeStart")) return g.fadeStart;
     if (!wcscmp(key, L"fadeEnd")) return g.fadeEnd;
     // task 4: 贴边隐藏
-    if (!wcscmp(key, L"hideEdge")) return g.hideEdge ? 1 : 0;
+    if (!wcscmp(key, L"hideMode")) return g.hideMode;
+    if (!wcscmp(key, L"hideEdge")) return g.hideMode == 1 ? 1 : 0;
     if (!wcscmp(key, L"wakeExt")) return g.wakeExt;
     if (!wcscmp(key, L"wakeVisible")) return g.wakeVisible ? 1 : 0;
     if (!wcscmp(key, L"wakeMode")) return g.wakeModeHover ? 1 : 0;
@@ -11781,13 +11814,17 @@ static void PageSet(int i, int v) {
                 GroupSectionName(g->id, sec, 32);
                 swprintf_s(buf, L"%d", isStart ? g->fadeStart : g->fadeEnd);
                 WritePrivateProfileStringW(sec, row.key, buf, g_iniPath.c_str());
-            } else if (!wcscmp(row.key, L"hideEdge")) {
-                // task 4: the switch itself. On = glue to the nearest edge right now; the page
-                // gains the three sub-rows, so the panel has to be re-laid out (see the
-                // SettingsPaint() at the end of RowFromX / the height in SettingsBuildPages).
-                GroupSaveFlag(*g, L"hideEdge", v != 0);
-                HideEdgeSet(*g, v != 0);
-                // the page gains/loses the three sub-rows: SettingsPaint() fixes the height too
+            } else if (!wcscmp(row.key, L"hideMode")) {
+                // 隐藏方案: 0 距离淡出 / 1 贴边隐藏 / 2 从不. Leaving 贴边隐藏 slides the group back
+                // in; entering it glues it to the nearest edge right away.
+                g->hideMode = v;
+                wchar_t sec[32];
+                GroupSectionName(g->id, sec, 32);
+                swprintf_s(buf, L"%d", v);
+                WritePrivateProfileStringW(sec, L"hideMode", buf, g_iniPath.c_str());
+                HideEdgeSet(*g, v == 1);
+                GroupRecompute(*g);
+                GroupRepaint(*g);
             } else if (!wcscmp(row.key, L"wakeExt")) {
                 g->wakeExt = v;
                 wchar_t sec[32];
@@ -12077,6 +12114,10 @@ static void SetHueFor(int which, DWORD rgb) {
         swprintf_s(b, L"#%06X", rgb);
         WritePrivateProfileStringW(sec, L"hue", b, g_iniPath.c_str());
         DLog(L"hue: %s = #%06X (group wake band)", sec, rgb);
+        // flash it so the new colour is actually visible - the band is not painted while the
+        // group is awake, so without this "调颜色" looks like it does nothing (user, 2026-11-23)
+        g->hideFlashStart = GetTickCount();
+        g->hideFlashUntil = g->hideFlashStart + kHideFlashMs;
         return;      // the band re-reads it on the next tick, see HideWakePresent
     }
     g_hue[which & 1] = rgb;
@@ -12131,13 +12172,17 @@ static void SettingsPickNewImage() {    const SPage* p = ActivePage();
 static bool SettingsRowVisible(const SPage* p, int i) {
     if (!p || i < 0 || i >= p->count) return false;
     const wchar_t* key = p->rows[i].key;
-    // task 4: on a *group* page the wake-band rows (and the band's colour) only exist while the
-    // group switch is on. The float pages keep their own 色调 row unconditionally.
-    if (p->kind == kPageGroupKind &&
-        (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") || !wcscmp(key, L"wakeMode") ||
-         !wcscmp(key, L"hue"))) {
+    // 隐藏方案 decides which of the two sub-groups of rows exist (user, 2026-11-23):
+    //   鼠标距离 -> only the two fade distances
+    //   贴边隐藏 -> only the wake-band rows (its colour included)
+    //   从不     -> nothing else
+    if (p->kind == kPageGroupKind) {
         Group* g = GroupById(p->groupId);
-        return g && g->hideEdge;
+        const int mode = g ? g->hideMode : 0;
+        if (!wcscmp(key, L"fadeStart") || !wcscmp(key, L"fadeEnd")) return mode == 0;
+        if (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") ||
+            !wcscmp(key, L"wakeMode") || !wcscmp(key, L"hue"))
+            return mode == 1;
     }
     if (wcscmp(key, L"image")) return true;
     int bg = 0;
@@ -12190,6 +12235,9 @@ static void SettingsPaint() {
                 if (SettingsRowVisible(pv, i)) want++;
         if (want < 1) want = 1;
         if (g_setH != kRowsTop + want * kRowH + 56) SettingsResizeForPage();
+        // task 4: while a group's page is open its wake band is painted faintly, so the width and
+        // colour rows have a visible effect at all (see HideEdgeTick).
+        g_previewGroupId = (pv && pv->kind == kPageGroupKind) ? pv->groupId : 0;
     }
     if (!g_setBits) {
         BITMAPINFO bi{};
@@ -12313,7 +12361,7 @@ static void SettingsPaint() {
                 bool on = (g_rowVal[i] == k);
                 RECT pr{tx + k * seg, ty - 14, tx + (k + 1) * seg - 6, ty + 16};
                 FillRound(g_setDC, pr, 8, dis ? 0x14FFFFFF : (on ? 0xFF4C9AFF : 0x30FFFFFF));
-                DrawTextAlpha(tx + k * seg + 14, ty - 22, seg - 26, 44, row.choices[k], 19,
+                DrawTextAlpha(tx + k * seg + 10, ty - 22, seg - 16, 44, row.choices[k], 19,
                               dis ? 0x50FFFFFF : (on ? 0xFFFFFFFF : 0xC0FFFFFF));
             }
         } else if (row.isToggle) {

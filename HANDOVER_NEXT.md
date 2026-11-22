@@ -1727,5 +1727,28 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
    顺带抓到 `HideWakePresent()` 里 **R/B 通道写反了**（`hue` 是 0x00RRGGBB，而 DIB 字是 0xAARRGGBB）——
    绿色看不出来，红色会渲染成蓝色。用"绿/蓝两个色调对比色带"的像素测试才揪出来（`t_hidehue.ps1` 3/3）。
 
+#### 3.32.2 第三批（2026-11-23 00:0x）：隐藏方案三选一 + 调参时的反馈 + 淡出也躲开菜单
+
+1. **`隐藏方案` 取代了布尔开关**（用户："组设置那块有点长了"）：新键 `[group] hideMode`
+   **0 = 距离 / 1 = 贴边 / 2 = 从不**（`kHideModeNames = {L"距离", L"贴边", L"从不"}`；原本想写"鼠标距离/贴边隐藏"，
+   但选择行的段宽只有 ~54 px，4 个汉字会被截成"鼠标…"，所以缩成两个字的标签）。
+   - 行可见性：`fadeStart/fadeEnd` 只在 mode 0；`hue/wakeExt/wakeVisible/wakeMode` 只在 mode 1；mode 2 都不显示。
+     组页高度实测：**990 → mode1 874 / mode0 758 / mode2 642**（`dev/t_hidemode.ps1`）。
+   - 兼容：没有 `hideMode` 时按老的 `hideEdge` 布尔推（`GroupLoad`）；用户的 ini 已经迁成 `hideMode=1` 并删掉 `hideEdge`。
+   - `GroupFadeTarget()`：mode 1（贴边接管）和 mode 2（从不）都直接返回 255。
+2. **调参现在看得见了**（用户："调节唤醒区域属性时根本没有闪烁 / 颜色一直不变"）。根因：色带**只在组隐藏时**渲染，
+   调参时组是醒着的 ⇒ 什么都不显示。现在：
+   - 组页开着时，该组的色带**以 alpha 40 常显**（预览用；`g_previewGroupId` 由 `SettingsPaint()` 设）。
+   - 改 `wakeExt` **或** 改色调 → 触发 2 s 闪烁（alpha 96），**两种可见性模式下都会闪**
+     （老逻辑 `!wakeVisible` 才闪，所以"常显"模式下改 x 完全没反应）。
+   - 实测：`t_hidemode.ps1` 段 2 在组页打开时色带 dG=+22（绿色调可见），修复前整条带子根本不上屏。
+3. **距离淡出也要在右键菜单打开期间停住**（用户："根据距离淡入淡出时也需要前往右键菜单时不淡出"）。
+   抽了个 `OurUiBusy()`（`g_popupOpen || g_menuOpen || g_setWnd || g_gridVisible || 缩略图可见`），
+   三处共用：`UpdateAlpha` 的早退、`GroupFadeTarget`（返回 255）、`HideEdgeTick` 的 `interacting`。
+   实测 `t_fadehold.ps1` 2/2：平时淡出正常（16 行 `fade:`），右键菜单开着时 **0 行**。
+   ⚠️ 探针注意：`WM_CANCELMODE` 关闭 `TrackPopupMenu` **不可靠**（`t_menuhold` 那次关了，`t_fadehold` 那次菜单一直开着），
+   所以验收脚本不要依赖"从外部把菜单关掉"，要么分段重启、要么用设置面板当"我们的 UI"。
+4. **色带的默认色调**：组的 `hue` 为空 = 跟随条的色调（`HueFor(2)`），我把自己测试写进去的 `[group] hue` 清掉了。
+
 
 

@@ -64,9 +64,10 @@ enum SPageKind {
     kPageFloatDock = 1,   // 浮窗页 of the strip: [dock]
     kPageBar = 2,         // 图标条页: [dock], only things a float window cannot use
     kPageFloatTray = 3,   // 浮窗页 of a companion: [traybar]
+    kPageDeco = 5,        // 贴纸窗口 (task 5): [deco]
     kPageGroupKind = 4,   // 组 N
 };
-enum SObj { kObjStrip = 0, kObjCompanion = 1, kObjGroup = 2 };
+enum SObj { kObjStrip = 0, kObjCompanion = 1, kObjGroup = 2, kObjDeco = 3 };
 static void ShowSettings(int hintObj = kObjStrip, int hintId = 0);   // per-window pages (G3/H2)
 static void* g_paintBits;
 static HWND g_setWnd;
@@ -996,7 +997,9 @@ static void AddPin(const std::wstring& path) {
 static void DLog(const wchar_t* fmt, ...);
 static void ThumbHide();
 static HWND g_thumbWnd;
-
+// task 5: the decoration window's handle, kept here so the "is this one of ours" test (used by the
+// backdrop capture) can see it without pulling the whole Deco struct this far up.
+static HWND g_decoHwnd = nullptr;
 // Logs what kind of token/process context we are in: a restricted token (e.g.
 // launched from a sandboxed host) silently blocks CreateProcess/ShellExecute.
 static void LogProcessContext() {
@@ -3450,6 +3453,7 @@ static void RefreshItems() {
 
 static void RefreshCompanionAfterReload();   // needs the paint helpers, defined further down
 static void ReloadGroupsFromIni();            // ditto: the group code is further down
+static void DecoCreate();                     // task 5: the desktop sticker (defined further down)
 
 static void Reload() {
     LoadConfig();
@@ -3462,6 +3466,7 @@ static void Reload() {
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
     RefreshCompanionAfterReload();
+    DecoCreate();            // task 5: [deco] edits apply on reload
 }
 
 // ---------------------------------------------------------------- flyout anchors
@@ -3886,7 +3891,8 @@ static HWND ZBandInsert() { return g_zMode == 1 ? HWND_NOTOPMOST : HWND_TOPMOST;
 static bool ZIsBottomBand(HWND h) {
     if (!h) return false;
     if (h == g_trayBar.hwnd && g_trayBar.band == 1) return true;
-    return false;      // the decorative windows of task 5 plug in here as well
+    if (h == g_decoHwnd) return true;      // task 5: the desktop sticker always lives at the bottom
+    return false;
 }
 
 // The hWndInsertAfter for one of our windows: capture yield first (task 1), then its band.
@@ -10217,13 +10223,14 @@ static int NonBlackPct(const uint32_t* px, int w, int h) {
 static bool IsOurWindow(HWND h) {
     if (!h) return false;
     return h == g_hwnd || h == g_trayBar.hwnd || h == g_gridWnd || h == g_thumbWnd ||
-           h == g_setWnd || h == g_menuHwnd || h == g_bgWnd;
+           h == g_setWnd || h == g_menuHwnd || h == g_bgWnd || h == g_decoHwnd;
 }
 
 // The list a capture has to keep out of the picture, most important first.
 static int CollectOurWindows(HWND* out, int max) {
     int n = 0;
-    HWND list[] = {g_hwnd, g_trayBar.hwnd, g_gridWnd, g_thumbWnd, g_setWnd, g_menuHwnd, g_bgWnd};
+    HWND list[] = {g_hwnd, g_trayBar.hwnd, g_gridWnd, g_thumbWnd, g_setWnd, g_menuHwnd, g_bgWnd,
+                   g_decoHwnd};
     for (HWND h : list) {
         if (h && IsWindowVisible(h) && n < max) out[n++] = h;
     }
@@ -11465,6 +11472,9 @@ static int g_setPickAction = 0;        // 1 = from the gallery, 2 = add a new pi
 static bool g_pickBusy = false;        // a dialog is up right now
 
 static void SettingsPaint();
+// task 5: the sticker's own style plumbing (defined with the Deco module further down)
+static void DecoApplyStyle();
+static void DecoInvalidateImage();
 static void SettingsPickFromGallery();
 static void SettingsPickNewImage();
 static void SetHueFor(int which, DWORD rgb);
@@ -11555,6 +11565,17 @@ static const SRow kRowsFloatTray[] = {
     // task 5: this window's z band. 最上 = the topmost band (what it always was); 最下 = the bottom
     // of the normal band, i.e. above the desktop and below every app window.
     {L"band", L"Z 序", 0, 1, 0, 0, nullptr, nullptr, kBandNames, 2},
+};
+
+// ---- 贴纸窗口页 (task 5): [deco] ---------------------------------------------------------
+// A decoration has a background, a glass layer and a corner radius - nothing else (no icons, no
+// cells). Values are written explicitly by DecoCreate(), so the rows never show "inherit".
+static const SRow kRowsDeco[] = {
+    {L"bgMode", L"背景", 0, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
+    {L"glassLayer", L"玻璃层", 0, 1, 0, 1, L"开", L"关"},
+    {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
+    {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
+    {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
 };
 
 // ---- 图标条页 (component: kCompBar; things a float window has no use for) ----------------
@@ -11787,6 +11808,11 @@ static void PageSet(int i, int v) {
         case kPageFloatDock:
         case kPageBar:
             ApplyStripStyle();
+            break;
+        case kPageDeco:
+            // task 5: re-read the sticker's style and repaint it in place
+            if (!wcscmp(row.key, L"bgMode") || !wcscmp(row.key, L"image")) DecoInvalidateImage();
+            DecoApplyStyle();
             break;
         case kPageFloatTray: {
             int v2 = v;
@@ -12764,6 +12790,357 @@ static void CompanionGlassTick(DWORD now) {
 //   a plain companion  → 浮窗 + 组 N
 //   a group (menu)     → 组 N only (a group is not a window: no background, no glass)
 // `hintObj` is what the menu asked for, `hintId` the group id when it is a group.
+// ---------------------------------------------------------------- 贴纸窗口 (task 5)
+//
+// A decoration for the desktop: background (透过背后 / 图片 / 纯色) + the glass layer + rounded
+// corners, and nothing else - no icons, no tray cells. Everything it draws comes from the pipeline
+// the strip and the float window already use (BakeGlass, EnsureFloatMask, PaintImageBg,
+// FillRound/SetPixelPremul), so the only difference to a float window is its z band: it lives at
+// the bottom of the normal band, above the desktop and below every app window (see ZBandFor).
+// It never fades and never hides - it is part of the desktop picture, and it stays visible in
+// screenshots on purpose (user, 2026-11-23).
+struct Deco {
+    HWND hwnd = nullptr;
+    RECT rc{0, 0, 0, 0};
+    HDC dc = nullptr;
+    HBITMAP bmp = nullptr;
+    void* bits = nullptr;
+    int dibW = 0, dibH = 0;
+    GlassTarget glass;
+    DWORD glassSig = 0;
+    DWORD glassMovedAt = 0;
+    DWORD glassWideUntil = 0;
+    bool dragging = false;
+    POINT dragGrab{};
+    // style: -1 = inherit [dock], exactly like a float window's overrides
+    int bgMode = -1, glassLayer = -1, radiusOv = -1, solidOpacity = -1;
+    bool enabled = false;
+};
+static Deco g_deco;
+static ImageBg g_imgDeco;
+static LRESULT CALLBACK DecoProc(HWND h, UINT m, WPARAM w, LPARAM l);
+
+static int DecoBgMode() { return g_deco.bgMode >= 0 ? g_deco.bgMode : g_cfg.bgMode; }
+static int DecoGlassLayer() { return g_deco.glassLayer >= 0 ? g_deco.glassLayer : g_cfg.glassLayer; }
+static int DecoRadiusPx(int w, int h) {
+    return RadiusForPercent(w, h, g_deco.radiusOv >= 0 ? g_deco.radiusOv : g_cfg.radius);
+}
+static int DecoSolidAlpha() {
+    int a = g_deco.solidOpacity >= 0 ? g_deco.solidOpacity : g_cfg.solidOpacity;
+    if (a < 3) a = 3;
+    if (a > 255) a = 255;
+    return a;
+}
+// Same split the float window uses: "bakes a screen backdrop" is only true for 透过背后 + 玻璃层.
+// A picture background has no backdrop to bake - it is drawn from the picture and still takes the
+// glass tint (see DecoPaint's picture branch).
+static bool DecoUsesGlass() { return DecoBgMode() == 0 && DecoGlassLayer() == 1; }
+
+static void DecoEnsureDib(int w, int h) {
+    Deco& d = g_deco;
+    if (w <= 0 || h <= 0) return;
+    if (d.bits && d.dibW == w && d.dibH == h) return;
+    if (d.bmp) {
+        if (d.dc && DummyBitmap()) SelectObject(d.dc, g_dummyBmp);
+        DeleteObject(d.bmp);
+        d.bmp = nullptr;
+        d.bits = nullptr;
+    }
+    if (!d.dc) d.dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    d.bmp = CreateDIBSection(d.dc, &bi, DIB_RGB_COLORS, &d.bits, nullptr, 0);
+    if (d.bmp) SelectObject(d.dc, d.bmp);
+    d.dibW = w;
+    d.dibH = h;
+}
+
+static void DecoPresent() {
+    Deco& d = g_deco;
+    if (!d.hwnd || !d.bits) return;
+    POINT src{0, 0};
+    SIZE size{d.dibW, d.dibH};
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    POINT dst{d.rc.left, d.rc.top};
+    UpdateLayeredWindow(d.hwnd, nullptr, &dst, &size, d.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+// No per-corner snap state: a sticker does not hug screen edges.
+static const float kDecoNoSnap[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+static void DecoPaint() {
+    Deco& d = g_deco;
+    if (!d.hwnd || !d.bits) return;
+    const int w = d.dibW, h = d.dibH;
+    void* savePaint = g_paintBits;
+    int savePW = g_paintW, savePH = g_paintH;
+    g_paintBits = d.bits;
+    g_paintW = w;
+    g_paintH = h;
+    memset(d.bits, 0, (size_t)w * h * 4);
+    RECT all{0, 0, w, h};
+    // 4 % white keeps the whole sticker opaque to the mouse without being visible (the same trick
+    // the float window uses); a solid background paints its own colour instead.
+    DWORD bgFill = 0x0AFFFFFF;
+    if (DecoBgMode() == 2) bgFill = ((DWORD)DecoSolidAlpha() << 24) | (g_hue[0] & 0x00FFFFFFu);
+    const int radius = DecoRadiusPx(w, h);
+    FillRound(d.dc, all, radius, bgFill);
+    if (DecoUsesGlass()) {
+        const GlassTarget& gt = d.glass;
+        if (gt.valid && gt.bits && gt.w >= w && gt.h >= h) {
+            int ox = d.rc.left - gt.origin.x, oy = d.rc.top - gt.origin.y;
+            if (ox < 0) ox = 0;
+            if (oy < 0) oy = 0;
+            if (ox > gt.w - w) ox = gt.w - w;
+            if (oy > gt.h - h) oy = gt.h - h;
+            EnsureFloatMask(w, h, radius, kDecoNoSnap);
+            for (int y = 0; y < h; y++) {
+                const uint32_t* src = (const uint32_t*)gt.bits + (size_t)(oy + y) * gt.w + ox;
+                const BYTE* cov = &g_fltCov[(size_t)y * w];
+                const BYTE* rim = &g_fltRim[(size_t)y * w];
+                for (int x = 0; x < w; x++) {
+                    DWORD a = cov[x];
+                    if (!a) continue;
+                    SetPixelPremul(x, y, (a << 24) | (src[x] & 0x00FFFFFF));
+                    DWORD ea = rim[x];
+                    if (ea) SetPixelPremul(x, y, (ea << 24) | 0x00FFFFFF);
+                }
+            }
+        }
+    } else if (DecoBgMode() == 1) {
+        if (EnsureImage(g_imgDeco, ImagePathFor(L"deco"), w, h, 0)) {
+            EnsureFloatMask(w, h, radius, kDecoNoSnap);
+            PaintImageBg(g_imgDeco, w, h, g_fltCov.data(), g_fltRim.data(), g_hue[0], g_glass[0]);
+        }
+    }
+    g_paintBits = savePaint;
+    g_paintW = savePW;
+    g_paintH = savePH;
+}
+
+static void DecoLoad();
+
+static void DecoInvalidateImage() { g_imgDeco.sig = 0; }
+
+// Re-read the sticker's style and repaint it where it stands (used by its settings page).
+static void DecoApplyStyle() {
+    DecoLoad();
+    Deco& d = g_deco;
+    if (!d.hwnd) return;
+    DecoEnsureDib(d.rc.right - d.rc.left, d.rc.bottom - d.rc.top);
+    DecoPaint();
+    DecoPresent();
+    d.glass.dirty = true;
+}
+
+static bool DecoEnabledIni() { return GetInt(L"deco", L"enabled", 0) != 0; }
+
+static void DecoLoad() {
+    Deco& d = g_deco;
+    d.enabled = GetInt(L"deco", L"enabled", 0) != 0;
+    d.bgMode = GetInt(L"deco", L"bgMode", -1);
+    d.glassLayer = GetInt(L"deco", L"glassLayer", -1);
+    d.radiusOv = GetInt(L"deco", L"radius", -1);
+    d.solidOpacity = GetInt(L"deco", L"solidOpacity", -1);
+    int w = GetInt(L"deco", L"w", 420), h = GetInt(L"deco", L"h", 260);
+    if (w < 40) w = 40;
+    if (h < 40) h = 40;
+    RECT mon = HideMonitorRect(nullptr);
+    int x = GetInt(L"deco", L"x", mon.left + (mon.right - mon.left - w) / 2);
+    int y = GetInt(L"deco", L"y", mon.top + (mon.bottom - mon.top - h) / 2);
+    d.rc = RECT{x, y, x + w, y + h};
+}
+
+static void DecoCreate() {
+    Deco& d = g_deco;
+    DecoLoad();
+    // Seed the section with the values actually in force, so the sticker's page shows the truth
+    // instead of three "inherit" rows (it has no parent window to inherit from in the panel).
+    if (g_iniPath.size()) {
+        wchar_t b[32];
+        struct Seed {
+            const wchar_t* key;
+            int value;
+        } seeds[] = {{L"bgMode", DecoBgMode()},
+                     {L"glassLayer", DecoGlassLayer()},
+                     {L"radius", d.radiusOv >= 0 ? d.radiusOv : g_cfg.radius},
+                     {L"solidOpacity", DecoSolidAlpha()}};
+        for (const Seed& s : seeds) {
+            if (GetInt(L"deco", s.key, -1) >= 0) continue;
+            swprintf_s(b, L"%d", s.value);
+            WritePrivateProfileStringW(L"deco", s.key, b, g_iniPath.c_str());
+        }
+    }
+    if (!d.enabled) {
+        if (d.hwnd) {
+            DestroyWindow(d.hwnd);
+            d.hwnd = nullptr;
+            g_decoHwnd = nullptr;
+        }
+        return;
+    }
+    if (!d.hwnd) {
+        static bool registered = false;
+        if (!registered) {
+            registered = true;
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.lpfnWndProc = DecoProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.lpszClassName = L"DockDecoWindow";
+            RegisterClassExW(&wc);
+        }
+        // never WS_EX_TOPMOST: it belongs at the bottom, see ZBandFor()
+        d.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                 L"DockDecoWindow", L"dock deco", WS_POPUP, d.rc.left, d.rc.top,
+                                 d.rc.right - d.rc.left, d.rc.bottom - d.rc.top, nullptr, nullptr,
+                                 GetModuleHandleW(nullptr), nullptr);
+        if (!d.hwnd) {
+            DLog(L"deco: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
+            return;
+        }
+        g_decoHwnd = d.hwnd;
+    }
+    const int w = d.rc.right - d.rc.left, h = d.rc.bottom - d.rc.top;
+    DecoEnsureDib(w, h);
+    DecoPaint();
+    DecoPresent();
+    SetWindowPos(d.hwnd, ZBandFor(d.hwnd), d.rc.left, d.rc.top, w, h, SWP_NOACTIVATE);
+    ShowWindow(d.hwnd, SW_SHOWNOACTIVATE);
+    d.glass.dirty = true;
+    DLog(L"deco: created %ld,%ld %dx%d (bg=%d glass=%d)", (long)d.rc.left, (long)d.rc.top, w, h,
+         DecoBgMode(), (int)DecoUsesGlass());
+}
+
+// The glass backdrop: same cadence/budget logic as CompanionGlassTick, for one window.
+static void DecoTick(DWORD now) {
+    Deco& d = g_deco;
+    if (!d.enabled || !d.hwnd || !IsWindowVisible(d.hwnd)) return;
+    if (!DecoUsesGlass()) {
+        d.glass.dirty = false;
+        return;
+    }
+    const DWORD sig = g_hue[0] ^ ((DWORD)g_glass[0].tintStrength << 8) ^
+                      ((DWORD)g_glass[0].glassOpacity << 16) ^ ((DWORD)g_glass[0].blurRadius << 20);
+    if (sig != d.glassSig) {
+        d.glassSig = sig;
+        d.glass.dirty = true;
+    }
+    if (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0) return;
+    const bool justMoved = d.glassMovedAt != 0;
+    if (justMoved && d.glass.valid && d.bits) {
+        const int w = d.rc.right - d.rc.left, h = d.rc.bottom - d.rc.top;
+        const int ox = d.rc.left - d.glass.origin.x, oy = d.rc.top - d.glass.origin.y;
+        if (ox < 0 || oy < 0 || ox + w > d.glass.w || oy + h > d.glass.h) {
+            d.glass.dirty = true;          // left the padded bake: one capture is required
+        } else {
+            DecoPaint();
+            DecoPresent();
+        }
+    }
+    d.glassMovedAt = 0;
+    if (g_cfg.captureHz <= 0) return;
+    UINT capMs = (UINT)(1000 / g_cfg.captureHz);
+    if (capMs < 1) capMs = 1;
+    DWORD floorMs = d.glass.lastMs * 2;
+    if (floorMs > capMs) capMs = floorMs;
+    if (!d.glass.dirty && now - d.glass.at < capMs) return;
+    if (d.dragging) {
+        d.glass.dirty = true;
+        return;
+    }
+    const bool movingSoon = justMoved || (d.glassWideUntil && (LONG)(d.glassWideUntil - now) > 0);
+    const int M = movingSoon ? kCompanionMargin : (g_glass[0].blurRadius > 0 ? 64 : 0);
+    if (movingSoon) d.glassWideUntil = now + 3000;
+    if (movingSoon && g_cfg.dragNoCapture) {
+        d.glass.dirty = false;
+        return;
+    }
+    const BakeResult r = BakeGlass(d.glass, d.rc, M, L"deco", g_hue[0], g_glass[0], movingSoon);
+    if (r == kBakeNoBudget) return;
+    if (r == kBakeFailed) {
+        d.glass.at = now;
+        d.glass.dirty = false;
+        return;
+    }
+    if (d.bits) {
+        DecoPaint();
+        DecoPresent();
+    }
+}
+
+static void DecoProcMenu(HWND h) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 10, L"设置…");
+    AppendMenuW(menu, MF_STRING, 11, L"重载配置");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 12, L"隐藏贴纸");
+    POINT sp;
+    GetCursorPos(&sp);
+    g_popupOpen = true;
+    const int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, h,
+                                        nullptr);
+    g_popupOpen = false;
+    DestroyMenu(menu);
+    if (cmd == 10) {
+        ShowSettings(kObjDeco, 0);
+    } else if (cmd == 11) {
+        Reload();
+    } else if (cmd == 12) {
+        WritePrivateProfileStringW(L"deco", L"enabled", L"0", g_iniPath.c_str());
+        DecoCreate();
+    }
+}
+
+static LRESULT CALLBACK DecoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    Deco& d = g_deco;
+    switch (m) {
+        case WM_LBUTTONDOWN: {
+            if (d.dragging) return 0;
+            POINT p{};
+            GetCursorPos(&p);
+            d.dragging = true;
+            d.dragGrab.x = p.x - d.rc.left;
+            d.dragGrab.y = p.y - d.rc.top;
+            SetCapture(h);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (!d.dragging) return 0;
+            POINT p{};
+            GetCursorPos(&p);
+            const int w2 = d.rc.right - d.rc.left, h2 = d.rc.bottom - d.rc.top;
+            const int x = p.x - d.dragGrab.x, y = p.y - d.dragGrab.y;
+            if (x == d.rc.left && y == d.rc.top) return 0;
+            d.rc = RECT{x, y, x + w2, y + h2};
+            d.glassMovedAt = GetTickCount();
+            SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            if (!d.dragging) return 0;
+            d.dragging = false;
+            ReleaseCapture();
+            wchar_t b[32];
+            swprintf_s(b, L"%d", d.rc.left);
+            WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
+            swprintf_s(b, L"%d", d.rc.top);
+            WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
+            DLog(L"deco: moved to %ld,%ld", (long)d.rc.left, (long)d.rc.top);
+            return 0;
+        }
+        case WM_RBUTTONUP:
+            DecoProcMenu(h);
+            return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     g_pages.clear();
     *hintPage = -1;
@@ -12784,6 +13161,11 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
         wantKind = kPageGroupKind;
         wantGroup = hintId;
         addGroupPage(hintId);
+    } else if (hintObj == kObjDeco) {
+        // task 5: the sticker has exactly one page - background, glass layer, radius
+        wantKind = kPageDeco;
+        g_pages.push_back(SPage{L"贴纸", L"deco", kRowsDeco,
+                                (int)(sizeof(kRowsDeco) / sizeof(kRowsDeco[0])), kPageDeco, 0});
     } else if (hintObj == kObjCompanion) {
         // A companion owns "float" always, "glass" only when its own background is the glass
         // layer, and the 组 page of the group it belongs to (groupId 0 = in no group).
@@ -13536,6 +13918,7 @@ static void RenderTick() {
         // H3: every *other* glass window bakes here, after the strip has had its turn in this
         // tick (the strip is the interactive one, so it gets first claim on the budget).
         CompanionGlassTick(now);
+        DecoTick(now);           // task 5: the desktop sticker's own backdrop
 
         // live evidence for tuning: how many ticks / repaints actually happened
         {
@@ -14022,6 +14405,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuW(menu, MF_STRING, 7, L"重新扫描托盘");
             AppendMenuW(menu, MF_STRING, 4, L"打开日志");
             AppendMenuW(menu, MF_STRING, 5, L"设置…");
+            // task 5: create / drop the desktop sticker (own window, own [deco] section)
+            AppendMenuW(menu, MF_STRING | (DecoEnabledIni() ? MF_CHECKED : 0), 8, L"贴纸窗口");
             AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), 6,
                         L"开机自启");
             AppendMenuW(menu, MF_STRING, 3, L"退出");
@@ -14044,6 +14429,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (cmd == 4) ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr,
                                             SW_SHOWNORMAL);
             else if (cmd == 5) ShowSettings(kObjStrip, 0);
+            else if (cmd == 8) {
+                // task 5: toggle the desktop sticker
+                const bool on = !DecoEnabledIni();
+                WritePrivateProfileStringW(L"deco", L"enabled", on ? L"1" : L"0", g_iniPath.c_str());
+                DecoCreate();
+                DLog(L"deco: enabled -> %d", (int)on);
+            }
             else if (cmd == 6) {
                 bool on = SetAutoStart(!AutoStartEnabled());
                 DLog(L"autostart -> %d (ok=%d)", (int)AutoStartEnabled(), (int)on);
@@ -14273,6 +14665,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     Present();
     CompanionCreate();       // the tray bar sits next to the strip, hidden until hovered
+    DecoCreate();            // task 5: the desktop sticker (only when [deco] enabled=1)
     StartFrameClock();      // drive the frames from a high-resolution timer
     TrayBridgeEnsureExists();   // own the block so nobody can hand us a bad DACL
     StartTrayWarmup(1500);   // fill the tray bridge table once the shell is up

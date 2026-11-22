@@ -3827,6 +3827,10 @@ struct Companion {
     int snapOv = -1;
     float snapAnim[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float snapTarget[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // task 5: which z band this window lives in. 0 = the topmost band (everything the dock has
+    // always been), 1 = the bottom of the normal band - a decoration that sits above the desktop
+    // and below every app window (measured 2026-11-23: HWND_BOTTOM lands directly above Progman).
+    int band = 0;
     // H3: this window's own padded backdrop bake (same pipeline as the strip, own pixels).
     // It is only filled when the window actually draws the glass layer - see CompanionGlassTick.
     GlassTarget glass;
@@ -3875,6 +3879,21 @@ static void QuickSettingsBeginPlacement(const RECT& button);
 // whole dock back over the selection box).
 static int g_zMode = 0;
 static HWND ZBandInsert() { return g_zMode == 1 ? HWND_NOTOPMOST : HWND_TOPMOST; }
+
+// task 5: does this window of ours belong in the *bottom* band? (A window there is placed with
+// HWND_BOTTOM: above the desktop, below every normal app window - measured 2026-11-23:
+// z#444 against Progman's z#446, with the app windows around z#47.)
+static bool ZIsBottomBand(HWND h) {
+    if (!h) return false;
+    if (h == g_trayBar.hwnd && g_trayBar.band == 1) return true;
+    return false;      // the decorative windows of task 5 plug in here as well
+}
+
+// The hWndInsertAfter for one of our windows: capture yield first (task 1), then its band.
+static HWND ZBandFor(HWND h) {
+    if (g_zMode == 1) return HWND_NOTOPMOST;
+    return ZIsBottomBand(h) ? HWND_BOTTOM : HWND_TOPMOST;
+}
 
 static int CompanionIconPx(const Companion& c) {
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
@@ -4553,6 +4572,8 @@ static void CompanionLoad(Companion& c) {
     c.gapOv = GetInt(c.iniSection, L"gap", -1);
     c.radiusOv = GetInt(c.iniSection, L"radius", -1);
     c.snapOv = GetInt(c.iniSection, L"snap", -1);
+    // task 5: which z band this window lives in (0 = topmost, 1 = just above the desktop)
+    c.band = GetInt(c.iniSection, L"band", 0) != 0 ? 1 : 0;
 
     int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
     if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
@@ -6407,10 +6428,10 @@ static void CompanionVisibilityTick(DWORD now) {
                                  // present, so assert it once with the current value
             if (g.id == 1) {
                 if (g_trayBar.hwnd)
-                    SetWindowPos(g_trayBar.hwnd, ZBandInsert(), 0, 0, 0, 0,
+                    SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 if (g_hwnd)
-                    SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
+                    SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
@@ -6460,9 +6481,9 @@ static void CompanionVisibilityTick(DWORD now) {
         // z-order: group frame < companion < strip. The frame asserts itself just above, so
         // both of these are needed on every show (dropping them lets the frame paint over the
         // companion).
-        SetWindowPos(c.hwnd, ZBandInsert(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_hwnd)
-            SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
+            SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         // The visible pixels are (re)built here and not while hidden: see the note in
         // TrayStateRefresh. ~1 ms, once per appearance.
@@ -6872,8 +6893,10 @@ static void CompanionCreate() {
     }
 
     int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
-    c.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                                 WS_EX_LAYERED,
+    // task 5: a bottom-band window is created without WS_EX_TOPMOST (it must never be topmost)
+    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+    if (c.band != 1) exStyle |= WS_EX_TOPMOST;
+    c.hwnd = CreateWindowExW(exStyle,
                              L"DockTrayBarWindow", L"dock tray bar", WS_POPUP, c.rc.left,
                              c.rc.top, w, h, nullptr, nullptr, GetModuleHandleW(nullptr),
                              nullptr);
@@ -6892,6 +6915,12 @@ static void CompanionCreate() {
     CompanionPresent(c);
     CompanionTooltipEnsure(c);
     ShowWindow(c.hwnd, SW_HIDE);
+    // task 5: drop it to the bottom of the normal band right away (it was created without
+    // WS_EX_TOPMOST, but a new window starts near the top of its band)
+    if (c.band == 1)
+        SetWindowPos(c.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    DLog(L"tray bar: band=%d", c.band);
     RECT r = c.rc;
     AnchorPublish(kAnchorQuickSettings, &r, 8);
     DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
@@ -10049,7 +10078,7 @@ static void SyncBackground() {
         return;
     }
 
-    SetWindowPos(g_bgWnd, ZBandInsert(), wr.left, wr.top, wr.right - wr.left,
+    SetWindowPos(g_bgWnd, ZBandFor(g_bgWnd), wr.left, wr.top, wr.right - wr.left,
                  wr.bottom - wr.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     // rounded corners
     HRGN rgn = CreateRoundRectRgn(0, 0, wr.right - wr.left + 1, wr.bottom - wr.top + 1,
@@ -10066,7 +10095,7 @@ static void SyncBackground() {
     // ZBandInsert: this runs on *every* alpha change, so a fade-in (the pointer coming back to
     // the dock) used to re-promote the strip in the middle of a snip - that is the "something of
     // ours re-asserted topmost during a capture" the QQ flow produced (2026-11-22 01:20:17).
-    SetWindowPos(g_hwnd, ZBandInsert(), 0, 0, 0, 0,
+    SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
@@ -10314,6 +10343,7 @@ static BOOL CALLBACK ZCollectProc(HWND h, LPARAM lp) {
     auto* c = reinterpret_cast<ZScanCtx*>(lp);
     int i = c->idx++;
     if (!IsWindowVisible(h) || !ZIsOurs(h)) return TRUE;
+    if (ZIsBottomBand(h)) return TRUE;      // task 5: never needs "keeping on top"
     RECT r{};
     if (!GetWindowRect(h, &r)) return TRUE;
     if (c->nMine < 8) {
@@ -10381,6 +10411,9 @@ static void ZScan(ZScanOut* out) {
     ZScanCtx c;
     EnumWindows(ZCollectProc, (LPARAM)&c);
     for (int k = 0; k < c.nMine; k++) {
+        // A bottom-band window (task 5) has no topmost flag on purpose, and app windows are
+        // always above it - neither is a fault to repair.
+        if (ZIsBottomBand(c.mine[k].h)) continue;
         if (!c.mine[k].topmost) {
             c.out.demoted = true;
             c.out.demotedHwnd = c.mine[k].h;
@@ -10406,7 +10439,7 @@ static void ZAssertOurs(bool twice) {
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         if (g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
-            SetWindowPos(g_trayBar.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (g_hwnd && IsWindowVisible(g_hwnd))
             SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -11450,6 +11483,8 @@ static const wchar_t* const kBgNames[] = {L"透过背后", L"图片", L"纯色"}
 static const wchar_t* const kColorNames[] = {L"黑", L"白"};
 // 隐藏方案 (group page): the three ways a group may get out of the way.
 static const wchar_t* const kHideModeNames[] = {L"距离", L"贴边", L"从不"};
+// task 5: which z band a window lives in (0 = the topmost band, 1 = just above the desktop)
+static const wchar_t* const kBandNames[] = {L"最上", L"最下"};
 
 // 色调 presets: soft macaron colours plus one dark, so a fresh profile can still look like the
 // old dark glass (user picked "预设七八种马卡龙淡色 + 一个调色盘", 2026-11-21).
@@ -11517,6 +11552,9 @@ static const SRow kRowsFloatTray[] = {
     {L"snap", L"贴边方角（覆盖）", -1, 1, 0, 1, L"开", L"关", nullptr, 0, 1},
     {L"pad", L"内边距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
     {L"gap", L"格子间距（覆盖）", -1, 40, 0, 0, nullptr, nullptr},
+    // task 5: this window's z band. 最上 = the topmost band (what it always was); 最下 = the bottom
+    // of the normal band, i.e. above the desktop and below every app window.
+    {L"band", L"Z 序", 0, 1, 0, 0, nullptr, nullptr, kBandNames, 2},
 };
 
 // ---- 图标条页 (component: kCompBar; things a float window has no use for) ----------------
@@ -11610,6 +11648,7 @@ static int TrayKeyVal(const wchar_t* key) {
     if (!wcscmp(key, L"solidOpacity")) return GetInt(L"traybar", L"solidOpacity", -1);
     // task 3: the companion's own snap switch
     if (!wcscmp(key, L"snap")) return GetInt(L"traybar", L"snap", -1);
+    if (!wcscmp(key, L"band")) return g_trayBar.band;      // task 5
     return -1;
 }
 
@@ -11756,6 +11795,14 @@ static void PageSet(int i, int v) {
             else if (!wcscmp(row.key, L"gap")) g_trayBar.gapOv = v2;
             // task 3: the snap override; the animation starts on the next tick (120 ms)
             else if (!wcscmp(row.key, L"snap")) g_trayBar.snapOv = v2;
+            // task 5: move the window into the other band right away
+            else if (!wcscmp(row.key, L"band")) {
+                g_trayBar.band = v2;
+                if (g_trayBar.hwnd)
+                    SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                DLog(L"tray bar: band -> %d (0 = topmost, 1 = just above the desktop)", v2);
+            }
             if (g_trayBar.hwnd) {
                 TrayRepaint(g_trayBar);
                 CompanionPresent(g_trayBar);
@@ -12082,6 +12129,11 @@ static void RefreshCompanionAfterReload() {
     // itself is NOT re-read here - a reload must never yank the window somewhere else.
     g_trayBar.snapOv = GetInt(g_trayBar.iniSection, L"snap", -1);
     CompanionSnapUpdate(g_trayBar);
+    // task 5: the z band is an ini key too - apply it on reload (no restart needed)
+    g_trayBar.band = GetInt(g_trayBar.iniSection, L"band", 0) != 0 ? 1 : 0;
+    if (g_trayBar.hwnd)
+        SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (!g_trayBar.hwnd) return;
     TrayRepaint(g_trayBar);
     CompanionPresent(g_trayBar);

@@ -1797,5 +1797,75 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
    实测 400x240 → 470x280 且 ini 同步。
    验收：`dev/t_deco2.ps1` 3/3（两条页面 + 缩放 + 落盘）。
 
+### 3.34 ⚠️ 任务 5 重做（**下一次会话从这里开始**，2026-11-23 00:52 交接）
+
+**为什么重做**：用户 2026-11-23 00:52 一口气报了 7 条问题，并且指出根因——**我把它写成了平行的
+`Deco` 实现**，而设计意图是：
+
+> **贴纸 = 三图标浮窗（companion）完全一样的东西**，只有两点不同：**永远不隐藏（常显）**、**不显示图标/托盘格子**。
+> 而且**可以新建多个**（有上限）。
+
+我的上一版（`struct Deco` + 单实例 + 共用 `[deco]` 小节）满足不了，于是出现了下面这些自相矛盾的地方。
+**不要再在 `Deco` 上打补丁**，按下面的方案重做。
+
+**§3.34.1 用户报的 7 条，逐条对应**
+
+| # | 现象 | 真因 |
+|---|---|---|
+| 1 | 角落很难触发尺寸调整 | 我自己写的 `DecoEdgeAt` 用 8 px 边带 / 18 px 角；companion 用的是 `EdgeAt()` 的 **24 px 角方块 + `cz`**，手感好得多。直接复用 `EdgeAt()` / `CompanionProc` 那套 |
+| 2 | 图片背景下"模糊半径"无效 | 先确认**浮窗/条在同样情况下是否有效**（`PaintImageBg` + 图片合成里 blurRadius 的用法，见 §3.27/§3.28）。若它们有效 ⇒ 照它们的做法搬；若同样无效 ⇒ 那是既有行为，只是看起来像 bug，别在贴纸里"修"出两套 |
+| 3 | 不能选自己的色调 | `g_hue[]` 只有 2 个（条/浮窗），贴纸借用了条的 `g_hue[0]`。要变成"每个实例一份色调"（`HueFor()/SetHueFor()` 现在用 `which` 0/1/2 索引，需要扩成按实例索引） |
+| 4 | 背景与条绑定、改不了 | 贴纸的 `[deco]` 样式键 `-1 = 继承 [dock]`（我图省事），而用户要的是**独立**。应改成绝对值的行集（`kRowsFloatDock` 那种），section 用各自的 `[sticker.N]` |
+| 5 | 要能新建多个（有上限防卡死） | `g_deco` 是单实例。必须把 companion 变成**多实例**（见方案） |
+| 6 | 右键「隐藏贴纸」改成「删除」 | 它本来就贴桌面，没有"隐藏"的需求。菜单应为 设置… / 删除（销毁窗口 + 从 ini 删掉该实例） |
+| 7 | 新建之初要纯色不透明，否则找不到 | 现在默认继承条的"图片"背景，新建后可能和壁纸混在一起。创建时写死 `bgMode=2`（纯色）+ `solidOpacity≈235` + 一个级联位置 |
+
+**§3.34.2 推荐方案（复用 > 新建）**
+
+1. **companion 多实例化**（这是重做的核心，别绕过）：
+   - 现在是 `static Companion g_trayBar;` 单例，而 `Companion` 结构本身已经带自己的 `rc/dib/glass/alpha/style`，
+     天然就是"一个窗口"。改成 `Companion g_companions[kMaxCompanions]` + `int g_companionCount`
+     （或者 `std::vector<std::unique_ptr<Companion>>`）。
+   - 每个实例加：`int id`、`wchar_t section[32]`（托盘那个仍是 `[traybar]`，贴纸是 `[sticker.N]`）、
+     `bool deco`（贴纸 = true）。`iniSection` 现在是 `const wchar_t*`，换成实例自己的 buffer。
+   - **必须逐个改掉的单例硬编码**（grep `g_trayBar` 的地方，约 40 处）：`CompanionTick`、`CompanionGlassTick`、
+     `CompanionVisibilityTick`、`CompanionFollowTo`、`CompanionCreate/Save/Load/SetRect/EnsureDib/Tooltip*`、
+     `TrayCells`/`TrayRepaint`（`if (c.deco) 跳过三个格子和 hover`）、`TrayStateRefresh`（deco 不需要）、
+     `IsOurWindow`/`CollectOurWindows`、`GroupMembers`（见 §3.34.3）、`SettingsBuildPages`/`TrayKeyVal`/
+     `PageSet`（都按实例取 section）、`AnchorPublish`（deco 不需要锚点）。
+2. **z 带**：已完成的 `ZBandFor()`/`ZIsBottomBand()` 直接用 —— 贴纸实例恒为 bottom（现在是靠 `g_decoHwnd` 判的，
+   多实例后改成 `c.deco`）。`[traybar] band` 那一行已经能用（浮窗页「Z 序」），贴纸实例固定 band=1。
+3. **样式页**：贴纸实例的页签 = `浮窗`（用 **`kRowsFloatDock`**，绝对值，不继承条）+ `玻璃`（`kRowsGlassDeco` 那套，
+   但玻璃参数要按实例索引：`g_glass[]` 从固定 3 个改成 `std::vector<GlassCfg>` 或者按实例 id 索引）。
+   `hue` 行已经在 `kRowsFloatDock` 里 ⇒ 只要 `HueFor(which)` 支持"按实例"，3 号问题自动解决。
+4. **创建/删除**：条右键菜单加「新建贴纸」（上限 `kMaxStickers = 8`，到了就不加并 DLog 一行）；
+   贴纸右键菜单 `设置… / 删除`。删除 = `DestroyWindow` + 从 ini 删 section + 从数组里移除 + 重排 id
+   （**注意**：重排 id 会让 ini 的 `[sticker.N]` 错位，建议**不重排**，删除后留空位，新建时找第一个空 id）。
+5. **常显**：贴纸实例不参与距离淡出、不参与贴边隐藏（`hideMode` 强制 2 = 从不，或者干脆不给它那一页/那一行）。
+6. **创建默认**：`bgMode=2`、`solidOpacity=235`、`radius`=条的、size 420x260、位置从屏幕中心级联偏移，
+   `enabled=1`，**写完立刻画一帧**，保证"创建了就能看见"。
+
+**§3.34.3 需要用户拍板的两个点（重做前问一句）**
+- 贴纸**要不要能加入组**？（"与三图标窗口一致"意味着能；但组开了贴边隐藏就会把它滑出屏幕，和"常显"冲突。
+  建议：贴纸可以入组（跟随组拖动/缩放），但组滑出隐藏时**跳过贴纸**。）
+- 贴纸**要不要参与吸附（贴边方角）**？（同"一致"逻辑 ⇒ 要；实现上就是把 `c.snapAnim/snapTarget` 也用起来，
+  代码已经是逐窗口的，应该免费。）
+
+**§3.34.4 上一版留下什么、删什么**
+- **保留**：`ZBandFor`/`ZIsBottomBand`/`[traybar] band` + 浮窗页「Z 序」行、看门狗对 bottom 带的豁免、
+  `dev/t_band.ps1`、HWND_BOTTOM 的实测结论（见 §3.33）、`dev/t_deco.ps1`/`t_deco2.ps1`（改写成多实例版本）。
+- **建议删除/替换**：`struct Deco` / `g_deco` / `g_decoHwnd` / `Deco*()` 一整套、`kRowsDeco` / `kRowsGlassDeco` /
+  `kPageDeco` / `kObjDeco`、`[deco]` 小节。它们和多实例 companion 方案重复且互相矛盾。
+- 当前状态：`[deco] enabled=0`（已关掉，桌面恢复原样），代码编译通过但**属于未完成的原型**，
+  条右键菜单里那个「贴纸窗口」开关也一起去掉。
+
+**§3.34.5 复核清单（做完贴纸要能过）**
+1. 条右键 → 新建贴纸 → 屏幕上出现一块**纯色不透明**的窗口，右键有 `设置… / 删除`。
+2. 设置里改背景/图片/圆角/纯色不透明度/玻璃参数/色调 → **只影响这一块**，条和三图标窗不变。
+3. 拖四个角、四条边都能缩放（手感与三图标窗一致），松手位置尺寸落盘。
+4. 新建到上限（8）时拒绝并提示；删除一块后能再建。
+5. 重启后所有贴纸都回来（各自的 `[sticker.N]`），且**常显**（不淡出、不隐藏）。
+6. 贴纸永远在所有应用窗口之下、桌面之上（`dev/t_band.ps1` 的判据可复用）。
+
 
 

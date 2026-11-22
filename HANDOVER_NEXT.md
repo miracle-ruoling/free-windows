@@ -1750,5 +1750,39 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
    所以验收脚本不要依赖"从外部把菜单关掉"，要么分段重启、要么用设置面板当"我们的 UI"。
 4. **色带的默认色调**：组的 `hue` 为空 = 跟随条的色调（`HueFor(2)`），我把自己测试写进去的 `[group] hue` 清掉了。
 
+### 3.33 任务 5 落地（2026-11-23 00:1x–00:3x）：z 带属性 + 桌面"贴纸"窗口
+
+**先量的事**（`dev/_bottomprobe.ps1`，已删）：`SetWindowPos(h, HWND_BOTTOM)` 之后窗口落在 **z#446**，而
+`Progman`（桌面）在 **z#447** —— 也就是"**紧贴桌面上方、所有应用窗口之下**"，正是要的位置，
+**不需要** `SetParent(Progman/WorkerW)` 那套"塞进桌面"的技巧。（顺带：`SetParent` 到 shell 窗口那个试验**看不见**，
+别走那条路。）
+
+**第一步：把 z 带变成属性（"小修以适配两种逻辑"）**
+- `ZBandFor(HWND)`：先看 task 1 的截屏让位（`g_zMode==1` → `HWND_NOTOPMOST`），再看窗口自己的带
+  （`ZIsBottomBand(h)` → `HWND_BOTTOM`，否则 `HWND_TOPMOST`）。原来那些 `ZBandInsert()`/`HWND_TOPMOST`
+  断言点全部改成"传自己的窗口"：组框显示、浮窗显示、条的背景层、task 1 的看门狗。
+- 带属性：`[traybar] band` 0/1，浮窗页多一行「Z 序：最上 / 最下」；`CompanionCreate` 对 band 1 **不加** `WS_EX_TOPMOST` 并在创建后 `HWND_BOTTOM`；reload 也会应用。
+- 看门狗 `ZScan`：bottom 带的窗口**不参与**"丢了 topmost / 有人压在上面"的判定（这两件事对它是设计如此）。
+
+**第二步：「贴纸」窗口 `DockDecoWindow`**（`dock.cpp` 的 "贴纸窗口 (task 5)" 段）
+- 内容只有背景三层（透过背后 / 图片 / 纯色）+ 玻璃层 + 圆角，**没有图标、没有托盘格子**；绘制全部复用
+  `BakeGlass`（自己的 `GlassTarget`，`[deco]` 用 `g_glass[0]`/`g_hue[0]`）、`EnsureFloatMask`、
+  `PaintImageBg`、`FillRound`/`SetPixelPremul`。
+- `[deco]` 小节：`enabled x y w h bgMode glassLayer radius solidOpacity`；样式键 `-1` = 继承 `[dock]`，
+  但 `DecoCreate()` 会**把生效值写回 ini**，所以它那一页永远不显示"继承"。
+- 交互：左键拖动（松手写回 `x/y`）、右键菜单（设置… / 重载配置 / 隐藏贴纸）；条自己的右键菜单多了「贴纸窗口」开关。
+- 设置页：`kObjDeco` + `kPageDeco` + `kRowsDeco`（背景 / 玻璃层 / 背景图片 / 圆角 / 纯色不透明度）。
+- 抓图：**故意允许出现在用户截图/录屏里**（它就是桌面的一部分）；但我们自己的玻璃抓图把它当"自己人"排除
+  （`IsOurWindow`/`CollectOurWindows` 加了 `g_decoHwnd`）。
+- ⚠️ 踩坑：`ZIsBottomBand()` 第一版忘了加贴纸 ⇒ `SetWindowPos(ZBandFor(...))` 把它**提成了 topmost**（z#16，
+  比条还高）。`dev/t_deco.ps1` 当场抓到（"not topmost" / "directly above the desktop" 两条一起红）。
+- 另一个语义修正：`DecoUsesGlass()` 必须和浮窗一致 —— 只有 **透过背后 + 玻璃层** 才烤底图；
+  图片背景是画图片再叠色调（第一版把图片背景也走了玻璃分支，贴纸会显示"背后的桌面"而不是图片）。
+
+**验收**：`dev/t_band.ps1` 5/5（浮窗切到 band 1 → z#437、紧贴 Progman z#438、无 topmost、条不受影响）、
+`dev/t_deco.ps1` 5/5（存在且几何对、非 topmost、紧贴 Progman、应用窗口仍能盖住它、关掉后窗口消失）；
+贴纸的像素用 `PrintWindow` 抓下来看过（`dev/deco_paint.png`：图片 + 圆角，正确）。
+**没有做的**：贴纸不参与组/吸附/贴边隐藏/淡入淡出（它是桌面装饰，永远可见），也不能放图标。
+
 
 

@@ -156,7 +156,8 @@ static DWORD g_focusGraceUntil = 0;     // ignore foreground churn right after o
 static HWND g_menuWatch;                // the app's menu window we are watching (menu code below)
 static DWORD g_menuItemPressAt = 0;     // when the user last pressed *on* the menu itself
 static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb,
-                          bool centered = false);
+                          bool centered = false, const wchar_t* face = nullptr, int tracking = 0,
+                          DWORD outline = 0);
 static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh,
                         int clipL = INT_MIN, int clipR = INT_MAX);
 
@@ -3886,6 +3887,7 @@ struct Companion {
     int itemHover = -1;           // hovered item index (the tray uses hoverCell instead)
     int itemPage = 0;             // first visible item when the grid does not fit
     int iconPxOv = -1;            // [float.N] iconSize, -1 = automatic
+    int clockStyle = 0;           // the clock tile: 0 = 极简 (big light time), 1 = 翻页卡片
     bool captionOn = true;        // draw the name under the icon (desktop-like)
     bool dropHot = false;         // a shell drag is over the window (drag & drop feedback)
     DWORD contentAt = 0;          // last content refresh (the clock ticks once a second)
@@ -4691,14 +4693,17 @@ static int FloatLayoutCells(const Companion& c, RECT* out, int max, int first) {
     const int n = cols * rows;
     const int w = c.rc.right - c.rc.left;
     // Centre the block on the items that are really there, not on the empty slots the window
-    // could hold (a 3-item window in a 5x2 grid must look centred, not top-left).
+    // could hold (a 3-item window in a 5x2 grid must look centred, not top-left). The *wrap* still
+    // uses the full column count, so the items stay on one line as long as they fit.
     const int visible = (int)c.items.size() - first;
+    int blockCols = cols, blockRows = rows;
     if (visible > 0) {
+        if (visible < blockCols) blockCols = visible;
         const int usedRows = (visible + cols - 1) / cols;
-        if (usedRows < rows) rows = usedRows;
+        if (usedRows < blockRows) blockRows = usedRows;
     }
-    const int gridW = cols * (icon + gap) - gap;
-    const int gridH = rows * (cellH + gap) - gap;
+    const int gridW = blockCols * (icon + gap) - gap;
+    const int gridH = blockRows * (cellH + gap) - gap;
     int x0 = (w - gridW) / 2;
     int y0 = (c.rc.bottom - c.rc.top - gridH) / 2;
     int count = 0;
@@ -4713,16 +4718,17 @@ static int FloatLayoutCells(const Companion& c, RECT* out, int max, int first) {
     return count;
 }
 
-// The name shown under the icon: the last path component, without a shortcut's ".lnk"
-// (user 2026-11-23: "图标下面注明去除 parent path 的路径名称").
+// The name shown under the icon: the last path component, without its extension - a shortcut is
+// "Clash Verge", not "Clash Verge.lnk", and an executable is "Code", not "Code.exe"
+// (user 2026-11-23: "图标下面注明去除 parent path 的路径名称" + "软件名就不要显示 .exe 后缀了").
 static std::wstring FloatItemLabelFor(const std::wstring& path) {
     std::wstring s = path;
     while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
     size_t slash = s.find_last_of(L"\\/");
     std::wstring leaf = (slash == std::wstring::npos) ? s : s.substr(slash + 1);
     if (leaf.size() > 4) {
-        std::wstring ext = Lower(leaf.substr(leaf.size() - 4));
-        if (ext == L".lnk") leaf = leaf.substr(0, leaf.size() - 4);
+        const std::wstring ext = Lower(leaf.substr(leaf.size() - 4));
+        if (ext == L".lnk" || ext == L".exe" || ext == L".url") leaf = leaf.substr(0, leaf.size() - 4);
     }
     if (leaf.empty()) leaf = s;
     return leaf;
@@ -4819,27 +4825,57 @@ static void FloatItemEnsureIcon(FloatItem& it, int px) {
     if (it.px.empty()) DLog(L"float: no icon for %s (%d px)", it.path.c_str(), px);
 }
 
-// Text colour for captions and the clock: dark on a light background, white on a dark one. The
-// effective background is the solid colour (what the user sees) - a picture or the glass layer is
-// treated as dark, which is what every wallpaper and the tinted glass look like here.
-static bool FloatLightBackground(const Companion& c) {
-    DWORD rgb = (c.hasHue ? c.hue : g_hueStrip) & 0x00FFFFFFu;
-    if (CompanionBgMode(c) != 2) return false;
-    const double lum = ((rgb >> 16) & 0xFF) * 0.2126 + ((rgb >> 8) & 0xFF) * 0.7152 +
-                       (rgb & 0xFF) * 0.0722;
-    return lum > 150.0;
+// How to colour text on this window's background:
+//   0 = dark text     (a light background)
+//   1 = white text    (a dark background)
+//   2 = white + ring  (unknown: a nearly transparent background - 透过背后 without glass - where we
+//                      cannot know what the wallpaper looks like; the ring is what keeps it legible)
+// The background is *measured* from the pixels that were just painted, not guessed from the ini:
+// a picture background was the case the old guess got wrong ("white text on a light photo").
+static int FloatTextMode(const Companion& c) {
+    const uint32_t* p = (const uint32_t*)c.bits;
+    if (!p || c.dibW <= 0 || c.dibH <= 0) {
+        return CompanionBgMode(c) == 2 ? 1 : 2;
+    }
+    const int step = 7;
+    double lum = 0;
+    long alpha = 0, count = 0;
+    for (int y = step / 2; y < c.dibH; y += step) {
+        for (int x = step / 2; x < c.dibW; x += step) {
+            const uint32_t v = p[(size_t)y * c.dibW + x];
+            const int a = (int)((v >> 24) & 0xFF);
+            alpha += a;
+            count++;
+            if (a < 32) continue;
+            // un-premultiply: the DIB holds premultiplied pixels
+            const double r = ((v >> 16) & 0xFF) * 255.0 / a;
+            const double g = ((v >> 8) & 0xFF) * 255.0 / a;
+            const double b = (v & 0xFF) * 255.0 / a;
+            lum += r * 0.2126 + g * 0.7152 + b * 0.0722;
+        }
+    }
+    if (!count) return 2;
+    const double avgA = (double)alpha / (double)count;
+    if (avgA < 60.0) return 2;                  // mostly see-through: the wallpaper decides
+    const double avgLum = lum / (double)count;
+    return avgLum > 150.0 ? 0 : 1;
 }
 
-static void FloatDrawCaption(int x, int y, int w, int h, const std::wstring& text, int px,
-                             bool light) {
-    // A one-pixel offset copy underneath keeps the caption readable on any background.
-    if (light) {
-        DrawTextAlpha(x + 1, y + 1, w, h, text, px, 0x50FFFFFF, true);
-        DrawTextAlpha(x, y, w, h, text, px, 0xE0000000, true);
-    } else {
-        DrawTextAlpha(x + 1, y + 1, w, h, text, px, 0x60000000, true);
-        DrawTextAlpha(x, y, w, h, text, px, 0xE8FFFFFF, true);
-    }
+static DWORD FloatTextColor(int mode, DWORD alpha) {
+    // Near-black / near-white rather than pure: full black on a coloured background reads harsh,
+    // and every modern widget does the same (user: "字体很丑" about the pure-white halo version).
+    if (mode == 0) return (alpha << 24) | 0x001A1C22u;
+    return (alpha << 24) | 0x00F7F8FAu;
+}
+
+// One caption / one line of a clock. No second offset copy any more: that is what made the text
+// look "cut out of a white background" (user, 2026-11-23). The ring replaces it, and only where the
+// background is unknown.
+static void FloatDrawText(int x, int y, int w, int h, const std::wstring& text, int px, int mode,
+                          const wchar_t* face = nullptr, int tracking = 0, DWORD alpha = 0xE8,
+                          DWORD ringAlpha = 0x80) {
+    const DWORD outline = (mode == 2) ? ((ringAlpha << 24) | 0x00000000u) : 0;
+    DrawTextAlpha(x, y, w, h, text, px, FloatTextColor(mode, alpha), true, face, tracking, outline);
 }
 
 // `timeLine` / `dateLine` (not "small": rpcndr.h #defines `small` as `char`).
@@ -4856,16 +4892,99 @@ static void FloatClockStrings(std::wstring* timeLine, std::wstring* dateLine) {
     *dateLine = b;
 }
 
+// Clock style 1: two split-flap cards (HH and MM) with a seam, the way the popular desktop clock
+// widgets look (Fliqlo and the flip-clock skins on GitHub). Static - no fold animation yet; the
+// point here is the shape, not the motion.
+static void FloatDrawClockFlip(Companion& c, const RECT& area, int mode) {
+    std::wstring timeLine, dateLine;
+    FloatClockStrings(&timeLine, &dateLine);
+    const int aw = area.right - area.left, ah = area.bottom - area.top;
+    if (aw <= 0 || ah <= 0 || timeLine.size() < 5) return;
+    const int shortSide = aw < ah ? aw : ah;
+    const int cardH = (int)(shortSide * 0.50);
+    const int cardW = (int)(cardH * 0.80);
+    const int colonW = cardW / 2;
+    const int totalW = cardW * 2 + colonW;
+    const int x0 = area.left + (aw - totalW) / 2;
+    const int datePx = FloatCaptionFontPx(shortSide * 46 / 100);
+    const int blockH = cardH + 8 + datePx + 4;
+    const int y0 = area.top + (ah - blockH) / 2;
+    const int radius = cardH / 10;
+    // The cards are dark whatever the window is: that contrast IS the look (a light card on a light
+    // background just washes out).
+    const DWORD cardFill = 0xF215171Cu;
+    const DWORD seamCol = 0x7A000000u;
+    const DWORD seamLight = 0x1AFFFFFFu;
+    const DWORD digitRgb = 0xF7F8FAu;
+    const int digitPx = (int)(cardH * 0.78);
+    for (int k = 0; k < 2; k++) {
+        const int cx = x0 + k * (cardW + colonW);
+        RECT card{cx, y0, cx + cardW, y0 + cardH};
+        FillRound(c.dc, card, radius, cardFill);
+        // the split: a soft highlight just above and a dark gap across the middle
+        FillRound(c.dc, RECT{card.left + 2, card.top + cardH / 2 - 3, card.right - 2,
+                             card.top + cardH / 2 - 1},
+                  radius / 2, seamLight);
+        FillRound(c.dc, RECT{card.left + 2, card.top + cardH / 2, card.right - 2,
+                             card.top + cardH / 2 + 2},
+                  radius / 2, seamCol);
+        std::wstring digits = (k == 0) ? timeLine.substr(0, 2) : timeLine.substr(3, 2);
+        DrawTextAlpha(card.left, card.top, cardW, cardH, digits, digitPx, digitRgb, true,
+                      L"Segoe UI Light", -digitPx / 18, 0);
+    }
+    // the colon: two dots in the gap, in the *window's* text colour (they sit on the background,
+    // not on a card, so white-on-a-light-background would vanish - seen on 2026-11-23)
+    const int dotR = (int)(cardH * 0.055);
+    const int dcx = x0 + cardW + colonW / 2;
+    for (int k = 0; k < 2; k++) {
+        const int dcy = y0 + cardH / 2 + (k == 0 ? -cardH / 5 : cardH / 5);
+        FillRound(c.dc, RECT{dcx - dotR, dcy - dotR, dcx + dotR, dcy + dotR}, dotR,
+                  FloatTextColor(mode, 0xF0));
+    }
+    FloatDrawText(area.left, y0 + cardH + 8, aw, datePx + 6, dateLine, datePx, mode, nullptr, 0,
+                  0xB0, 0x70);
+}
+
+// A clock, drawn the way a modern widget does it: a light, large time with slightly tightened
+// tracking, and a quiet date line under it. `area` is the part of the window it may use.
+static void FloatDrawClock(Companion& c, const RECT& area, int mode, bool big, int style) {
+    if (style == 1) {
+        FloatDrawClockFlip(c, area, mode);
+        return;
+    }
+    std::wstring timeLine, dateLine;
+    FloatClockStrings(&timeLine, &dateLine);
+    const int aw = area.right - area.left, ah = area.bottom - area.top;
+    if (aw <= 0 || ah <= 0) return;
+    const int shortSide = aw < ah ? aw : ah;
+    // 0.54 of the em is what Segoe UI's digits actually occupy (measured: asked 92 px -> 50 px of
+    // ink), so the em has to be this much larger than the height the time should *look* like.
+    int timePx = big ? (int)(shortSide * 0.62) : (int)(shortSide * 0.54);
+    if (timePx < 14) timePx = 14;
+    // The tracking is what makes a big time look *set* instead of loosely spaced.
+    const int tracking = -timePx / 18;
+    const int datePx = FloatCaptionFontPx(shortSide * (big ? 60 : 46) / 100);
+    // The box is exactly one em tall: tmHeight == the requested height, so this holds the whole line
+    // box with no slack and no clipping (a *bigger* box only changed where it sat, never the size).
+    const int timeBoxH = timePx;
+    const int blockH = timeBoxH + 4 + datePx + 6;
+    int y0 = area.top + (ah - blockH) / 2;
+    FloatDrawText(area.left, y0, aw, timeBoxH, timeLine, timePx, mode, L"Segoe UI Light",
+                  tracking, 0xF0, 0x90);
+    FloatDrawText(area.left, y0 + timeBoxH + 4, aw, datePx + 6, dateLine, datePx, mode, nullptr, 0,
+                  0xB0, 0x70);
+}
+
 // Paint the generic content (everything that is not the tray's three cells).
 static void FloatContentPaint(Companion& c) {
     const int w = c.dibW, h = c.dibH;
     if (w <= 0 || h <= 0) return;
-    const bool light = FloatLightBackground(c);
+    const int mode = FloatTextMode(c);
 
     if (c.items.empty()) {
         // Nothing inside yet: say what the window is for, very faintly (it is a drop target).
-        DrawTextAlpha(0, h / 2 - 12, w, 24, L"拖入文件或文件夹", 15,
-                      light ? 0x50000000 : 0x48FFFFFF, true);
+        FloatDrawText(0, h / 2 - 12, w, 24, L"拖入文件或文件夹", 15, mode, nullptr, 0,
+                      mode == 2 ? 0x60 : 0x50, 0x60);
         return;
     }
 
@@ -4874,22 +4993,15 @@ static void FloatContentPaint(Companion& c) {
         (c.items[0].kind == kItemClock || c.items[0].kind == kItemWeather)) {
         const FloatItem& it = c.items[0];
         if (it.kind == kItemClock) {
-            std::wstring timeLine, dateLine;
-            FloatClockStrings(&timeLine, &dateLine);
-            const int shortSide = w < h ? w : h;
-            int bigPx = shortSide * 42 / 100;
-            if (bigPx < 18) bigPx = 18;
-            FloatDrawCaption(0, h / 2 - bigPx * 3 / 4, w, bigPx + 8, timeLine, bigPx, light);
-            const int smallPx = FloatCaptionFontPx(shortSide * 60 / 100);
-            FloatDrawCaption(0, h / 2 + bigPx / 3, w, smallPx + 8, dateLine, smallPx, light);
+            FloatDrawClock(c, RECT{0, 0, w, h}, mode, true, c.clockStyle);
             return;
         }
         // Weather: the data source is not wired up yet (user 2026-11-23: "天气只留接口"), so the
         // tile says so instead of showing a made-up temperature.
         const int shortSide = w < h ? w : h;
         const int px = FloatCaptionFontPx(shortSide * 55 / 100) + 4;
-        FloatDrawCaption(0, h / 2 - px, w, px * 2, L"—°", px * 2, light);
-        FloatDrawCaption(0, h / 2 + px / 2, w, px + 6, L"天气（未接数据）", px, light);
+        FloatDrawText(0, h / 2 - px, w, px * 2, L"—°", px * 2, mode, L"Segoe UI Light", 0, 0xF0);
+        FloatDrawText(0, h / 2 + px / 2, w, px + 6, L"天气（未接数据）", px, mode, nullptr, 0, 0xB0);
         return;
     }
 
@@ -4897,8 +5009,6 @@ static void FloatContentPaint(Companion& c) {
     const int n = FloatLayoutCells(c, cells, 64, c.itemPage);
     const int icon = FloatIconPx(c);
     const int capPx = FloatCaptionFontPx(icon);
-    std::wstring clockTime, clockDate;
-    bool clockRead = false;
     for (int i = 0; i < n; i++) {
         FloatItem& it = c.items[c.itemPage + i];
         const RECT& cell = cells[i];
@@ -4907,28 +5017,21 @@ static void FloatContentPaint(Companion& c) {
             FillRound(c.dc, hl, 8, ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
         }
         if (it.kind == kItemClock) {
-            // A clock tile: the time on the icon's line, the date where the caption goes.
-            if (!clockRead) {
-                FloatClockStrings(&clockTime, &clockDate);
-                clockRead = true;
-            }
-            int tp = icon * 42 / 100;
-            if (tp < 12) tp = 12;
-            FloatDrawCaption(cell.left - 6, cell.top + (icon - tp) / 2, icon + 12, tp + 6,
-                             clockTime, tp, light);
-            FloatDrawCaption(cell.left - 6, cell.top + icon + 3, icon + 12, capPx + 6, clockDate,
-                             capPx, light);
+            // A clock tile inside the grid: time on the icon's line, date where the caption goes.
+            FloatDrawClock(c, RECT{cell.left - 6, cell.top, icon + 12, icon + capPx + 9}, mode,
+                           false, c.clockStyle);
             continue;
         }
         if (it.kind == kItemWeather) {
-            FloatDrawCaption(cell.left - 6, cell.top, icon + 12, icon, L"—°", capPx * 2, light);
+            FloatDrawText(cell.left - 6, cell.top, icon + 12, icon, L"—°", capPx * 2, mode,
+                          L"Segoe UI Light", 0, 0xF0);
             continue;
         }
         FloatItemEnsureIcon(it, icon);
         if (!it.px.empty()) BlendPremul(cell.left, cell.top, icon, icon, it.px.data());
         if (c.captionOn && !it.label.empty()) {
-            FloatDrawCaption(cell.left - 6, cell.top + icon + 3, icon + 12, capPx + 6, it.label,
-                             capPx, light);
+            FloatDrawText(cell.left - 6, cell.top + icon + 3, icon + 12, capPx + 6, it.label, capPx,
+                          mode, nullptr, 0, 0xE8, 0x80);
         }
     }
     // More items than cells: a page indicator in the bottom-right corner.
@@ -4937,7 +5040,7 @@ static void FloatContentPaint(Companion& c) {
         wchar_t b[32];
         swprintf_s(b, L"%d/%d", c.itemPage / (cols * rows) + 1,
                    ((int)c.items.size() + cols * rows - 1) / (cols * rows));
-        DrawTextAlpha(w - 60, h - 20, 54, 16, b, 12, light ? 0x80000000 : 0x80FFFFFF, true);
+        FloatDrawText(w - 60, h - 20, 54, 16, b, 12, mode, nullptr, 0, 0x80, 0x60);
     }
 }
 
@@ -5015,6 +5118,16 @@ static void CompanionSaveAllPositions() {
     }
 }
 
+// This window's own glass parameters. -1 = inherit the strip's (the tray's old semantics); a
+// [float.N] window writes absolute values. Called on load and again whenever its 玻璃 page writes
+// a row - without that second call the window keeps the values it was created with and "调玻璃
+// 参数没有任何变化" (reported 2026-11-23).
+static void CompanionLoadGlass(Companion& c) {
+    c.glassCfg.blurRadius = GetGlassInt(c.sec, L"blurRadius", g_glassStrip.blurRadius, 0, 64);
+    c.glassCfg.tintStrength = GetGlassInt(c.sec, L"tintStrength", g_glassStrip.tintStrength, 0, 255);
+    c.glassCfg.glassOpacity = GetGlassInt(c.sec, L"glassOpacity", g_glassStrip.glassOpacity, 0, 255);
+}
+
 // The ini is read with the same helpers the strip uses (GetInt), so the semantics match.
 // `c.sec` and `c.id`/`c.content` are set by the caller (the tray's section is [traybar]).
 static void CompanionLoad(Companion& c) {
@@ -5043,13 +5156,11 @@ static void CompanionLoad(Companion& c) {
         c.hasHue = !hs.empty();
         c.hue = c.hasHue ? (ParseHexRgb(hs, g_hueStrip) & 0x00FFFFFFu) : 0;
     }
-    // The window's own glass parameters. -1 = inherit the strip's (the tray's old semantics);
-    // a [float.N] window writes absolute values.
-    c.glassCfg.blurRadius = GetGlassInt(sec, L"blurRadius", g_glassStrip.blurRadius, 0, 64);
-    c.glassCfg.tintStrength = GetGlassInt(sec, L"tintStrength", g_glassStrip.tintStrength, 0, 255);
-    c.glassCfg.glassOpacity = GetGlassInt(sec, L"glassOpacity", g_glassStrip.glassOpacity, 0, 255);
+    // The window's own glass parameters (-1 = inherit the strip's, see CompanionLoadGlass).
+    CompanionLoadGlass(c);
     // The item grid (only for a generic window; the tray draws its three cells itself).
     c.iconPxOv = GetInt(sec, L"iconSize", -1);
+    c.clockStyle = GetInt(sec, L"clockStyle", 0) != 0 ? 1 : 0;
     c.captionOn = GetInt(sec, L"caption", 1) != 0;
     c.itemPage = 0;
     c.itemHover = -1;
@@ -5303,6 +5414,13 @@ static void TrayRepaint(Companion& c) {
         }
     } else {
         FloatContentPaint(c);
+        {
+            static int dump = 0;
+            if (c.id == 3 && dump < 1) {
+                dump++;
+                SaveBmp(L"float_content.bmp", (const uint32_t*)c.bits, c.dibW, c.dibH);
+            }
+        }
     }
 
     g_paintBits = savePaint;
@@ -12462,6 +12580,8 @@ static const wchar_t* const kBgNames[] = {L"透过背后", L"图片", L"纯色"}
 static const wchar_t* const kColorNames[] = {L"黑", L"白"};
 // 隐藏方案 (group page): the three ways a group may get out of the way.
 static const wchar_t* const kHideModeNames[] = {L"距离", L"贴边", L"从不"};
+// 时钟样式: the two looks the clock tile can have (see FloatDrawClock / FloatDrawClockFlip).
+static const wchar_t* const kClockStyleNames[] = {L"极简", L"翻页"};
 // task 5: which z band a window lives in (0 = the topmost band, 1 = just above the desktop)
 static const wchar_t* const kBandNames[] = {L"最上", L"最下"};
 
@@ -12564,6 +12684,8 @@ static const SRow kRowsFloatWin[] = {
     // The item grid: icon size + whether the name is drawn under each icon (desktop-like).
     {L"iconSize", L"条目图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
     {L"caption", L"图标下显示名称", 0, 1, 0, 1, L"显示", L"隐藏", nullptr, 0, 1},
+    // The clock tile inside this window: two looks (see FloatDrawClock).
+    {L"clockStyle", L"时钟样式", 0, 1, 0, 0, nullptr, nullptr, kClockStyleNames, 2},
     // This window's z band. 最下 = the desktop band (above the wallpaper, below every app window),
     // 最上 = the topmost band, i.e. always in front.
     {L"band", L"Z 序", 0, 1, 0, 0, nullptr, nullptr, kBandNames, 2},
@@ -12623,6 +12745,15 @@ static const int kRowH = 58;        // row pitch
 
 static int TintAlpha() { return (int)((g_cfg.tint >> 24) & 0xFF); }
 
+// What the open panel is showing, so its tab set can be rebuilt when the set changes (turning the
+// glass layer on/off adds or drops the 玻璃 page - user 2026-11-23: "开关玻璃层时不会动态出现玻璃
+// 标签，需要关闭再打开"). Set by ShowSettings.
+static int g_setHintObj = kObjStrip;
+static int g_setHintId = 0;
+static void SettingsBuildPages(int hintObj, int hintId, int* hintPage);   // defined further down
+static void SettingsRefreshPages();
+static void SettingsResizeForPage();
+
 static const SPage* ActivePage() {
     if (g_page < 0 || g_page >= (int)g_pages.size()) return nullptr;
     return &g_pages[g_page];
@@ -12649,12 +12780,24 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     return 0;
 }
 
-// The float window a page belongs to (kPageFloatTray pages carry its id in `objId`).
+// The float window a page belongs to. A 浮窗 page carries its id in `objId`; a 玻璃 page (which is
+// built per window too) is matched by its section name - `[dock]` has no companion and the strip
+// keeps its own cache, everything else is one of ours.
+// ⛔ Forgetting the kPageGlass case here is what made "调玻璃参数没有任何变化" come back: the glass
+// page updated nothing at all for the tray and every float window (only g_imgStrip was invalidated).
 static Companion* PageCompanion(const SPage* p) {
-    if (!p || p->kind != kPageFloatTray) return nullptr;
-    if (p->objId == 0) return &g_trayBar;
-    for (int i = 1; i < g_compCount; i++)
-        if (g_comps[i].id == p->objId) return &g_comps[i];
+    if (!p) return nullptr;
+    if (p->kind == kPageFloatTray) {
+        if (p->objId == 0) return &g_trayBar;
+        for (int i = 1; i < g_compCount; i++)
+            if (g_comps[i].id == p->objId) return &g_comps[i];
+        return nullptr;
+    }
+    if (p->kind == kPageGlass) {
+        if (!wcscmp(p->section.c_str(), L"dock")) return nullptr;   // the strip's own cache
+        for (int i = 0; i < g_compCount; i++)
+            if (!wcscmp(g_comps[i].sec, p->section.c_str())) return &g_comps[i];
+    }
     return nullptr;
 }
 
@@ -12671,6 +12814,7 @@ static int CompKeyVal(const Companion& c, const wchar_t* key) {
     if (!wcscmp(key, L"snap")) return c.snapOv;
     if (!wcscmp(key, L"band")) return c.band;
     if (!wcscmp(key, L"iconSize")) return c.iconPxOv >= 0 ? c.iconPxOv : 48;
+    if (!wcscmp(key, L"clockStyle")) return c.clockStyle;
     if (!wcscmp(key, L"caption")) return c.captionOn ? 1 : 0;
     return -1;
 }
@@ -12802,6 +12946,7 @@ static void PageSet(int i, int v) {
             // Per-window glass parameters: the picture composition bakes the blur in, and every
             // float window keeps its own bake, so the one whose page this is repaints here.
             if (Companion* c = PageCompanion(p)) {
+                CompanionLoadGlass(*c);          // the row just wrote the ini: re-read this window
                 c->img.sig = 0;
                 c->glass.dirty = true;
                 c->glassSig = 0;
@@ -12827,6 +12972,7 @@ static void PageSet(int i, int v) {
             // task 3: the snap override; the animation starts on the next tick (120 ms)
             else if (!wcscmp(row.key, L"snap")) c->snapOv = v;
             else if (!wcscmp(row.key, L"iconSize")) c->iconPxOv = v;
+            else if (!wcscmp(row.key, L"clockStyle")) c->clockStyle = v;
             else if (!wcscmp(row.key, L"caption")) c->captionOn = v != 0;
             // task 5: move the window into the other band right away
             else if (!wcscmp(row.key, L"band")) {
@@ -12935,19 +13081,40 @@ static void PageSet(int i, int v) {
         default:
             break;
     }
+    // A row that changes the *shape* of the object (background / glass layer) adds or drops a page:
+    // rebuild the tab set in place instead of asking the user to close the panel.
+    if (!wcscmp(row.key, L"bgMode") || !wcscmp(row.key, L"glassLayer")) SettingsRefreshPages();
     PageLoad();
 }
 
-// GDI text into a 32bpp DIB leaves alpha at 0; render white text on black and
-// rebuild the alpha from luminance, then composite with premultiplied maths.
-// `centered` is for the icon captions and the clock (the panel's own text is left-aligned).
+// GDI leaves alpha at 0 in a 32bpp DIB, so text is rendered white-on-black and the luminance is
+// used as a coverage map. Two things matter for how it looks:
+//   * ANTIALIASED_QUALITY (grayscale), never ClearType: subpixel rendering leaves coloured fringes
+//     on a transparent target, and they survive the alpha rebuild as a white halo - the "text looks
+//     cut out of a white background" the user reported on 2026-11-23;
+//   * no amplification. The old code multiplied coverage by 2.5 ("thin edges were vanishing"),
+//     which turned that halo into a visible outline. A small threshold does the opposite: it drops
+//     the near-invisible edge pixels instead of boosting them.
+// `face` selects the family (nullptr = the CJK-capable UI font), `tracking` shifts glyphs apart
+// (negative = tighter, which is what makes a big clock look set rather than spaced), and `outline`
+// draws a 1 px ring underneath for text that sits on an unknown background (a picture / the glass).
+//
+// ⛔ Third thing: GDI's own grayscale AA only produces one or two steps per edge, which at 70 px
+// looks hard and cheap ("字体很丑"). So the text is rendered at SUPER times the target size and
+// box-filtered down: that is the same supersampling a vector rasteriser would do, and it is what
+// makes the strokes read as smooth as DirectWrite without taking on DirectWrite.
 static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb,
-                          bool centered) {
-    if (!g_paintBits || w <= 0 || h <= 0) return;
+                          bool centered, const wchar_t* face, int tracking, DWORD outline) {
+    if (!g_paintBits || w <= 0 || h <= 0 || px <= 0) return;
+    // ⛔ Super sampling has a price: GDI rounds glyph advances per size, so a 2x render of small
+    // text comes out a pixel or two wider and an ellipsis appears where the text used to fit
+    // (the panel's 背景 pills did exactly that). Small text therefore keeps 1x and its old metrics.
+    const int SUPER = (px >= 60) ? 3 : ((px >= 20) ? 2 : 1);
+    const int sw = w * SUPER, sh = h * SUPER;
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biWidth = sw;
+    bi.bmiHeader.biHeight = -sh;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -12956,31 +13123,82 @@ static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, 
     HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HDC dc = CreateCompatibleDC(screen);
     HGDIOBJ old = SelectObject(dc, bmp);
-    memset(bits, 0, (size_t)w * h * 4);
+    if (!bits) {
+        SelectObject(dc, old);
+        if (bmp) DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    memset(bits, 0, (size_t)sw * sh * 4);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
-    HFONT font = CreateFontW(px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH, L"Microsoft YaHei UI");
+    HFONT font = CreateFontW(px * SUPER, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH, face ? face : L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(dc, font);
-    RECT tr{0, 0, w, h};
+    if (tracking) SetTextCharacterExtra(dc, tracking * SUPER);
+    RECT tr{0, 0, sw, sh};
     DrawTextW(dc, text.c_str(), -1, &tr,
-              DT_SINGLELINE | DT_VCENTER | (centered ? DT_CENTER : DT_LEFT) | DT_END_ELLIPSIS);
+              DT_SINGLELINE | DT_VCENTER | (centered ? DT_CENTER : DT_LEFT) | DT_NOPREFIX |
+                  DT_END_ELLIPSIS);
+    if (tracking) SetTextCharacterExtra(dc, 0);
     SelectObject(dc, oldFont);
     DeleteObject(font);
 
-    auto* src = (uint32_t*)bits;
-    DWORD r0 = rgb & 0xFF, g0 = (rgb >> 8) & 0xFF, b0 = (rgb >> 16) & 0xFF;
+    // coverage map: box-filter the supersampled mask down to one byte per target pixel. The 8/255
+    // floor removes the faintest edge pixels (they are what used to read as a halo).
+    static std::vector<BYTE> cov;
+    cov.assign((size_t)w * h, 0);
+    {
+        const auto* src = (const uint32_t*)bits;
+        const int total = SUPER * SUPER;
+        for (int yy = 0; yy < h; yy++) {
+            for (int xx = 0; xx < w; xx++) {
+                int sum = 0;
+                for (int sy = 0; sy < SUPER; sy++) {
+                    const uint32_t* row = src + (size_t)(yy * SUPER + sy) * sw + xx * SUPER;
+                    for (int sx = 0; sx < SUPER; sx++) sum += (int)((row[sx] >> 8) & 0xFF);
+                }
+                const int v = sum / total;
+                const int a = (v - 8) * 255 / 247;
+                cov[(size_t)yy * w + xx] = (BYTE)(a < 0 ? 0 : (a > 255 ? 255 : a));
+            }
+        }
+    }
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+
+    if (outline) {
+        // 1 px ring: every empty pixel that touches ink gets the outline colour, at 2/3 of its
+        // alpha. Cheap (8 compares per pixel) and it is what makes a caption readable on a photo.
+        // (`near` / `far` are Windows macros - not usable as names.)
+        const DWORD oa = ((outline >> 24) & 0xFF) * 2 / 3;
+        for (int yy = 0; yy < h; yy++) {
+            for (int xx = 0; xx < w; xx++) {
+                const size_t i = (size_t)yy * w + xx;
+                if (cov[i] > 24) continue;
+                bool touching = false;
+                for (int dy = -1; dy <= 1 && !touching; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        const int ny = yy + dy, nx = xx + dx;
+                        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                        if (cov[(size_t)ny * w + nx] > 48) { touching = true; break; }
+                    }
+                }
+                if (touching) SetPixelPremul(x + xx, y + yy, (oa << 24) | (outline & 0x00FFFFFFu));
+            }
+        }
+    }
+
+    const DWORD rgbOnly = rgb & 0x00FFFFFFu;
     for (int yy = 0; yy < h; yy++) {
         for (int xx = 0; xx < w; xx++) {
-            uint32_t v = src[(size_t)yy * w + xx];
-            int a = (v >> 16) & 0xFF;            // white text: any channel works
-            a = a * 5 / 2;                        // thin antialiased edges were vanishing
-            if (a > 255) a = 255;
-            if (a <= 6) continue;
-            SetPixelPremul(x + xx, y + yy,
-                           ((DWORD)a << 24) | ((DWORD)(r0 * a / 255) << 16) |
-                               ((DWORD)(g0 * a / 255) << 8) | (DWORD)(b0 * a / 255));
+            const DWORD a = cov[(size_t)yy * w + xx];
+            if (a <= 4) continue;
+            SetPixelPremul(x + xx, y + yy, (a << 24) | rgbOnly);
         }
     }
     SelectObject(dc, old);
@@ -13960,11 +14178,37 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     }
 }
 
+// Rebuild the tab set of the panel that is already open, keeping the page the user is on whenever
+// it still exists (switching 玻璃层 on must not throw them to another tab).
+static void SettingsRefreshPages() {
+    if (!g_setWnd) return;
+    const SPage* cur = ActivePage();
+    const int keepKind = cur ? cur->kind : -1;
+    const int keepObj = cur ? cur->objId : 0;
+    int hint = -1;
+    SettingsBuildPages(g_setHintObj, g_setHintId, &hint);
+    int pick = -1;
+    for (int i = 0; i < (int)g_pages.size(); i++) {
+        if (g_pages[i].kind != keepKind || g_pages[i].objId != keepObj) continue;
+        pick = i;
+        break;
+    }
+    if (pick < 0) pick = (hint >= 0) ? hint : 0;
+    g_page = pick;
+    PageLoad();
+    SettingsResizeForPage();
+    SettingsPaint();
+}
+
 static void ShowSettings(int hintKind, int hintId) {
     if (g_setWnd) {
         SetForegroundWindow(g_setWnd);
         return;
     }
+    // Remember what this panel is about: a row that changes the object's shape rebuilds the tabs
+    // from these two numbers (see SettingsRefreshPages).
+    g_setHintObj = hintKind;
+    g_setHintId = hintId;
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{sizeof(wc)};

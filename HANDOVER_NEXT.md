@@ -1867,5 +1867,110 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
 5. 重启后所有贴纸都回来（各自的 `[sticker.N]`），且**常显**（不淡出、不隐藏）。
 6. 贴纸永远在所有应用窗口之下、桌面之上（`dev/t_band.ps1` 的判据可复用）。
 
+### 3.35 任务 5 重做完成（2026-11-23 19:2x）：**一类浮窗**，三图标窗只是它的特化
+
+**用户 18:32 的新设计（比 §3.34 更进一步，提示词优先于本文档）**
+> 不是"贴纸"和"三图标"两类窗口，而是**一类**：拥有三图标窗除图标外的全部属性，**再加**两件事——
+> ① z 序变成用户可调的窗口属性（`最上` / `最下`）；② 内容多样化（时间、天气、一堆快捷方式、
+> 文件夹快捷方式，像手机桌面文件夹那样多个应用放一起，甚至可以混装）。
+> 做法："把三图标窗改成通用窗，然后特化（z=最上、内容=三图标）得到现在的三图标小窗"。
+> 另外：**贴边隐藏最终也要有**（之前说不要，现在要），所以它和三图标窗行为基本一致、也能进组。
+
+**六个我当场问清、用户逐条拍板的点**（`ask_user_question`，别再自己猜）
+1. 内容模型 = **容器 + 条目**（一个窗口里放若干条目），不是"一个窗口一种内容"。
+2. 本轮范围 = 通用窗 + 内容接口 + **时钟 + 快捷方式网格**；**天气只留接口、不联网**（代码里没有任何网络模块）。
+3. 条目怎么加 = 右键菜单 + 文件选择器 **+ 拖放**（用户明确要拖放）。
+4. 新建默认 z 序 = **最下**（桌面），设置里可改最上。
+5. 用户可见的名字 = **`浮窗`**（和设置页签一致）。
+6. "文件夹快捷方式" = **普通文件夹图标**（点开 = 资源管理器），名称显示去掉 parent path 的部分
+   （`D:/A/B/C/` → `C`），**悬浮显示完整路径**；应用和文件夹同一个逻辑，可混装在一个窗口里。
+
+**落地形状（`dock.cpp` 的"浮窗的内容 (items)"段 + Companion 改造）**
+
+1. **`Companion` 多实例**：`static Companion g_comps[kMaxComps]`（`kMaxFloats=8`，slot 0 = 托盘），
+   并且 `static Companion& g_trayBar = g_comps[0];` —— 这条**引用别名**让原来 100 多处
+   `g_trayBar.xxx` 一行都不用改，是一天里最省事的一个决定。`g_compCount` = 用到的槽位数。
+   - 每个实例自带：`sec[24]`（`[traybar]` / `[float.N]`）、`id`、`content`、`hue/hasHue`、
+     `glassCfg`、`img`（图片背景合成缓存）、`items`、`iconPxOv`、`captionOn`。
+   - **id 就是槽位号**，删除后槽位空着、下次新建复用；`[float.N]` 永远指同一个窗口（不重排）。
+2. **窗口过程不再认单例**：`CompanionProc` 用 `GetWindowLongPtr(h, GWLP_USERDATA)` 取 `Companion*`
+   （和组框用 `GWLP_USERDATA` 存 group id 是同一个套路）。类名两个：托盘的仍是
+   **`DockTrayBarWindow`**（**故意不改**，`dev/` 里 ~20 个探针脚本按这个类名找它），
+   用户窗口是 **`DockFloatWindow`**、标题 `dock float N`。
+3. **内容接口**（就这几个函数，加一种内容只碰它们）：
+   - `FloatLayoutCells()` 布局（网格 + `itemPage` 翻页）、`FloatCellH()` 单元格高度（图标 + 名称）
+   - `FloatContentPaint()` 绘制（玻璃/图片背景是公用路径，见 `TrayRepaint`）
+   - `FloatItemAt()` 命中、`FloatItemActivate()` 左键动作、`FloatItemTip()` 悬浮文本
+   - `FloatContentTick()` 自刷新节拍（时钟 1 Hz；`RotateTick` 里每窗一次，日志
+     `float: content tick id=N`）
+   - 条目类型：`kItemApp` / `kItemFolder` / `kItemClock` / `kItemWeather`（天气**只画 `—°` + "未接数据"**，
+     菜单里那项也叫「添加天气（未接数据）」——数据源是下一步的事）
+4. **ini**：`[float.N]` 用**绝对值**行集（`kRowsFloatWin` / `kRowsGlassWin`），**不再继承条**；
+   新增键 `items=`（`;` 分隔：`clock` / `weather` / 任意路径）、`iconSize`、`caption`。
+   `[traybar]` 的"继承条"语义**原样保留**（托盘还是 `kRowsFloatTray`/`kRowsGlassTray`）。
+   例：`items=clock;C:\Windows;C:\Windows\System32\notepad.exe`
+5. **z 序**：`band` 已经是每窗口属性；`ZIsBottomBand()` 改成遍历 `g_comps`。
+   `最下` 的窗口**永远 alpha 255、不参与淡出**（它是桌面的一部分）。
+6. **组 / 贴边隐藏 / 贴边方角 / 拖动缩放 / 玻璃烘焙**：全部是 `Companion` 的字段或遍历
+   `g_comps` 的循环，所以浮窗**天然**具备（用户要的"行为和三图标窗一致"就是这样来的，没写新逻辑）。
+   唯一新增判断：**不在任何组里的用户窗口强制 255**（它是用户摆在那儿的挂件，不该按鼠标距离淡出）。
+7. **新建 / 删除**：条右键加「新建浮窗」（默认 `band=1`、纯色 235、色调=条的、`group=0`、
+   300x210 级联摆放）；浮窗右键 `添加快捷方式… / 添加文件夹… / 添加时钟 / 添加天气（未接数据）/
+   移除条目 ▸ / 清空全部条目 / 设置… / 删除这个浮窗`。删除 = 销毁窗口 + 删掉整个 `[float.N]` 段 + 释放槽位。
+8. **拖放**：`DragAcceptFiles` + `WM_DROPFILES` → 逐个 `FloatItemAdd()`（应用/文件夹自动判别）。
+9. **手改 ini 能生效**：`FloatsReloadFromIni()`（`Reload()` 里调用）按 ini 里现存的 `[float.N]`
+   段**补建缺失的、删掉消失的、重读已有的**；`RefreshCompanionAfterReload()` 改成遍历所有实例。
+   ⚠️ 这意味着**重载现在会重读每个浮窗的 x/y/w/h 并搬回 ini 里的位置**（旧代码故意不读几何）。
+   因为每次拖动/缩放都会落盘，正常使用看不出差别；手改 ini 想搬窗口时反而是想要的。
+
+**删掉的东西（§3.34.4 的清单，全部执行）**
+`struct Deco` / `g_deco` / `g_decoHwnd` / `Deco*()` 全套、`kRowsDeco` / `kRowsGlassDeco` /
+`kPageDeco` / `kObjDeco`、`[deco]` 的读取、条右键那个「贴纸窗口」开关、`DecoTick`。
+`g_glass[3]`/`g_hue[2]` 也拆了：条用 `g_glassStrip` / `g_hueStrip`，浮窗用 `Companion::glassCfg` / `.hue`，
+`HueFor()/SetHueFor()` 的 `which` 编码改成 `0=条 / 100+槽位=浮窗 / 200+组 id=组色带`
+（`HueWhichForPage()` 一处决定；`g_hueGroup` 这个全局没了）。`[deco]` 段**留在 ini 里没删**（无害，不再读）。
+
+**踩到的坑（都很值钱）**
+1. ⛔ **`BlendPremul()` / `BlendScaled()` 原来写死 `g_bits`/`g_dibW`**（条的 DIB）。以前只有条画图标，
+   所以看不出来；浮窗一画就画进条的缓冲区（还被条的尺寸裁掉）。现在两者都走
+   `g_paintBits`/`g_paintW`/`g_paintH`（`SetPixelPremul` 一直是这么做的）。**症状：浮窗里只有文字没有图标。**
+2. ⛔ **`small` 是 Windows 头文件里的宏**（`rpcndr.h`：`#define small char`），
+   `std::wstring big, small;` 直接编译报"意外的类型 char"。改名 `timeLine`/`dateLine`。
+3. ⛔ **绝不要用 PowerShell 批量替换 `dock.cpp`**：`Get-Content -Raw` 按 ANSI 读 UTF-8 源码，
+   中文全部变成 `以太�?` 并且**不可逆**（我这次已经把 `QueryNetworkInto` 等好几行搞坏过一次，
+   `git checkout -- dock.cpp` 全部重做才救回来）。**要么用 read/edit 工具，要么用 python 按字节改。**
+   顺手用过一次 python 按行删 467 行（Deco 块）：`read` 的行号是 1-based，`lines[end-1]` 才是第 end 行。
+4. `SettingsBuildPages` 里 `wantKind == kPageFloatTray` 的页现在按 `SPage::objId`（原本叫 `groupId`）
+   区分实例；忘了改那一行的话，打开任何浮窗的设置页都会落到托盘身上。
+5. 组 1 用的是 `hideMode=1`（贴边隐藏）：**把一个浮窗加进组 1，它会跟着组一起滑出屏幕**
+   （这正是"和三图标窗一致"）。所以验收脚本测"组框包含它"之前先把 `[group] hideMode` 临时设成 2，
+   否则量到的是滑出去之后的坐标。
+6. 弹右键菜单期间**整个渲染 tick 会停**（`TrackPopupMenu` 的模态循环不吃 `WM_APP+1`），
+   菜单一关就恢复。老代码的托盘菜单也是这样，暂时不管。
+7. 这台机器上 `FindWindowW` 从普通进程找不到我们的窗口（老坑，§3.23）。
+   新脚本一律 `EnumWindows` + 类名（`dev/t_float.ps1` 里的 `FW::All()` 可抄）。
+
+**验收（都能复跑）**
+- `dev/t_float_accept.ps1` **13/13**：写 `[float.7]` → 重载 → 窗口存在/几何/可见/无 topmost/
+  紧贴桌面上方（z#428 vs Progman z#429）；拖一个文件夹进去 → `items` 追加；
+  `band=0` → 变 topmost 且在条之上（z#17 vs 条 z#19）；`group=1` → 组框长到包含它（frame 1029x1239）、
+  窗口自己没被搬走；删段 → 窗口消失。**脚本最后会把 ini 还原并重启 dock**
+  （切隐藏方案会把组 1 重新贴到最近边并落盘，只能靠重启复位）。
+- `dev/t_float.ps1`：`Dock*` 窗口清单（类名/标题/矩形/可见/topmost/z 序）+ `PrintWindow`
+  截图到 `dev/float_N.png`（分层窗口在 z 最下也能抓，屏幕截图抓不到）。
+- 像素证据：`dev/float_1.png`（时钟 19:11 + 日期 + 文件夹 + notepad，浅绿纯色圆角）、
+  `dev/float_2.png`（拖进去的 `System32` + `explorer.exe`）、`dev/settings_float1.png`
+  （浮窗页：背景/玻璃层/色调/纯色不透明度/圆角/贴边方角/内边距/格子间距/条目图标尺寸/图标下显示名称/Z 序）、
+  `dev/settings_tray.png`（托盘页仍是 浮窗|玻璃|组 1，`（覆盖）` 行显示"继承"）。
+- 回归：条的图标一个没少、托盘三格（wifi/喇叭/电池 + 图片背景）正常（`dev/strip_check.png`、`tray_check.png`）。
+
+**没做 / 下一步（都还没问用户）**
+1. **天气数据源**：`wininet.lib` 其实已经链了，Open-Meteo（无 key）可以直接用；需要"城市/坐标"设置项。
+2. **条目重排**：现在只能追加/移除，没有拖拽排序，也没有"插入到第几个"。
+3. **条目的溢出**：窗口装不下时滚轮翻页 + 右下角 `1/2` 指示；没有"自动长大"。
+4. **图标尺寸/名称字号**没有自动适配（名称字号 = 图标 26%，11–18 px 夹紧）。
+5. 右键菜单/设置页的**观感**只做了截图，没让用户实际点过（拖放、点击启动、缩放、组内跟随都待用户验）。
+
+
 
 

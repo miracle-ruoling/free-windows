@@ -67,6 +67,37 @@ public class FX {
 "@
 [void][FX]::SetProcessDpiAwarenessContext([IntPtr](-4))
 
+# ---- the file drop: WM_DROPFILES with a real (synthetic) HDROP -------------------------------
+# Testing drag & drop by hand needs a real OLE drag from Explorer; posting WM_DROPFILES with a
+# DROPFILES block built in global memory exercises exactly the handler the shell would call.
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices;
+public class FXDrop {
+  [DllImport("kernel32.dll")] public static extern IntPtr GlobalAlloc(uint f, UIntPtr n);
+  [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [StructLayout(LayoutKind.Sequential)] public struct DROPFILES { public uint pFiles; public int X, Y; public int fNC; public int fWide; }
+  public static void Drop(IntPtr hwnd, string[] paths) {
+    int header = Marshal.SizeOf(typeof(DROPFILES));
+    var sb = new StringBuilder();
+    foreach (var one in paths) sb.Append(one).Append('\0');
+    sb.Append('\0');
+    byte[] text = Encoding.Unicode.GetBytes(sb.ToString());
+    IntPtr hglob = GlobalAlloc(0x42, (UIntPtr)(header + text.Length));
+    if (hglob == IntPtr.Zero) return;
+    IntPtr lp = GlobalLock(hglob);
+    var df = new DROPFILES();
+    df.pFiles = (uint)header;
+    df.fWide = 1;
+    Marshal.StructureToPtr(df, lp, false);
+    Marshal.Copy(text, 0, (IntPtr)((long)lp + header), text.Length);
+    GlobalUnlock(hglob);
+    PostMessage(hwnd, 0x0233, hglob, IntPtr.Zero);
+  }
+}
+"@
+
 $ini = Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.ini'
 $bak = Join-Path $PSScriptRoot '_float_accept.ini.bak'
 $log = Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.log'
@@ -130,14 +161,20 @@ try {
     }
     Write-Output ("   log: " + ((LogTail 'float: (created|loaded) id=7' 1) -join ''))
 
+    # ---- 1b. drop a folder onto it --------------------------------------------------------
+    [FXDrop]::Drop($w, @('C:\Windows\System32'))
+    Start-Sleep -Milliseconds 700
+    $items = [FX]::Get($sec, 'items', '', $ini)
+    Check "6a the dropped folder was appended to the items" ($items -match 'C:\\Windows\\System32') ("items=" + $items)
+
     # ---- 2. band=0 = topmost --------------------------------------------------------------
     [void][FX]::Set($sec, 'band', '0', $ini)
     Reload
     Write-Output ""
     Write-Output "== 2. band=0 =="
     $w = Win
-    Check "6  it became topmost" ([FX]::Topmost($w)) ("topmost=" + [FX]::Topmost($w))
-    Check "7  and sits above the strip" (([FX]::Index($w)) -lt ([FX]::Index((Strip)))) `
+    Check "7  it became topmost" ([FX]::Topmost($w)) ("topmost=" + [FX]::Topmost($w))
+    Check "8  and sits above the strip" (([FX]::Index($w)) -lt ([FX]::Index((Strip)))) `
           ("win z#" + [FX]::Index($w) + " strip z#" + [FX]::Index((Strip)))
 
     # ---- 3. join group 1 (the strip's group) ----------------------------------------------
@@ -151,22 +188,22 @@ try {
     [void][FX]::Set($sec, 'follow', '1', $ini)
     Reload
     Write-Output ""
-    Write-Output "== 3. group 1 (隐藏方案 forced to 从不 for the measurement) =="
+    Write-Output "== 3. group 1 (hideMode forced to never for the measurement) =="
     $line = ((LogTail 'float: loaded id=7' 1) -join '')
-    Check "8  the load reports group=1" ($line -match 'group=1') $line
+    Check "9  the load reports group=1" ($line -match 'group=1') $line
     $f = NonEmptyFrame
     if ($f -ne [IntPtr]::Zero) {
         $fr = RectOf $f
         $wr = RectOf (Win)
-        Check "9  the group frame grew to include the float window" `
+        Check "10 the group frame grew to include the float window" `
               (($fr.Bottom -ge 500) -and ($fr.Right -ge 1000)) `
               ("frame " + $fr.Left + "," + $fr.Top + " " + ($fr.Right - $fr.Left) + "x" + ($fr.Bottom - $fr.Top))
-        Check "10 the float window itself did not move" `
+        Check "11 the float window itself did not move" `
               (($wr.Left -eq 720) -and ($wr.Top -eq 300)) `
               ("rect " + $wr.Left + "," + $wr.Top)
     } else {
-        Check "9  the group frame grew to include the float window" $false "no DockGroupBoxWindow"
-        Check "10 the float window itself did not move" $false "no frame"
+        Check "10 the group frame grew to include the float window" $false "no DockGroupBoxWindow"
+        Check "11 the float window itself did not move" $false "no frame"
     }
     [void][FX]::Set('group', 'hideMode', $hideMode, $ini)
 
@@ -175,16 +212,21 @@ try {
     Reload
     Write-Output ""
     Write-Output "== 4. section removed =="
-    Check "11 the window is gone" ((Win) -eq [IntPtr]::Zero) ("hwnd=" + (Win))
+    Check "12 the window is gone" ((Win) -eq [IntPtr]::Zero) ("hwnd=" + (Win))
     $line = ((LogTail 'float: deleting id=7' 1) -join '')
-    Check "12 and the log says why" ($line -match 'float: deleting id=7') $line
+    Check "13 and the log says why" ($line -match 'float: deleting id=7') $line
 }
 finally {
     Copy-Item $bak $ini -Force
     Remove-Item $bak -Force -ErrorAction SilentlyContinue
-    Reload
+    # Toggling the 隐藏方案 re-attaches group 1 to the nearest screen edge, and that lands in the
+    # ini - so a restart is what reliably puts the user's layout back exactly as it was.
+    Stop-Process -Name dock -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 600
+    Start-Process explorer.exe (Join-Path $env:LOCALAPPDATA 'Programs\Dock\dock.exe')
+    Start-Sleep -Seconds 2
     Write-Output ""
-    Write-Output ("  ini restored; [float.7] present now: " +
+    Write-Output ("  ini restored and dock restarted; [float.7] present now: " +
                   ([FX]::Get('float.7', 'enabled', '<none>', $ini)))
 }
 Write-Output ""

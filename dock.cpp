@@ -63,11 +63,10 @@ enum SPageKind {
     kPageGlass = 0,       // 玻璃页: [dock], global params shared by every glass window
     kPageFloatDock = 1,   // 浮窗页 of the strip: [dock]
     kPageBar = 2,         // 图标条页: [dock], only things a float window cannot use
-    kPageFloatTray = 3,   // 浮窗页 of a companion: [traybar]
-    kPageDeco = 5,        // 贴纸窗口 (task 5): [deco]
+    kPageFloatTray = 3,   // 浮窗页 of a companion: [traybar] / [float.N]
     kPageGroupKind = 4,   // 组 N
 };
-enum SObj { kObjStrip = 0, kObjCompanion = 1, kObjGroup = 2, kObjDeco = 3 };
+enum SObj { kObjStrip = 0, kObjCompanion = 1, kObjGroup = 2 };
 static void ShowSettings(int hintObj = kObjStrip, int hintId = 0);   // per-window pages (G3/H2)
 static void* g_paintBits;
 static HWND g_setWnd;
@@ -156,7 +155,8 @@ static DWORD g_friendPid = 0;           // app we just acted for
 static DWORD g_focusGraceUntil = 0;     // ignore foreground churn right after our click
 static HWND g_menuWatch;                // the app's menu window we are watching (menu code below)
 static DWORD g_menuItemPressAt = 0;     // when the user last pressed *on* the menu itself
-static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb);
+static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb,
+                          bool centered = false);
 static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int sw, int sh,
                         int clipL = INT_MIN, int clipR = INT_MAX);
 
@@ -244,8 +244,10 @@ struct GlassCfg {
     int tintStrength = 110;
     int glassOpacity = 140;
 };
-static GlassCfg g_glass[3];      // [0] strip ([dock]), [1] companion ([traybar]), [2] sticker ([deco]);
-                                 // -1 in the section = inherit [dock]
+// The *strip's* glass parameters ([dock]). Every float window carries its own copy in
+// Companion::glassCfg (2026-11-23: this used to be a global array indexed by window kind, which is
+// why a second window could not have its own material); a -1 in a section means "inherit these".
+static GlassCfg g_glassStrip;
 
 // ---- 色调 (hue): one colour per float window ------------------------------------------------
 // User decision 2026-11-21: the 色调 IS the window's colour - it paints the solid background and
@@ -253,7 +255,7 @@ static GlassCfg g_glass[3];      // [0] strip ([dock]), [1] companion ([traybar]
 // 浅色/深色 are gone). Per-window is safe: no cache bakes the tint in - the frozen work-area
 // picture, the screen grab and the PrintWindow cache all hold *raw* pixels, and the tint is applied
 // inside BakeGlass() on every bake.
-static DWORD g_hue[2] = {0x101010, 0x101010};   // [0] the strip ([dock]), [1] the companion ([traybar])
+static DWORD g_hueStrip = 0x101010;      // [dock] hue; a float window's own tone lives in Companion
 static std::wstring g_pinDir;
 
 // ---- tray double click (H1.2, user 2026-11-16)
@@ -310,13 +312,12 @@ static DWORD ParseHexRgb(const std::wstring& s, DWORD def) {
     return (DWORD)v;
 }
 
-// The 色调 of both windows. A profile that predates the key keeps its look: it falls back to the
-// old black/white `color` switch plus the glass page's 浅色/深色.
+// The strip's 色调. A profile that predates the key keeps its look: it falls back to the old
+// black/white `color` switch plus the glass page's 浅色/深色. (A float window reads its own `hue`
+// from its own section - see CompanionLoad.)
 static void LoadHues() {
     std::wstring s = GetStr(L"dock", L"hue");
-    g_hue[0] = s.empty() ? (g_cfg.lightMode ? 0xFFFFFFu : 0x101010u) : ParseHexRgb(s, 0x101010u);
-    std::wstring t = GetStr(L"traybar", L"hue");
-    g_hue[1] = t.empty() ? g_hue[0] : ParseHexRgb(t, g_hue[0]);
+    g_hueStrip = s.empty() ? (g_cfg.lightMode ? 0xFFFFFFu : 0x101010u) : ParseHexRgb(s, 0x101010u);
 }
 
 // Ints from an ini section that may also inherit: a negative value means "use the strip's".
@@ -328,22 +329,12 @@ static int GetGlassInt(const wchar_t* section, const wchar_t* key, int stripVal,
     return v;
 }
 
-// Resolve the per-window glass parameters. Must run after the strip's own values are loaded.
+// Resolve the strip's glass parameters. Must run after the strip's own values are loaded.
+// (A float window resolves its own in CompanionLoad; -1 there still means "inherit the strip".)
 static void LoadGlassCfgs() {
-    g_glass[0].blurRadius = g_cfg.blurRadius;
-    g_glass[0].tintStrength = g_cfg.tintStrength;
-    g_glass[0].glassOpacity = g_cfg.glassOpacity;
-    g_glass[1].blurRadius = GetGlassInt(L"traybar", L"blurRadius", g_glass[0].blurRadius, 0, 64);
-    g_glass[1].tintStrength =
-        GetGlassInt(L"traybar", L"tintStrength", g_glass[0].tintStrength, 0, 255);
-    g_glass[1].glassOpacity =
-        GetGlassInt(L"traybar", L"glassOpacity", g_glass[0].glassOpacity, 0, 255);
-    // task 5: the desktop sticker has its own glass parameters too (-1 = inherit [dock])
-    g_glass[2].blurRadius = GetGlassInt(L"deco", L"blurRadius", g_glass[0].blurRadius, 0, 64);
-    g_glass[2].tintStrength =
-        GetGlassInt(L"deco", L"tintStrength", g_glass[0].tintStrength, 0, 255);
-    g_glass[2].glassOpacity =
-        GetGlassInt(L"deco", L"glassOpacity", g_glass[0].glassOpacity, 0, 255);
+    g_glassStrip.blurRadius = g_cfg.blurRadius;
+    g_glassStrip.tintStrength = g_cfg.tintStrength;
+    g_glassStrip.glassOpacity = g_cfg.glassOpacity;
 }
 
 static COLORREF ParseColor(const std::wstring& s, BYTE* alpha) {
@@ -1004,9 +995,6 @@ static void AddPin(const std::wstring& path) {
 static void DLog(const wchar_t* fmt, ...);
 static void ThumbHide();
 static HWND g_thumbWnd;
-// task 5: the decoration window's handle, kept here so the "is this one of ours" test (used by the
-// backdrop capture) can see it without pulling the whole Deco struct this far up.
-static HWND g_decoHwnd = nullptr;
 // Logs what kind of token/process context we are in: a restricted token (e.g.
 // launched from a sandboxed host) silently blocks CreateProcess/ShellExecute.
 static void LogProcessContext() {
@@ -1675,6 +1663,9 @@ static void DrawLine(int x0, int y0, int x1, int y1, int width, DWORD argb) {
 // Size drives the layout: the short side sets the icon size, the long side sets
 // how many cells fit. Taller than wide => a vertical column.
 
+// ⛔ This used to write into g_bits (the *strip's* DIB). That was fine while only the strip drew
+// icons, but a float window painting into its own DIB used to land in the strip's buffer (and be
+// clipped by the strip's size). Every pixel helper works on the current paint target.
 static void BlendPremul(int x0, int y0, int w, int h, const uint32_t* src) {
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
@@ -1682,8 +1673,8 @@ static void BlendPremul(int x0, int y0, int w, int h, const uint32_t* src) {
             int a = (sp >> 24) & 0xFF;
             if (!a) continue;
             int dx = x0 + x, dy = y0 + y;
-            if (dx < 0 || dy < 0 || dx >= g_dibW || dy >= g_dibH) continue;
-            BYTE* dst = (BYTE*)g_bits + ((size_t)dy * g_dibW + dx) * 4;
+            if (dx < 0 || dy < 0 || dx >= g_paintW || dy >= g_paintH) continue;
+            BYTE* dst = (BYTE*)g_paintBits + ((size_t)dy * g_paintW + dx) * 4;
             int sb = sp & 0xFF, sg = (sp >> 8) & 0xFF, sr = (sp >> 16) & 0xFF;
             dst[0] = (BYTE)(sb + dst[0] * (255 - a) / 255);
             dst[1] = (BYTE)(sg + dst[1] * (255 - a) / 255);
@@ -2258,17 +2249,17 @@ struct ImageBg {
     DWORD sig = 1;
 };
 
-static DWORD ImageSig(int which) {
-    return (DWORD)((g_cfg.glassLayer ? 1u : 0u) |
-                   ((DWORD)(g_glass[which & 1].blurRadius & 0xFF) << 8));
+static DWORD ImageSig(const GlassCfg& gc, bool glassOn) {
+    return (DWORD)((glassOn ? 1u : 0u) | ((DWORD)(gc.blurRadius & 0xFF) << 8));
 }
 
 static std::wstring ImagePathFor(const wchar_t* section) {
     std::vector<wchar_t> b(MAX_PATH * 2, 0);
     GetPrivateProfileStringW(section, L"image", L"", b.data(), (DWORD)b.size(), g_iniPath.c_str());
     std::wstring p = b.data();
-    if (p.empty() && wcscmp(section, L"dock") != 0) {
+    if (p.empty() && !wcscmp(section, L"traybar")) {
         // [traybar] has no picture of its own -> inherit the strip's, like every other style key
+        // (that is the old "跟随条样式" behaviour; a [float.N] window is independent on purpose).
         GetPrivateProfileStringW(L"dock", L"image", L"", b.data(), (DWORD)b.size(),
                                  g_iniPath.c_str());
         p = b.data();
@@ -2379,7 +2370,8 @@ static bool EnsureImageSrc(const std::wstring& path, ImageSrc** out) {
     return true;
 }
 
-static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h, int which) {
+static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h,
+                           const GlassCfg& gc, bool glassOn) {
     im.ok = false;
     // Remember what was asked for even when it fails: EnsureImage() must not retry a broken path
     // on every single repaint (a 4K decode attempt per frame is not a debugging aid).
@@ -2539,10 +2531,10 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h, 
         // The radius is a full-resolution number (36 on this profile); on a 76 px tall layer that
         // is a complete wipe, so it is capped to an eighth of the short side - enough to read as
         // "softened by the glass", far from destroying the picture.
-        if (g_cfg.glassLayer != 0 && g_glass[which & 1].blurRadius > 0 && sharpW > 8 && sharpH > 8) {
+        if (glassOn && gc.blurRadius > 0 && sharpW > 8 && sharpH > 8) {
             int cap = (sharpW < sharpH ? sharpW : sharpH) / 8;
             if (cap < 2) cap = 2;
-            int rb = g_glass[which & 1].blurRadius;
+            int rb = gc.blurRadius;
             if (rb > cap) rb = cap;
             BoxBlurFast(sharp, sharpW, sharpH, rb);
             BoxBlurFast(sharp, sharpW, sharpH, rb);
@@ -2586,7 +2578,7 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h, 
     im.h = h;
     im.ok = true;
     im.at = GetTickCount();
-    im.sig = ImageSig(which);
+    im.sig = ImageSig(gc, glassOn);
     DLog(L"image: composed %s (%ux%u -> %dx%d, sharp %dx%d at %d,%d, feather %d) in %.1f ms",
          path.c_str(), sw, sh, w, h, sharpW, sharpH, dx, dy, feather, NowMs() - tComp0);
     if (g_cfg.dumpBake) {
@@ -2598,22 +2590,24 @@ static bool LoadImageCover(ImageBg& im, const std::wstring& path, int w, int h, 
     return true;
 }
 
-// Load on demand, and reload when the path or the window size changed.
-static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h, int which) {
-    if (im.ok && im.w == w && im.h == h && im.path == path && im.sig == ImageSig(which)) return true;
-    return LoadImageCover(im, path, w, h, which);
+// Load on demand, and reload when the path, the window size or the material changed.
+static bool EnsureImage(ImageBg& im, const std::wstring& path, int w, int h, const GlassCfg& gc,
+                        bool glassOn) {
+    if (im.ok && im.w == w && im.h == h && im.path == path && im.sig == ImageSig(gc, glassOn))
+        return true;
+    return LoadImageCover(im, path, w, h, gc, glassOn);
 }
 
-// One cached picture per glass-capable window (the strip and the float window may differ).
-static ImageBg g_imgStrip, g_imgTray;
+// One cached composed picture per window (the strip, the tray, every [float.N]).
+static ImageBg g_imgStrip;
 
 // Paint the picture into the current paint target (g_paintBits) through the given coverage/rim
 // masks, with the glass layer's tint applied when it is on. Same maths as the baked glass (lift +
 // tint mix) so a picture background and a "behind" background look like the same material.
 static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov, const BYTE* rim,
-                         DWORD hueRgb, const GlassCfg& gc) {
+                         DWORD hueRgb, const GlassCfg& gc, bool glassOn) {
     if (!im.ok || !g_paintBits) return;
-    const bool glass = g_cfg.glassLayer != 0;
+    const bool glass = glassOn;
     const double tintK = glass ? gc.tintStrength / 255.0 : 0.0;
     // The whole background layer takes the glass opacity as its alpha (user, 2026-11-21): the
     // icons are drawn afterwards into the same DIB, so they stay fully opaque.
@@ -2649,9 +2643,11 @@ static void PaintImageBg(const ImageBg& im, int dstW, int dstH, const BYTE* cov,
 
 // Paint the strip's picture background; false = no usable picture (caller falls back).
 static bool DrawImageBgStrip(int w, int h) {
-    if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h, 0)) return false;
+    const bool glassOn = g_cfg.glassLayer != 0;
+    if (!EnsureImage(g_imgStrip, ImagePathFor(L"dock"), w, h, g_glassStrip, glassOn)) return false;
     EnsureStripMasks(w, h, RadiusFor(w, h));
-    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data(), g_hue[0], g_glass[0]);
+    PaintImageBg(g_imgStrip, w, h, g_covMask.data(), g_rimMask.data(), g_hueStrip, g_glassStrip,
+                 glassOn);
     return true;
 }
 
@@ -2662,7 +2658,7 @@ static void Paint(int w, int h) {
     // glassOpacity = tintStrength = 0 means "no glass": the composite would only be a
     // frozen copy of the backdrop, so skip the capture and the per-pixel pass and let the
     // real desktop show through.
-    const bool noGlass = (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0);
+    const bool noGlass = (g_glassStrip.glassOpacity == 0 && g_glassStrip.tintStrength == 0);
     if (g_cfg.material == 1 && g_bakeDirty && !noGlass) {
         CaptureBackdrop();
         g_glassCacheValid = false;
@@ -2677,7 +2673,7 @@ static void Paint(int w, int h) {
             logged++;
             DLog(L"paint: material=%d bake=%p bakeW=%d bakeH=%d w=%d h=%d op=%d tint=%d blur=%d",
                  g_cfg.material, g_stripGlass.bits, g_stripGlass.w, g_stripGlass.h, w, h,
-                 g_glass[0].glassOpacity, g_glass[0].tintStrength, g_glass[0].blurRadius);
+                 g_glassStrip.glassOpacity, g_glassStrip.tintStrength, g_glassStrip.blurRadius);
         }
     }
     // The glass depends on *where* the strip currently sits inside the padded bake, so
@@ -2715,7 +2711,7 @@ static void Paint(int w, int h) {
             if (a < 3) a = 3;
             if (a > 255) a = 255;
             FillRound(g_memDC, RECT{0, 0, w, h}, RadiusForPercent(w, h, g_cfg.radius),
-                      ((DWORD)a << 24) | (g_hue[0] & 0x00FFFFFFu));
+                      ((DWORD)a << 24) | (g_hueStrip & 0x00FFFFFFu));
         }
     } else {
     if (g_cfg.material == 1 && g_stripGlass.bits && g_stripGlass.w >= w &&
@@ -2766,7 +2762,7 @@ static void Paint(int w, int h) {
             }
             lastC = bake[(size_t)(h / 2) * pw + w / 2];
             DLog(L"paint: glass op=%d tint=%d bakeC=%08X -> outC=%08X",
-                 g_glass[0].glassOpacity, g_glass[0].tintStrength, lastC, out);
+                 g_glassStrip.glassOpacity, g_glassStrip.tintStrength, lastC, out);
         }
     } else if (g_cfg.bgAlpha) {
         DWORD cr = GetRValue(g_cfg.bg), cg = GetGValue(g_cfg.bg), cb = GetBValue(g_cfg.bg);
@@ -3460,7 +3456,7 @@ static void RefreshItems() {
 
 static void RefreshCompanionAfterReload();   // needs the paint helpers, defined further down
 static void ReloadGroupsFromIni();            // ditto: the group code is further down
-static void DecoCreate();                     // task 5: the desktop sticker (defined further down)
+static void FloatsReloadFromIni();            // the extra float windows ([float.N]) are further down
 
 static void Reload() {
     LoadConfig();
@@ -3473,7 +3469,7 @@ static void Reload() {
     g_bakeDirty = true;      // one capture with the new settings
     RefreshItems();
     RefreshCompanionAfterReload();
-    DecoCreate();            // task 5: [deco] edits apply on reload
+    FloatsReloadFromIni();   // [float.N] sections: create/destroy/re-style the extra windows
 }
 
 // ---------------------------------------------------------------- flyout anchors
@@ -3795,9 +3791,32 @@ struct TrayState {
 };
 static TrayState g_trayState;
 
+// How many user float windows can exist at once (a hard cap: each one can bake a backdrop and
+// paints its own DIB, so "unlimited" is how you hang the box - user 2026-11-23).
+static const int kMaxFloats = 8;
+static const int kMaxComps = kMaxFloats + 1;      // slot 0 = the tray companion
+
+// One thing a float window can show: a clock, the weather, an app or a folder. `path` is empty for
+// the two built-ins. Icons are cached as premultiplied pixels, exactly like the strip's items.
+enum FloatItemKind { kItemApp = 0, kItemFolder = 1, kItemClock = 2, kItemWeather = 3 };
+struct FloatItem {
+    int kind = kItemApp;
+    std::wstring path;            // file / folder this item opens (empty for built-ins)
+    std::wstring label;           // caption under the icon: the name without its parent path
+    std::vector<uint32_t> px;     // icon pixels, square, `cachedPx` wide
+    int cachedPx = 0;
+};
+// What a float window draws inside: the tray's three status cells (the "three icons" window), or
+// the generic item grid (which may be empty - that is the plain desktop sticker).
+enum FloatContent { kContentTray = 1, kContentItems = 2 };
+
 struct Companion {
     HWND hwnd = nullptr;
-    const wchar_t* iniSection = L"traybar";
+    // Which ini section this window lives in: the tray companion keeps `[traybar]` (so an existing
+    // profile is untouched), every other float window is `[float.N]`.
+    wchar_t sec[24] = L"traybar";
+    int id = 0;                       // 0 = the tray companion, 1..kMaxFloats = a user float window
+    int content = kContentTray;       // see FloatContent
     bool enabled = true;
     bool follow = true;
     RECT rc{0, 0, 0, 0};              // screen px
@@ -3832,7 +3851,9 @@ struct Companion {
     // 0 = independent (no group at all, distance fade), N>1 = its own group.
     int groupId = 1;
     // Per-window style overrides (R4): [traybar] radius/pad/gap. -1 = inherit from [dock],
-    // which is the "跟随条样式" default; the plan's "独立样式" hook is exactly this.
+    // which is the "跟随条样式" default. A [float.N] window writes absolute values instead (-1
+    // never appears there), because a desktop window must not move when the strip's style does
+    // (user 2026-11-23: "背景与条绑定、改不了" was the complaint about the first sticker).
     int padOv = -1, gapOv = -1, radiusOv = -1;
     // task 3: [traybar] snap, -1 = inherit [dock] snap; the per-corner factors are this
     // window's own (the strip has its own g_cornerAnim), animated the same ~120 ms way.
@@ -3843,6 +3864,11 @@ struct Companion {
     // always been), 1 = the bottom of the normal band - a decoration that sits above the desktop
     // and below every app window (measured 2026-11-23: HWND_BOTTOM lands directly above Progman).
     int band = 0;
+    // The window's own 色调 and glass parameters. They used to be indexed globally (g_hue[1] /
+    // g_glass[1]), which is exactly why "a second window cannot have its own colour" (2026-11-23).
+    DWORD hue = 0;
+    bool hasHue = false;
+    GlassCfg glassCfg;
     // H3: this window's own padded backdrop bake (same pipeline as the strip, own pixels).
     // It is only filled when the window actually draws the glass layer - see CompanionGlassTick.
     GlassTarget glass;
@@ -3853,14 +3879,62 @@ struct Companion {
     // a capture - otherwise following the strip during a drag would re-grab ~15 ms per frame.
     DWORD glassMovedAt = 0;
     DWORD glassWideUntil = 0;     // keep the wide bake margin until then (see CompanionGlassTick)
+    // The picture background, composed per window (was one slot shared by one window).
+    ImageBg img;
+    // Content state: the ini `items=` list decoded, with each item's icon cached.
+    std::vector<FloatItem> items;
+    int itemHover = -1;           // hovered item index (the tray uses hoverCell instead)
+    int itemPage = 0;             // first visible item when the grid does not fit
+    int iconPxOv = -1;            // [float.N] iconSize, -1 = automatic
+    bool captionOn = true;        // draw the name under the icon (desktop-like)
+    bool dropHot = false;         // a shell drag is over the window (drag & drop feedback)
+    DWORD contentAt = 0;          // last content refresh (the clock ticks once a second)
 };
-static Companion g_trayBar;
+
+// ---------------------------------------------------------------------------------------------
+// Float windows (user 2026-11-23)
+//
+// There is ONE kind of float window. The tray companion ([traybar], the "three icons" window) is
+// the specialization {band = 0, content = tray}; a desktop sticker is {band = 1, content = items,
+// no items}; a clock, a weather tile or a folder of shortcuts is the same window with other
+// contents. Groups, 贴边隐藏, 贴边方角, dragging and resizing are per window already, so they come
+// for free (they were written against Companion, not against "the tray").
+//
+// The tray keeps slot 0 and its own ini section, and `g_trayBar` stays a reference to it, so every
+// existing call site ("g_trayBar.xxx") keeps working unchanged.
+static Companion g_comps[kMaxComps];
+static Companion& g_trayBar = g_comps[0];
+static int g_compCount = 1;       // live slots (slot 0 is always the tray)
 
 // Style accessors: one place decides "override or inherit" for every drawing site.
 static int CompanionPad(const Companion& c) { return c.padOv >= 0 ? c.padOv : g_cfg.pad; }
 static int CompanionGap(const Companion& c) { return c.gapOv >= 0 ? c.gapOv : g_cfg.gap; }
 static int CompanionRadiusPercent(const Companion& c) {
     return c.radiusOv >= 0 ? c.radiusOv : g_cfg.radius;
+}
+
+// ---- addressing a float window -------------------------------------------------------------
+// Slot 0 (the tray) always exists; another slot is live while it has an id (a deleted window
+// keeps its slot but is reset, so ids never shift - the ini's [float.N] must stay put).
+static Companion* CompanionAt(int idx) {
+    if (idx < 0 || idx >= kMaxComps) return nullptr;
+    if (idx == 0) return &g_comps[0];
+    return g_comps[idx].id ? &g_comps[idx] : nullptr;
+}
+static int CompanionIndexOf(const Companion* c) { return c ? (int)(c - g_comps) : -1; }
+static Companion* CompanionByWindow(HWND h) {
+    if (!h) return nullptr;
+    for (int i = 0; i < g_compCount; i++)
+        if (g_comps[i].hwnd == h) return &g_comps[i];
+    return nullptr;
+}
+// Every live float window, in creation order (the tray first). The callbacks get the window and
+// its index; `Count` is what most loops want.
+static int CompanionLiveCount() {
+    int n = 0;
+    for (int i = 0; i < g_compCount; i++)
+        if (i == 0 || g_comps[i].id) n++;
+    return n;
 }
 
 #define kTrayCellCount 3
@@ -3872,10 +3946,16 @@ static void CompanionPresent(Companion& c);
 // H3: "does this window draw the glass layer?" - defined with the component helpers further
 // down, needed by the paint path above it.
 static bool CompanionUsesGlass(const Companion& c);
+static bool CompanionHasGlassLayer(const Companion& c);
 static int CompanionBgMode(const Companion& c);      // 0 behind / 1 picture / 2 solid
+static int CompanionGlassLayer(const Companion& c);
+static int CompanionSolidAlpha(const Companion& c);
+static DWORD CompanionHue(const Companion& c);
 // the group frame (R2) is derived geometry: "the strip + every following companion"
 static struct Group& DefaultGroup();
 static bool GroupBoxRect(Group& g, RECT* out);
+static Group* GroupById(int id);              // the group code itself is further down
+static void GroupRecompute(Group& g);
 static bool GroupScaling();      // true while any frame is being dragged to scale its group
 static bool GroupDragging();     // true while any board (or member) is dragging its group
 static bool PointerInDefaultGroup(POINT p);   // pointer in the strip's own group (or driving it)
@@ -3897,8 +3977,8 @@ static HWND ZBandInsert() { return g_zMode == 1 ? HWND_NOTOPMOST : HWND_TOPMOST;
 // z#444 against Progman's z#446, with the app windows around z#47.)
 static bool ZIsBottomBand(HWND h) {
     if (!h) return false;
-    if (h == g_trayBar.hwnd && g_trayBar.band == 1) return true;
-    if (h == g_decoHwnd) return true;      // task 5: the desktop sticker always lives at the bottom
+    for (int i = 0; i < g_compCount; i++)
+        if (h == g_comps[i].hwnd && g_comps[i].band == 1) return true;
     return false;
 }
 
@@ -4506,12 +4586,18 @@ static bool CursorInCompanionGroup() {
     POINT p{};
     if (!GetCursorPos(&p)) return false;
     if (PointerInDefaultGroup(p)) return true;
-    if (!g_trayBar.hwnd || !g_trayBar.enabled || g_trayBar.groupId != 1) return false;
-    if (g_trayBar.alpha <= 0) return false;      // nothing of ours is on screen
-    // Before a frame exists (companion disabled in the ini) fall back to strip-united-member.
+    // Before a frame exists (a member disabled in the ini) fall back to strip-united-member.
     RECT group{};
     if (!GetWindowRect(g_hwnd, &group)) return false;
-    UnionRect(&group, &group, &g_trayBar.rc);
+    bool any = false;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || c.groupId != 1) continue;
+        if (c.alpha <= 0) continue;              // nothing of that window is on screen
+        UnionRect(&group, &group, &c.rc);
+        any = true;
+    }
+    if (!any) return false;
     return PtInRect(&group, p) != FALSE;
 }
 
@@ -4541,61 +4627,449 @@ static void CompanionSetRect(Companion& c, int x, int y, int w, int h, bool repa
     if (publishAnchor) AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
 }
 
+// =============================================================== 浮窗的内容 (items)
+// User design 2026-11-23: a float window is a small desktop widget - it holds a clock, the
+// weather, one app, or a whole grid of apps and folders, mixed freely (Windows desktops mix them
+// too). The tray companion is the specialization "content = the three status cells".
+//
+// Everything a content needs is one of these hooks:
+//   layout   FloatLayoutCells()      where the cells are (client px)
+//   paint    FloatContentPaint()     draw into the window's DIB
+//   hit      FloatItemAt()           which cell is under the pointer
+//   activate FloatItemActivate()     left click on a cell
+//   tip      FloatItemTip()          tooltip text (full path, "打开 …")
+//   refresh  c.contentAt             the clock re-reads the time once a second
+// A new content kind therefore touches those four switches and nothing else.
+static std::vector<uint32_t> TrayIconFromPath(const std::wstring& path, int px);   // further down
+static void CompanionNew(int band);      // strip menu: create a float window (further down)
+static void CompanionDelete(Companion& c);
+
+// Item icon size: the window's own `iconSize`, else a desktop-widget default (a 91 px strip icon
+// would make a 3-item folder as big as the screen).
+static int FloatIconPx(const Companion& c) {
+    int v = c.iconPxOv >= 0 ? c.iconPxOv : 40;
+    if (v < 16) v = 16;
+    if (v > 128) v = 128;
+    return v;
+}
+
+// Caption font + line height under one icon (desktop-like: one line, ellipsised).
+static int FloatCaptionFontPx(int icon) {
+    int px = icon * 26 / 100;
+    if (px < 11) px = 11;
+    if (px > 18) px = 18;
+    return px;
+}
+static int FloatCellH(const Companion& c, int icon) {
+    if (!c.captionOn) return icon;
+    return icon + 3 + FloatCaptionFontPx(icon) + 6;
+}
+
+// How many cells fit in the window (padding + gaps as everywhere else).
+static int FloatGridCols(const Companion& c, int icon) {
+    const int w = c.rc.right - c.rc.left;
+    const int gap = CompanionGap(c), pad = CompanionPad(c);
+    int n = (w - pad * 2 + gap) / (icon + gap);
+    return n < 1 ? 1 : n;
+}
+static int FloatGridRows(const Companion& c, int icon) {
+    const int h = c.rc.bottom - c.rc.top;
+    const int gap = CompanionGap(c), pad = CompanionPad(c);
+    const int cellH = FloatCellH(c, icon);
+    int n = (h - pad * 2 + gap) / (cellH + gap);
+    return n < 1 ? 1 : n;
+}
+
+// Cell rects (client px) for the items currently on screen, in grid order. `first` is the item
+// index of the first cell, so a window that is too small can page through its items.
+static int FloatLayoutCells(const Companion& c, RECT* out, int max, int first) {
+    const int icon = FloatIconPx(c);
+    const int cellH = FloatCellH(c, icon);
+    const int gap = CompanionGap(c), pad = CompanionPad(c);
+    const int cols = FloatGridCols(c, icon);
+    int rows = FloatGridRows(c, icon);
+    const int n = cols * rows;
+    const int w = c.rc.right - c.rc.left;
+    // Centre the block on the items that are really there, not on the empty slots the window
+    // could hold (a 3-item window in a 5x2 grid must look centred, not top-left).
+    const int visible = (int)c.items.size() - first;
+    if (visible > 0) {
+        const int usedRows = (visible + cols - 1) / cols;
+        if (usedRows < rows) rows = usedRows;
+    }
+    const int gridW = cols * (icon + gap) - gap;
+    const int gridH = rows * (cellH + gap) - gap;
+    int x0 = (w - gridW) / 2;
+    int y0 = (c.rc.bottom - c.rc.top - gridH) / 2;
+    int count = 0;
+    for (int i = 0; i < n && count < max; i++) {
+        const int idx = first + i;
+        if (idx >= (int)c.items.size()) break;
+        const int cx = x0 + (i % cols) * (icon + gap);
+        const int cy = y0 + (i / cols) * (cellH + gap);
+        out[count++] = RECT{cx, cy, cx + icon, cy + cellH};
+    }
+    (void)pad;
+    return count;
+}
+
+// The name shown under the icon: the last path component, without a shortcut's ".lnk"
+// (user 2026-11-23: "图标下面注明去除 parent path 的路径名称").
+static std::wstring FloatItemLabelFor(const std::wstring& path) {
+    std::wstring s = path;
+    while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    size_t slash = s.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? s : s.substr(slash + 1);
+    if (leaf.size() > 4) {
+        std::wstring ext = Lower(leaf.substr(leaf.size() - 4));
+        if (ext == L".lnk") leaf = leaf.substr(0, leaf.size() - 4);
+    }
+    if (leaf.empty()) leaf = s;
+    return leaf;
+}
+
+static void FloatItemsSave(Companion& c) {
+    if (g_iniPath.empty()) return;
+    std::wstring all;
+    for (size_t i = 0; i < c.items.size(); i++) {
+        if (i) all += L";";
+        if (c.items[i].kind == kItemClock) all += L"clock";
+        else if (c.items[i].kind == kItemWeather) all += L"weather";
+        else all += c.items[i].path;
+    }
+    WritePrivateProfileStringW(c.sec, L"items", all.c_str(), g_iniPath.c_str());
+    DLog(L"float: items id=%d -> %s (n=%d)", c.id, all.c_str(), (int)c.items.size());
+}
+
+// One ini token -> one item. `clock` / `weather` are the built-ins; anything else is a path
+// (a folder, a .lnk or an .exe).
+static bool FloatItemFromToken(const std::wstring& raw, FloatItem* out) {
+    std::wstring t = raw;
+    Trim(t);
+    if (t.empty()) return false;
+    out->path.clear();
+    out->px.clear();
+    out->cachedPx = 0;
+    if (!_wcsicmp(t.c_str(), L"clock")) {
+        out->kind = kItemClock;
+        out->label = L"";
+        return true;
+    }
+    if (!_wcsicmp(t.c_str(), L"weather")) {
+        out->kind = kItemWeather;
+        out->label = L"";
+        return true;
+    }
+    DWORD attr = GetFileAttributesW(t.c_str());
+    out->kind = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+                    ? kItemFolder
+                    : kItemApp;
+    out->path = t;
+    out->label = FloatItemLabelFor(t);
+    return true;
+}
+
+static void FloatItemsLoad(Companion& c) {
+    c.items.clear();
+    std::wstring all = GetStr(c.sec, L"items");
+    size_t start = 0;
+    while (start <= all.size()) {
+        size_t semi = all.find(L';', start);
+        std::wstring tok = all.substr(start, semi == std::wstring::npos ? std::wstring::npos
+                                                                       : semi - start);
+        FloatItem it;
+        if (FloatItemFromToken(tok, &it)) c.items.push_back(it);
+        if (semi == std::wstring::npos) break;
+        start = semi + 1;
+    }
+}
+
+// Append one path (used by the menu's file picker and by drag & drop).
+static bool FloatItemAdd(Companion& c, const std::wstring& path) {
+    FloatItem it;
+    if (!FloatItemFromToken(path, &it)) return false;
+    c.items.push_back(it);
+    FloatItemsSave(c);
+    c.glass.dirty = true;
+    TrayRepaint(c);
+    CompanionPresent(c);
+    if (Group* g = GroupById(c.groupId)) GroupRecompute(*g);
+    DLog(L"float: add id=%d kind=%d label=%s path=%s", c.id, it.kind, it.label.c_str(),
+         it.path.c_str());
+    return true;
+}
+
+static void FloatItemRemove(Companion& c, int idx) {
+    if (idx < 0 || idx >= (int)c.items.size()) return;
+    c.items.erase(c.items.begin() + idx);
+    c.itemHover = -1;
+    FloatItemsSave(c);
+    c.glass.dirty = true;
+    TrayRepaint(c);
+    CompanionPresent(c);
+    if (Group* g = GroupById(c.groupId)) GroupRecompute(*g);
+}
+
+// Icons are loaded lazily: a window that is never shown must not pay for 9 shell icon lookups.
+static void FloatItemEnsureIcon(FloatItem& it, int px) {
+    if (it.kind == kItemClock || it.kind == kItemWeather) return;
+    if (it.cachedPx == px && !it.px.empty()) return;
+    it.px = TrayIconFromPath(it.path, px);
+    it.cachedPx = px;
+    if (it.px.empty()) DLog(L"float: no icon for %s (%d px)", it.path.c_str(), px);
+}
+
+// Text colour for captions and the clock: dark on a light background, white on a dark one. The
+// effective background is the solid colour (what the user sees) - a picture or the glass layer is
+// treated as dark, which is what every wallpaper and the tinted glass look like here.
+static bool FloatLightBackground(const Companion& c) {
+    DWORD rgb = (c.hasHue ? c.hue : g_hueStrip) & 0x00FFFFFFu;
+    if (CompanionBgMode(c) != 2) return false;
+    const double lum = ((rgb >> 16) & 0xFF) * 0.2126 + ((rgb >> 8) & 0xFF) * 0.7152 +
+                       (rgb & 0xFF) * 0.0722;
+    return lum > 150.0;
+}
+
+static void FloatDrawCaption(int x, int y, int w, int h, const std::wstring& text, int px,
+                             bool light) {
+    // A one-pixel offset copy underneath keeps the caption readable on any background.
+    if (light) {
+        DrawTextAlpha(x + 1, y + 1, w, h, text, px, 0x50FFFFFF, true);
+        DrawTextAlpha(x, y, w, h, text, px, 0xE0000000, true);
+    } else {
+        DrawTextAlpha(x + 1, y + 1, w, h, text, px, 0x60000000, true);
+        DrawTextAlpha(x, y, w, h, text, px, 0xE8FFFFFF, true);
+    }
+}
+
+// `timeLine` / `dateLine` (not "small": rpcndr.h #defines `small` as `char`).
+static void FloatClockStrings(std::wstring* timeLine, std::wstring* dateLine) {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t b[64]{};
+    swprintf_s(b, L"%02d:%02d", st.wHour, st.wMinute);
+    *timeLine = b;
+    static const wchar_t* const kWeek[] = {L"周日", L"周一", L"周二", L"周三",
+                                           L"周四", L"周五", L"周六"};
+    int wd = st.wDayOfWeek % 7;
+    swprintf_s(b, L"%d月%d日 %s", st.wMonth, st.wDay, kWeek[wd]);
+    *dateLine = b;
+}
+
+// Paint the generic content (everything that is not the tray's three cells).
+static void FloatContentPaint(Companion& c) {
+    const int w = c.dibW, h = c.dibH;
+    if (w <= 0 || h <= 0) return;
+    const bool light = FloatLightBackground(c);
+
+    if (c.items.empty()) {
+        // Nothing inside yet: say what the window is for, very faintly (it is a drop target).
+        DrawTextAlpha(0, h / 2 - 12, w, 24, L"拖入文件或文件夹", 15,
+                      light ? 0x50000000 : 0x48FFFFFF, true);
+        return;
+    }
+
+    // A single built-in item gets the whole window (a clock is not a 40 px icon).
+    if (c.items.size() == 1 &&
+        (c.items[0].kind == kItemClock || c.items[0].kind == kItemWeather)) {
+        const FloatItem& it = c.items[0];
+        if (it.kind == kItemClock) {
+            std::wstring timeLine, dateLine;
+            FloatClockStrings(&timeLine, &dateLine);
+            const int shortSide = w < h ? w : h;
+            int bigPx = shortSide * 42 / 100;
+            if (bigPx < 18) bigPx = 18;
+            FloatDrawCaption(0, h / 2 - bigPx * 3 / 4, w, bigPx + 8, timeLine, bigPx, light);
+            const int smallPx = FloatCaptionFontPx(shortSide * 60 / 100);
+            FloatDrawCaption(0, h / 2 + bigPx / 3, w, smallPx + 8, dateLine, smallPx, light);
+            return;
+        }
+        // Weather: the data source is not wired up yet (user 2026-11-23: "天气只留接口"), so the
+        // tile says so instead of showing a made-up temperature.
+        const int shortSide = w < h ? w : h;
+        const int px = FloatCaptionFontPx(shortSide * 55 / 100) + 4;
+        FloatDrawCaption(0, h / 2 - px, w, px * 2, L"—°", px * 2, light);
+        FloatDrawCaption(0, h / 2 + px / 2, w, px + 6, L"天气（未接数据）", px, light);
+        return;
+    }
+
+    RECT cells[64];
+    const int n = FloatLayoutCells(c, cells, 64, c.itemPage);
+    const int icon = FloatIconPx(c);
+    const int capPx = FloatCaptionFontPx(icon);
+    std::wstring clockTime, clockDate;
+    bool clockRead = false;
+    for (int i = 0; i < n; i++) {
+        FloatItem& it = c.items[c.itemPage + i];
+        const RECT& cell = cells[i];
+        if (c.itemHover == c.itemPage + i) {
+            RECT hl{cell.left - 4, cell.top - 2, cell.right + 4, cell.top + icon + 4};
+            FillRound(c.dc, hl, 8, ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
+        }
+        if (it.kind == kItemClock) {
+            // A clock tile: the time on the icon's line, the date where the caption goes.
+            if (!clockRead) {
+                FloatClockStrings(&clockTime, &clockDate);
+                clockRead = true;
+            }
+            int tp = icon * 42 / 100;
+            if (tp < 12) tp = 12;
+            FloatDrawCaption(cell.left - 6, cell.top + (icon - tp) / 2, icon + 12, tp + 6,
+                             clockTime, tp, light);
+            FloatDrawCaption(cell.left - 6, cell.top + icon + 3, icon + 12, capPx + 6, clockDate,
+                             capPx, light);
+            continue;
+        }
+        if (it.kind == kItemWeather) {
+            FloatDrawCaption(cell.left - 6, cell.top, icon + 12, icon, L"—°", capPx * 2, light);
+            continue;
+        }
+        FloatItemEnsureIcon(it, icon);
+        if (!it.px.empty()) BlendPremul(cell.left, cell.top, icon, icon, it.px.data());
+        if (c.captionOn && !it.label.empty()) {
+            FloatDrawCaption(cell.left - 6, cell.top + icon + 3, icon + 12, capPx + 6, it.label,
+                             capPx, light);
+        }
+    }
+    // More items than cells: a page indicator in the bottom-right corner.
+    const int cols = FloatGridCols(c, icon), rows = FloatGridRows(c, icon);
+    if ((int)c.items.size() > cols * rows) {
+        wchar_t b[32];
+        swprintf_s(b, L"%d/%d", c.itemPage / (cols * rows) + 1,
+                   ((int)c.items.size() + cols * rows - 1) / (cols * rows));
+        DrawTextAlpha(w - 60, h - 20, 54, 16, b, 12, light ? 0x80000000 : 0x80FFFFFF, true);
+    }
+}
+
+static int FloatItemAt(const Companion& c, POINT pt) {
+    RECT cells[64];
+    const int n = FloatLayoutCells(c, cells, 64, c.itemPage);
+    for (int i = 0; i < n; i++)
+        if (PtInRect(&cells[i], pt)) return c.itemPage + i;
+    return -1;
+}
+
+static std::wstring FloatItemTip(const Companion& c, int idx) {
+    if (idx < 0 || idx >= (int)c.items.size()) return L"";
+    const FloatItem& it = c.items[idx];
+    if (it.kind == kItemClock) {
+        std::wstring timeLine, dateLine;
+        FloatClockStrings(&timeLine, &dateLine);
+        return timeLine + L"  " + dateLine;
+    }
+    if (it.kind == kItemWeather) return L"天气（还没有数据源）";
+    if (it.kind == kItemFolder) return it.path;
+    return it.path;
+}
+
+static void FloatItemActivate(Companion& c, int idx) {
+    if (idx < 0 || idx >= (int)c.items.size()) return;
+    const FloatItem& it = c.items[idx];
+    if (it.kind == kItemClock || it.kind == kItemWeather) return;
+    if (it.path.empty()) return;
+    DLog(L"float: open id=%d idx=%d kind=%d path=%s", c.id, idx, it.kind, it.path.c_str());
+    ShellExecuteW(nullptr, L"open", it.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Does the content need a repaint on its own (no user input)? The clock does, once a second.
+static bool FloatContentTick(Companion& c, DWORD now) {
+    for (const FloatItem& it : c.items) {
+        if (it.kind != kItemClock) continue;
+        if (!c.contentAt || now - c.contentAt >= 1000) {
+            c.contentAt = now;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 static void CompanionSave(Companion& c) {
     if (g_iniPath.empty()) return;
     wchar_t b[32];
     swprintf_s(b, L"%d", c.rc.left);
-    WritePrivateProfileStringW(c.iniSection, L"x", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"x", b, g_iniPath.c_str());
     swprintf_s(b, L"%d", c.rc.top);
-    WritePrivateProfileStringW(c.iniSection, L"y", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"y", b, g_iniPath.c_str());
     swprintf_s(b, L"%d", c.rc.right - c.rc.left);
-    WritePrivateProfileStringW(c.iniSection, L"w", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"w", b, g_iniPath.c_str());
     swprintf_s(b, L"%d", c.rc.bottom - c.rc.top);
-    WritePrivateProfileStringW(c.iniSection, L"h", b, g_iniPath.c_str());
-    WritePrivateProfileStringW(c.iniSection, L"hasPos", L"1", g_iniPath.c_str());
-    WritePrivateProfileStringW(c.iniSection, L"follow", c.follow ? L"1" : L"0",
-                               g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"h", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"hasPos", L"1", g_iniPath.c_str());
+    WritePrivateProfileStringW(c.sec, L"follow", c.follow ? L"1" : L"0", g_iniPath.c_str());
     swprintf_s(b, L"%d", c.groupId);
-    WritePrivateProfileStringW(c.iniSection, L"group", b, g_iniPath.c_str());
-    DLog(L"tray bar: saved %ld,%ld %ldx%ld (follow=%d group=%d)", (long)c.rc.left,
-         (long)c.rc.top, (long)(c.rc.right - c.rc.left), (long)(c.rc.bottom - c.rc.top),
-         (int)c.follow, c.groupId);
+    WritePrivateProfileStringW(c.sec, L"group", b, g_iniPath.c_str());
+    DLog(L"float: saved id=%d [%s] %ld,%ld %ldx%ld (follow=%d group=%d)", c.id, c.sec,
+         (long)c.rc.left, (long)c.rc.top, (long)(c.rc.right - c.rc.left),
+         (long)(c.rc.bottom - c.rc.top), (int)c.follow, c.groupId);
 }
 
 // Called from SavePosition(): the attached windows moved with the strip, so their stored
 // position has to follow, otherwise a restart would put them back where the strip used to be.
+// Only the *following* windows move with the strip; an independent one stays where the user put it.
 static void CompanionSaveAllPositions() {
-    if (!g_trayBar.hwnd || !g_trayBar.enabled) return;
-    CompanionSave(g_trayBar);
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || !c.follow) continue;
+        CompanionSave(c);
+    }
 }
 
 // The ini is read with the same helpers the strip uses (GetInt), so the semantics match.
+// `c.sec` and `c.id`/`c.content` are set by the caller (the tray's section is [traybar]).
 static void CompanionLoad(Companion& c) {
-    c.enabled = GetInt(c.iniSection, L"enabled", 1) != 0;
-    c.follow = GetInt(c.iniSection, L"follow", 1) != 0;
+    const wchar_t* sec = c.sec;
+    c.enabled = GetInt(sec, L"enabled", 1) != 0;
+    c.follow = GetInt(sec, L"follow", 1) != 0;
     // G2: the group id is the real assignment; `follow` is kept for older builds and for the
     // common case (1 = default group, 0 = independent). No `group` key -> derive from `follow`.
     int defGroup = c.follow ? 1 : 0;
-    c.groupId = GetInt(c.iniSection, L"group", defGroup);
+    c.groupId = GetInt(sec, L"group", defGroup);
     if (c.groupId < 0) c.groupId = 0;
     if (c.groupId > kMaxGroups) c.groupId = kMaxGroups;
     c.follow = (c.groupId == 1);
-    // Style overrides (R4): absent (or negative) means "inherit the strip's style".
-    c.padOv = GetInt(c.iniSection, L"pad", -1);
-    c.gapOv = GetInt(c.iniSection, L"gap", -1);
-    c.radiusOv = GetInt(c.iniSection, L"radius", -1);
-    c.snapOv = GetInt(c.iniSection, L"snap", -1);
-    // task 5: which z band this window lives in (0 = topmost, 1 = just above the desktop)
-    c.band = GetInt(c.iniSection, L"band", 0) != 0 ? 1 : 0;
+    // Style overrides (R4): absent (or negative) means "inherit the strip's style". A [float.N]
+    // window stores absolute numbers (see CompanionNew), so it never sees a -1 here.
+    c.padOv = GetInt(sec, L"pad", -1);
+    c.gapOv = GetInt(sec, L"gap", -1);
+    c.radiusOv = GetInt(sec, L"radius", -1);
+    c.snapOv = GetInt(sec, L"snap", -1);
+    // task 5: which z band this window lives in (0 = topmost, 1 = just above the desktop).
+    // A user float window defaults to the bottom band: it lives on the desktop.
+    c.band = GetInt(sec, L"band", c.id ? 1 : 0) != 0 ? 1 : 0;
+    // The window's own 色调 (empty = the strip's tone).
+    {
+        std::wstring hs = GetStr(sec, L"hue");
+        c.hasHue = !hs.empty();
+        c.hue = c.hasHue ? (ParseHexRgb(hs, g_hueStrip) & 0x00FFFFFFu) : 0;
+    }
+    // The window's own glass parameters. -1 = inherit the strip's (the tray's old semantics);
+    // a [float.N] window writes absolute values.
+    c.glassCfg.blurRadius = GetGlassInt(sec, L"blurRadius", g_glassStrip.blurRadius, 0, 64);
+    c.glassCfg.tintStrength = GetGlassInt(sec, L"tintStrength", g_glassStrip.tintStrength, 0, 255);
+    c.glassCfg.glassOpacity = GetGlassInt(sec, L"glassOpacity", g_glassStrip.glassOpacity, 0, 255);
+    // The item grid (only for a generic window; the tray draws its three cells itself).
+    c.iconPxOv = GetInt(sec, L"iconSize", -1);
+    c.captionOn = GetInt(sec, L"caption", 1) != 0;
+    c.itemPage = 0;
+    c.itemHover = -1;
+    if (c.content == kContentItems) FloatItemsLoad(c);
+    else c.items.clear();
 
     int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
     if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
     int pad = CompanionPad(c), gap = CompanionGap(c);
+    // The tray's natural size is "three cells in a row"; a generic window's is a 3x2 grid.
     int defW = kTrayCellCount * (icon + gap) - gap + pad * 2;
     int defH = icon + pad * 2;
+    if (c.content == kContentItems) {
+        const int iw = FloatIconPx(c);
+        defW = 3 * (iw + gap) - gap + pad * 2;
+        defH = 2 * (FloatCellH(c, iw) + gap) - gap + pad * 2;
+    }
 
-    int w = GetInt(c.iniSection, L"w", defW);
-    int h = GetInt(c.iniSection, L"h", defH);
+    int w = GetInt(sec, L"w", defW);
+    int h = GetInt(sec, L"h", defH);
     if (w < 40) w = 40;
     if (h < 40) h = 40;
 
@@ -4603,11 +5077,11 @@ static void CompanionLoad(Companion& c) {
     GetWindowRect(g_hwnd, &sr);
     int defX = sr.right - w;
     int defY = sr.bottom + 8;
-    int x = GetInt(c.iniSection, L"x", defX);
-    int y = GetInt(c.iniSection, L"y", defY);
+    int x = GetInt(sec, L"x", defX);
+    int y = GetInt(sec, L"y", defY);
     c.rc = RECT{x, y, x + w, y + h};
-    DLog(L"tray bar: loaded %ld,%ld %dx%d (follow=%d enabled=%d)", (long)x, (long)y, w, h,
-         (int)c.follow, (int)c.enabled);
+    DLog(L"float: loaded id=%d [%s] %ld,%ld %dx%d (follow=%d enabled=%d band=%d group=%d)",
+         c.id, sec, (long)x, (long)y, w, h, (int)c.follow, (int)c.enabled, c.band, c.groupId);
 }
 
 // ---- task 3: the snap (贴边方角) for a float window --------------------------------------
@@ -4641,7 +5115,7 @@ static void CompanionSnapUpdate(Companion& c) {
     }
     if (changed)
         DLog(L"snap: %s corners TL=%.0f TR=%.0f BL=%.0f BR=%.0f rect=%ld,%ld-%ld,%ld on=%d",
-             c.iniSection, t[0], t[1], t[2], t[3], (long)c.rc.left, (long)c.rc.top,
+             c.sec, t[0], t[1], t[2], t[3], (long)c.rc.left, (long)c.rc.top,
              (long)c.rc.right, (long)c.rc.bottom, CompanionSnapOn(c));
 }
 
@@ -4787,14 +5261,12 @@ static void TrayRepaint(Companion& c) {
     // would sit on top of the desktop behind it is H3's work.
     DWORD bgFill = 0x0AFFFFFF;
     {
-        int bgMode = GetInt(L"traybar", L"bgMode", -1);
-        if (bgMode < 0 || bgMode > 2) bgMode = g_cfg.bgMode;
+        const int bgMode = CompanionBgMode(c);
         if (bgMode == 2) {
-            int a = GetInt(L"traybar", L"solidOpacity", -1);
-            if (a < 0) a = g_cfg.solidOpacity;
+            int a = CompanionSolidAlpha(c);
             if (a > 255) a = 255;
             if (a < 3) a = 3;
-            bgFill = ((DWORD)a << 24) | (g_hue[1] & 0x00FFFFFFu);   // the window's 色调
+            bgFill = ((DWORD)a << 24) | (CompanionHue(c) & 0x00FFFFFFu);   // the window's 色调
         }
     }
     FillRound4F(all, RadiusForPercent(all.right, all.bottom, CompanionRadiusPercent(c)),
@@ -4805,28 +5277,32 @@ static void TrayRepaint(Companion& c) {
     if (CompanionUsesGlass(c)) CompanionPaintGlass(c);
     else if (CompanionBgMode(c) == 1) {
         // picture background: fill the rounded rect from the cached picture
-        if (EnsureImage(g_imgTray, ImagePathFor(L"traybar"), c.dibW, c.dibH, 1)) {
+        const bool glassOn = CompanionHasGlassLayer(c);
+        if (EnsureImage(c.img, ImagePathFor(c.sec), c.dibW, c.dibH, c.glassCfg, glassOn)) {
             EnsureFloatMask(c.dibW, c.dibH,
                             RadiusForPercent(c.dibW, c.dibH, CompanionRadiusPercent(c)),
                             c.snapAnim);
-            PaintImageBg(g_imgTray, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), g_hue[1], g_glass[1]);
+            PaintImageBg(c.img, c.dibW, c.dibH, g_fltCov.data(), g_fltRim.data(), CompanionHue(c),
+                         c.glassCfg, glassOn);
         }
     }
 
-    RECT cells[kTrayCellCount];
-    TrayCells(c, cells);
-    int icon = CompanionIconPx(c);
-
-    for (int i = 0; i < kTrayCellCount; i++) {
-        const RECT& cellRect = cells[i];
-        if (i == c.hoverCell) {
-            FillRound(c.dc, cellRect, RadiusFor(cellRect.right - cellRect.left,
-                                                cellRect.bottom - cellRect.top) / 2 + 2,
-                      ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
+    if (c.content == kContentTray) {
+        RECT cells[kTrayCellCount];
+        TrayCells(c, cells);
+        for (int i = 0; i < kTrayCellCount; i++) {
+            const RECT& cellRect = cells[i];
+            if (i == c.hoverCell) {
+                FillRound(c.dc, cellRect, RadiusFor(cellRect.right - cellRect.left,
+                                                    cellRect.bottom - cellRect.top) / 2 + 2,
+                          ((DWORD)g_cfg.hoverAlpha << 24) | 0x00FFFFFF);
+            }
+            wchar_t glyph = (i == 0) ? TrayGlyphNet() : (i == 1) ? TrayGlyphVolume()
+                                                                 : TrayGlyphBattery();
+            DrawGlyphInCell(cellRect, glyph, 0xE8FFFFFF, 0.78f);
         }
-        wchar_t glyph = (i == 0) ? TrayGlyphNet() : (i == 1) ? TrayGlyphVolume()
-                                                             : TrayGlyphBattery();
-        DrawGlyphInCell(cellRect, glyph, 0xE8FFFFFF, 0.78f);
+    } else {
+        FloatContentPaint(c);
     }
 
     g_paintBits = savePaint;
@@ -4851,6 +5327,9 @@ static void CompanionTooltipEnsure(Companion& c) {
     // layout first and fall back to the full one.
     RECT cells[kTrayCellCount];
     TrayCells(c, cells);
+    const RECT anchor = (c.content == kContentTray) ? cells[0]
+                                                    : RECT{0, 0, c.dibW ? c.dibW : 40,
+                                                           c.dibH ? c.dibH : 40};
     const int sizes[] = {(int)TTTOOLINFOW_V1_SIZE, (int)sizeof(TOOLINFOW)};
     for (int size : sizes) {
         c.tipInfo = TOOLINFOW{};
@@ -4858,7 +5337,7 @@ static void CompanionTooltipEnsure(Companion& c) {
         c.tipInfo.uFlags = TTF_TRACK | TTF_ABSOLUTE;
         c.tipInfo.hwnd = c.hwnd;
         c.tipInfo.uId = 0x51;
-        c.tipInfo.rect = cells[0];
+        c.tipInfo.rect = anchor;
         c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
         SetLastError(0);
         LRESULT added = SendMessageW(c.tipWnd, TTM_ADDTOOLW, 0, (LPARAM)&c.tipInfo);
@@ -4920,6 +5399,35 @@ static void CompanionTooltipShow(Companion& c, int cell) {
         logged++;
         DLog(L"tray bar: tooltip cell=%d text='%s' at %ld,%ld track=%ld", cell, text.c_str(),
              (long)pt.x, (long)pt.y, (long)on);
+    }
+}
+
+// Tooltip for one item of a generic float window: the full path (a folder's full path is what the
+// caption cannot show - user 2026-11-23), or the time for the clock tile.
+static void FloatTipShow(Companion& c, int idx) {
+    if (!c.tipWnd) return;
+    if (idx < 0) {
+        c.tipInfo.lpszText = const_cast<LPWSTR>(L"");
+        SendMessageW(c.tipWnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&c.tipInfo);
+        SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(-4000, -4000));
+        return;
+    }
+    static std::wstring text;
+    text = FloatItemTip(c, idx);
+    if (text.empty()) return;
+    c.tipInfo.lpszText = const_cast<LPWSTR>(text.c_str());
+    SendMessageW(c.tipWnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&c.tipInfo);
+    RECT cells[64];
+    const int n = FloatLayoutCells(c, cells, 64, c.itemPage);
+    POINT pt{c.rc.left + 20, c.rc.top + 20};
+    const int i = idx - c.itemPage;
+    if (i >= 0 && i < n) {
+        pt.x = c.rc.left + (cells[i].left + cells[i].right) / 2;
+        pt.y = c.rc.top + cells[i].bottom + 6;
+    }
+    SendMessageW(c.tipWnd, TTM_TRACKPOSITION, 0, MAKELPARAM(pt.x, pt.y));
+    if (!c.tipActive) {
+        if (SendMessageW(c.tipWnd, TTM_TRACKACTIVATE, TRUE, (LPARAM)&c.tipInfo)) c.tipActive = true;
     }
 }
 
@@ -5096,7 +5604,7 @@ static void GroupLoad(Group& g) {
     {
         std::wstring hs = GetStr(sec, L"hue");
         g.hasHue = !hs.empty();
-        if (g.hasHue) g.hue = ParseHexRgb(hs, g_hue[0]) & 0x00FFFFFFu;
+        if (g.hasHue) g.hue = ParseHexRgb(hs, g_hueStrip) & 0x00FFFFFFu;
     }
 }
 
@@ -5116,12 +5624,14 @@ static int GroupMembers(Group& g, GroupMember* out) {
         GetWindowRect(g_hwnd, &m.rc);
         out[n++] = m;
     }
-    if (g_trayBar.hwnd && g_trayBar.enabled && g_trayBar.groupId == g.id &&
-        n < kGroupMaxMembers) {
+    // Every live float window that belongs to this group (the strip is only ever in group 1).
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || c.groupId != g.id || n >= kGroupMaxMembers) continue;
         GroupMember m;
-        m.hwnd = g_trayBar.hwnd;
-        m.comp = &g_trayBar;
-        m.rc = g_trayBar.rc;     // the intended rect: the follow path keeps it in sync
+        m.hwnd = c.hwnd;
+        m.comp = &c;
+        m.rc = c.rc;             // the intended rect: the follow path keeps it in sync
         out[n++] = m;
     }
     return n;
@@ -5793,7 +6303,7 @@ static void HideWakePresent(Group& g, int alpha) {
     }
     if (!bmp || !bits) return;
     // the band's colour: the group's own 色调 when it has one, else the strip's tone
-    DWORD hue = (g.hasHue ? g.hue : g_hue[0]) & 0x00FFFFFFu;
+    DWORD hue = (g.hasHue ? g.hue : g_hueStrip) & 0x00FFFFFFu;
     // hue is 0x00RRGGBB (the convention every other 色调 site uses); the DIB word is 0xAARRGGBB,
     // so red goes in bits 16..23. Getting this backwards swaps red and blue - invisible for a
     // green tone, obvious for anything else (found 2026-11-22 by the two-hue band test).
@@ -6016,11 +6526,12 @@ static void AppendGroupMenuItems(HMENU menu, Group& g, bool withSettings) {
 // Moves every member of `g` back to the default group (only used for groups without the strip).
 static void GroupDissolve(Group& g) {
     if (g.id <= 1) return;
-    // Only the tray bar exists today; a second companion plugs in here (loop over companions).
-    if (g_trayBar.hwnd && g_trayBar.groupId == g.id) {
-        g_trayBar.groupId = 1;
-        g_trayBar.follow = true;
-        CompanionSave(g_trayBar);
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || c.groupId != g.id) continue;
+        c.groupId = 1;
+        c.follow = true;
+        CompanionSave(c);
     }
     GroupRecompute(g);           // now empty -> the frame goes away
     GroupRecompute(DefaultGroup());
@@ -6181,8 +6692,10 @@ static void GroupCreateAll() {
     }
     // How many ids are actually in use: the default group plus whatever the companions reference.
     g_groupCount = 1;
-    int maxId = g_trayBar.hwnd ? g_trayBar.groupId : 1;
-    if (maxId > g_groupCount) g_groupCount = maxId;
+    for (int i = 0; i < g_compCount; i++) {
+        if (!g_comps[i].hwnd) continue;
+        if (g_comps[i].groupId > g_groupCount) g_groupCount = g_comps[i].groupId;
+    }
     if (g_groupCount > kMaxGroups) g_groupCount = kMaxGroups;
     for (int i = 0; i < g_groupCount; i++) {
         Group& g = g_groups[i];
@@ -6225,21 +6738,36 @@ static void CompanionMoveToGroup(Companion& c, int id) {
 // First id > 1 that has no member yet, else 0 (menu refuses).
 static int NewGroupId() {
     for (int id = 2; id <= kMaxGroups; id++) {
-        bool taken = (g_trayBar.hwnd && g_trayBar.enabled && g_trayBar.groupId == id);
+        bool taken = false;
+        for (int i = 0; i < g_compCount && !taken; i++)
+            if (g_comps[i].hwnd && g_comps[i].enabled && g_comps[i].groupId == id) taken = true;
         if (!taken) return id;
     }
     return 0;
 }
 
 // ---------------------------------------------------------------- companion menu (R4/G2)
-// Right-click on the tray bar: its own settings + which group it belongs to (G2). Everything
-// here takes effect immediately and is written to the ini, so a restart keeps it.
+// Right-click on a float window: its own settings, its content (a generic window only), the group
+// it belongs to (G2), and - for a user window - "delete". Everything here takes effect
+// immediately and is written to the ini, so a restart keeps it.
 // `显示组框` used to live here; since G1 it is the *group's* property (`显示边框线`).
 #define kCmdFollow 1
 #define kCmdSize 2
 #define kCmdSettings 4
 #define kCmdGroupBase 20          // 20 + id = "join group id" (1..kMaxGroups)
 #define kCmdGroupNew 30           // "move to a brand new group"
+#define kCmdAddShortcut 40
+#define kCmdAddFolder 45
+#define kCmdAddClock 41
+#define kCmdAddWeather 42
+#define kCmdClearItems 43
+#define kCmdDeleteWindow 44
+#define kCmdItemRemoveBase 100    // 100 + index = "remove this item"
+// The file picker for "添加快捷方式…" is modal and therefore runs from a queued message, never
+// from inside a mouse message (the picture buttons follow the same rule, see kSetMsgPickImage).
+static const UINT kSetMsgPickShortcut = WM_APP + 11;
+static const UINT kSetMsgPickFolder = WM_APP + 12;
+static int g_floatPickTarget = 0;
 static void CompanionShowMenu(Companion& c) {
     HMENU menu = CreatePopupMenu();
     Group* g = GroupById(c.groupId);
@@ -6248,6 +6776,7 @@ static void CompanionShowMenu(Companion& c) {
         RECT fr{};
         hasFrame = GroupBoxRect(*g, &fr);
     }
+    const bool userWin = (c.id > 0);
 
     // `组 ▸` — the assignment itself (the old "跟随条" tick became one entry of it).
     HMENU sub = CreatePopupMenu();
@@ -6262,7 +6791,33 @@ static void CompanionShowMenu(Companion& c) {
     AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(sub, MF_STRING, kCmdGroupNew, L"移到一个新组…");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, L"组");
-    AppendMenuW(menu, MF_STRING, kCmdSize, L"重置为默认尺寸（3 格）");
+    AppendMenuW(menu, MF_STRING, kCmdSize, c.content == kContentTray
+                                               ? L"重置为默认尺寸（3 格）"
+                                               : L"重置为默认尺寸");
+
+    if (userWin) {
+        // The content: add a shortcut (file picker), the clock, and "remove one" as a submenu.
+        // Dropping files onto the window does the same thing (see WM_DROPFILES).
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kCmdAddShortcut, L"添加快捷方式…");
+        AppendMenuW(menu, MF_STRING, kCmdAddFolder, L"添加文件夹…");
+        AppendMenuW(menu, MF_STRING, kCmdAddClock, L"添加时钟");
+        AppendMenuW(menu, MF_STRING, kCmdAddWeather, L"添加天气（未接数据）");
+        if (!c.items.empty()) {
+            HMENU rm = CreatePopupMenu();
+            for (int i = 0; i < (int)c.items.size() && i < 40; i++) {
+                std::wstring label = c.items[i].label;
+                if (label.empty()) {
+                    if (c.items[i].kind == kItemClock) label = L"时钟";
+                    else if (c.items[i].kind == kItemWeather) label = L"天气";
+                }
+                if (label.empty()) label = c.items[i].path;
+                AppendMenuW(rm, MF_STRING, kCmdItemRemoveBase + i, label.c_str());
+            }
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)rm, L"移除条目");
+            AppendMenuW(menu, MF_STRING, kCmdClearItems, L"清空全部条目");
+        }
+    }
     // A group with fewer than two members has no frame, so its settings are reachable from here
     // (user, 2026-11-16: "单成员组的组设置先叠加到成员的菜单里").
     if (g && !hasFrame) {
@@ -6270,7 +6825,8 @@ static void CompanionShowMenu(Companion& c) {
         AppendGroupMenuItems(menu, *g, false);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCmdSettings, L"Dock 设置…");
+    AppendMenuW(menu, MF_STRING, kCmdSettings, L"设置…");
+    if (userWin) AppendMenuW(menu, MF_STRING, kCmdDeleteWindow, L"删除这个浮窗");
     POINT sp{};
     GetCursorPos(&sp);
     g_popupOpen = true;
@@ -6280,28 +6836,59 @@ static void CompanionShowMenu(Companion& c) {
     DestroyMenu(menu);
     if (cmd <= 0) return;
     if (cmd == kCmdSize) {
-        int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
-        if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
-        int pad = CompanionPad(c), gap = CompanionGap(c);
-        int w = kTrayCellCount * (icon + gap) - gap + pad * 2;
-        int h = icon + pad * 2;
+        int w = 0, h = 0;
+        const int pad = CompanionPad(c), gap = CompanionGap(c);
+        if (c.content == kContentTray) {
+            int icon = g_cfg.iconSize < 40 ? 40 : g_cfg.iconSize;
+            if (icon > g_cfg.maxIcon) icon = g_cfg.maxIcon;
+            w = kTrayCellCount * (icon + gap) - gap + pad * 2;
+            h = icon + pad * 2;
+        } else {
+            const int icon = FloatIconPx(c);
+            w = 3 * (icon + gap) - gap + pad * 2;
+            h = 2 * (FloatCellH(c, icon) + gap) - gap + pad * 2;
+        }
         CompanionSetRect(c, c.rc.left, c.rc.top, w, h, true);
         CompanionSave(c);
         if (Group* gg = GroupById(c.groupId)) GroupRecompute(*gg);
-        DLog(L"tray bar: menu -> default size %dx%d", w, h);
+        DLog(L"float: menu -> default size id=%d %dx%d", c.id, w, h);
     } else if (cmd == kCmdSettings) {
-        ShowSettings(kObjCompanion, 0);
+        ShowSettings(kObjCompanion, c.id);
+    } else if (cmd == kCmdDeleteWindow) {
+        CompanionDelete(c);
+        return;
+    } else if (cmd == kCmdAddShortcut) {
+        // A modal dialog must never run inside a mouse message: queue it (same rule as the
+        // picture buttons, see kSetMsgPickImage).
+        g_floatPickTarget = c.id;
+        PostMessageW(c.hwnd, kSetMsgPickShortcut, 0, 0);
+    } else if (cmd == kCmdAddFolder) {
+        g_floatPickTarget = c.id;
+        PostMessageW(c.hwnd, kSetMsgPickFolder, 0, 0);
+    } else if (cmd == kCmdAddClock || cmd == kCmdAddWeather) {
+        FloatItemAdd(c, cmd == kCmdAddClock ? L"clock" : L"weather");
+    } else if (cmd == kCmdClearItems) {
+        c.items.clear();
+        c.itemHover = -1;
+        c.itemPage = 0;
+        FloatItemsSave(c);
+        c.glass.dirty = true;
+        TrayRepaint(c);
+        CompanionPresent(c);
+        if (Group* gg = GroupById(c.groupId)) GroupRecompute(*gg);
+    } else if (cmd >= kCmdItemRemoveBase && cmd < kCmdItemRemoveBase + 100) {
+        FloatItemRemove(c, cmd - kCmdItemRemoveBase);
     } else if (cmd == kCmdGroupNew) {
         int id = NewGroupId();
         if (id) {
             CompanionMoveToGroup(c, id);
-            DLog(L"tray bar: menu -> moved to a new group %d", id);
+            DLog(L"float: menu -> moved to a new group %d", id);
         } else {
-            DLog(L"tray bar: menu -> no free group id (max %d)", kMaxGroups);
+            DLog(L"float: menu -> no free group id (max %d)", kMaxGroups);
         }
     } else if (cmd >= kCmdGroupBase + 1 && cmd <= kCmdGroupBase + kMaxGroups) {
         CompanionMoveToGroup(c, cmd - kCmdGroupBase);
-        DLog(L"tray bar: menu -> group %d", c.groupId);
+        DLog(L"float: menu -> group %d", c.groupId);
     } else if (g && HandleGroupCommand(*g, cmd)) {
         // the appended group items of a single-member group
     }
@@ -6440,9 +7027,12 @@ static void CompanionVisibilityTick(DWORD now) {
             GroupPresent(g);     // a window re-shown after SW_HIDE keeps the alpha of its last
                                  // present, so assert it once with the current value
             if (g.id == 1) {
-                if (g_trayBar.hwnd)
-                    SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
+                for (int ci = 0; ci < g_compCount; ci++) {
+                    Companion& c = g_comps[ci];
+                    if (!c.hwnd || c.groupId != 1) continue;
+                    SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
                 if (g_hwnd)
                     SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -6458,58 +7048,68 @@ static void CompanionVisibilityTick(DWORD now) {
     }
 
     // ---- companions: alpha target + show/hide ----
-    Companion& c = g_trayBar;
-    // The companion shows its group's fade value (one fade for the whole group). A companion
-    // with no group at all (groupId 0) keeps its own distance fade.
-    Group* cg = GroupById(c.groupId);
-    int target = cg ? cg->fadeTarget : CompanionAlphaTarget(c, p);
-    bool wasVisible = c.visible;
-    c.visible = (target > 0);
-    if (c.visible && !wasVisible && c.hwnd) {
-        // Volume/power are cheap (a COM getter and a struct), so they are refreshed for the
-        // first frame on screen. The network state must NOT be re-queried here: that is an RPC
-        // into the WLAN service, and doing it on this path blocked the UI thread (and with it
-        // WH_MOUSE_LL) exactly when the pointer crossed into this window - the hitch the user
-        // reported on 2026-11-17, worse with glass on because the same frame also bakes. The
-        // worker thread is nudged instead; its answer lands a few ms later and is invisible.
-        c.stateAt = 0;
-        NetQueryNudge();
-        // While hidden we only moved the stored rect, so put the window where it belongs now -
-        // but only when it really is somewhere else: two SetWindowPos calls here cost ~4 ms in
-        // the frame the window appears, which is one more thing the pointer can feel.
-        RECT now{};
-        bool moved = !GetWindowRect(c.hwnd, &now) || now.left != c.rc.left || now.top != c.rc.top ||
-                     now.right - now.left != c.rc.right - c.rc.left ||
-                     now.bottom - now.top != c.rc.bottom - c.rc.top;
-        if (moved) {
-            // While the dock is yielding to a capture overlay this must be a plain move: a
-            // HWND_TOPMOST insert here would lift the companion back over the selection box
-            // (task 1 - "the dock pops up when the pointer wanders into the menus next to it").
-            SetWindowPos(c.hwnd, g_zMode == 1 ? nullptr : HWND_TOPMOST, c.rc.left, c.rc.top,
-                         c.rc.right - c.rc.left, c.rc.bottom - c.rc.top,
-                         SWP_NOACTIVATE | (g_zMode == 1 ? SWP_NOZORDER : 0u));
-        }
-        // and publish the anchor once (the flyout may be opened before the next move).
-        AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
-        // z-order: group frame < companion < strip. The frame asserts itself just above, so
-        // both of these are needed on every show (dropping them lets the frame paint over the
-        // companion).
-        SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        if (g_hwnd)
-            SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
+    // Every float window: the tray's rules, applied per instance. A window in the *bottom* band is
+    // part of the desktop picture - it never fades and never hides (user 2026-11-23); otherwise it
+    // shows its group's shared fade (or, with no group at all, its own distance fade).
+    for (int ci = 0; ci < g_compCount; ci++) {
+        Companion& c = g_comps[ci];
+        if (!c.hwnd) continue;
+        Group* cg = GroupById(c.groupId);
+        int target = c.band == 1 ? 255 : (cg ? cg->fadeTarget : CompanionAlphaTarget(c, p));
+        // A user window that is in no group is simply always on screen (it is a widget the user
+        // put somewhere, not a strip attachment). Only a window that joined a group fades with it.
+        if (c.id != 0 && !cg) target = 255;
+        if (!c.enabled) target = 0;
+        bool wasVisible = c.visible;
+        c.visible = (target > 0);
+        if (c.visible && !wasVisible) {
+            // Volume/power are cheap (a COM getter and a struct), so they are refreshed for the
+            // first frame on screen. The network state must NOT be re-queried here: that is an
+            // RPC into the WLAN service, and doing it on this path blocked the UI thread (and with
+            // it WH_MOUSE_LL) exactly when the pointer crossed into this window - the hitch the
+            // user reported on 2026-11-17, worse with glass on because the same frame also bakes.
+            // The worker thread is nudged instead; its answer lands a few ms later and is invisible.
+            c.stateAt = 0;
+            if (c.content == kContentTray) NetQueryNudge();
+            // While hidden we only moved the stored rect, so put the window where it belongs now -
+            // but only when it really is somewhere else: two SetWindowPos calls here cost ~4 ms in
+            // the frame the window appears, which is one more thing the pointer can feel.
+            RECT now{};
+            bool moved = !GetWindowRect(c.hwnd, &now) || now.left != c.rc.left ||
+                         now.top != c.rc.top || now.right - now.left != c.rc.right - c.rc.left ||
+                         now.bottom - now.top != c.rc.bottom - c.rc.top;
+            if (moved) {
+                // While the dock is yielding to a capture overlay this must be a plain move: a
+                // HWND_TOPMOST insert here would lift the companion back over the selection box
+                // (task 1 - "the dock pops up when the pointer wanders into the menus next to it").
+                SetWindowPos(c.hwnd, g_zMode == 1 ? nullptr : ZBandFor(c.hwnd), c.rc.left, c.rc.top,
+                             c.rc.right - c.rc.left, c.rc.bottom - c.rc.top,
+                             SWP_NOACTIVATE | (g_zMode == 1 ? SWP_NOZORDER : 0u));
+            }
+            // and publish the anchor once for the tray (the flyout may open before the next move).
+            if (c.id == 0) AnchorPublish(kAnchorQuickSettings, &c.rc, 8);
+            // z-order: group frame < companion < strip. The frame asserts itself just above, so
+            // both of these are needed on every show (dropping them lets the frame paint over the
+            // companion).
+            SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        // The visible pixels are (re)built here and not while hidden: see the note in
-        // TrayStateRefresh. ~1 ms, once per appearance.
-        TrayRepaint(c);
+            if (g_hwnd)
+                SetWindowPos(g_hwnd, ZBandFor(g_hwnd), 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // The visible pixels are (re)built here and not while hidden: see the note in
+            // TrayStateRefresh. ~1 ms, once per appearance.
+            TrayRepaint(c);
+        }
+        // Visible from the moment it should show until the fade has actually reached 0, so the
+        // fade-out is a fade instead of an instant disappearance (stepped in CompanionTick).
+        bool shouldBeVisible = (target > 0) || c.alpha > 0;
+        if ((IsWindowVisible(c.hwnd) != FALSE) != shouldBeVisible) {
+            ShowWindow(c.hwnd, shouldBeVisible ? SW_SHOWNOACTIVATE : SW_HIDE);
+            if (!shouldBeVisible && c.content == kContentTray) CompanionTooltipShow(c, -1);
+            else if (!shouldBeVisible) FloatTipShow(c, -1);
+        }
+        c.alphaTarget = target;
     }
-    // Visible from the moment it should show until the fade has actually reached 0, so the
-    // fade-out is a fade instead of an instant disappearance (stepped in CompanionTick).
-    bool shouldBeVisible = (target > 0) || c.alpha > 0;
-    if (c.hwnd && ((IsWindowVisible(c.hwnd) != FALSE) != shouldBeVisible)) {
-        ShowWindow(c.hwnd, shouldBeVisible ? SW_SHOWNOACTIVATE : SW_HIDE);
-        if (!shouldBeVisible) CompanionTooltipShow(c, -1);
-    }
-    c.alphaTarget = target;
     const double dVis = NowMs() - tEnter;
     if (dVis >= 3.0) DLog(L"slow: companion visibility tick %.1f ms", dVis);
 }
@@ -6552,23 +7152,27 @@ static void CompanionFollowTo(int stripX, int stripY) {
     // has to happen on this path (not on the 16 ms housekeeping gate) for the same reason the
     // companions do: the frame must land in the strip's composition, not a frame later.
     GroupTranslate(dg, dx, dy);
-    if (!g_trayBar.hwnd || !g_trayBar.enabled || g_trayBar.groupId != 1) return;
-    if (g_trayBar.dragging || g_trayBar.resizing) return;    // the pointer owns it right now
-    if (g_trayBar.alpha > 0) {
-        CompanionSetRect(g_trayBar, g_trayBar.rc.left + dx, g_trayBar.rc.top + dy,
-                         g_trayBar.rc.right - g_trayBar.rc.left,
-                         g_trayBar.rc.bottom - g_trayBar.rc.top, false);
-        g_companionFollowMoves++;
-    } else {
-        g_trayBar.rc.left += dx;
-        g_trayBar.rc.right += dx;
-        g_trayBar.rc.top += dy;
-        g_trayBar.rc.bottom += dy;
+    // Every member of the default group follows, the tray and any float window the user put
+    // there (user 2026-11-23: a float window may join the strip's group like the tray does).
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || c.groupId != 1) continue;
+        if (c.dragging || c.resizing) continue;    // the pointer owns it right now
+        if (c.alpha > 0) {
+            CompanionSetRect(c, c.rc.left + dx, c.rc.top + dy, c.rc.right - c.rc.left,
+                             c.rc.bottom - c.rc.top, false);
+            g_companionFollowMoves++;
+        } else {
+            c.rc.left += dx;
+            c.rc.right += dx;
+            c.rc.top += dy;
+            c.rc.bottom += dy;
+        }
     }
 }
 
 static void CompanionTick(DWORD now) {
-    if (!g_trayBar.hwnd) return;
+    if (!g_trayBar.hwnd && g_compCount <= 1) return;
 
     // 1. follow the strip - per frame from Present() while it is dragged; this tick only
     //    catches geometry that changed without a present (resize, snap, restore)
@@ -6596,34 +7200,37 @@ static void CompanionTick(DWORD now) {
         if (dState >= 3.0) DLog(L"slow: state+visibility %.1f ms", dState);
     }
 
-    // The companion's alpha *is* its group's fade value - no independent stepping, otherwise the
+    // A companion's alpha *is* its group's fade value - no independent stepping, otherwise the
     // strip (which takes the value straight away) and the companion drift apart while fading,
     // which is exactly what the user saw (2026-11-22). A companion with no group keeps the old
-    // eased behaviour.
-    Group* cFade = GroupById(g_trayBar.groupId);
-    int wantAlpha = cFade ? cFade->fadeNow : g_trayBar.alphaTarget;
-    if (!cFade && g_trayBar.alpha != g_trayBar.alphaTarget) {
-        int diff = g_trayBar.alphaTarget - g_trayBar.alpha;
-        int step = (int)(255 * 16 / 120);        // ~120 ms for a full fade at 60 fps
-        if (step < 1) step = 1;
-        if (diff > 0) g_trayBar.alpha += step < diff ? step : diff;
-        else g_trayBar.alpha += (-step) > diff ? -step : diff;
+    // eased behaviour (and a desktop window in the bottom band never fades at all).
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd) continue;
+        Group* cFade = GroupById(c.groupId);
+        int wantAlpha = cFade ? cFade->fadeNow : c.alphaTarget;
+        if (c.band == 1) wantAlpha = 255;      // a desktop window is always fully visible
+        if (!cFade && c.alpha != c.alphaTarget) {
+            int diff = c.alphaTarget - c.alpha;
+            int step = (int)(255 * 16 / 120);        // ~120 ms for a full fade at 60 fps
+            if (step < 1) step = 1;
+            if (diff > 0) c.alpha += step < diff ? step : diff;
+            else c.alpha += (-step) > diff ? -step : diff;
+        }
+        if (c.alpha != wantAlpha) {
+            if (c.id == 0) DLog(L"fade: tray %d -> %d", c.alpha, wantAlpha);
+            c.alpha = wantAlpha;
+            const double tPresent = NowMs();
+            CompanionPresent(c);
+            const double dPresent = NowMs() - tPresent;
+            if (dPresent >= 4.0) DLog(L"slow: companion fade present %.1f ms", dPresent);
+            // the window is hidden only once the fade has finished, see CompanionVisibilityTick
+            if (c.alpha == 0 && c.hwnd && IsWindowVisible(c.hwnd)) ShowWindow(c.hwnd, SW_HIDE);
+        }
+        // 2b. task 3: the snap (贴边方角). One animation step per frame, like the strip's
+        // AnimateCorners; a hidden window snaps instantly and costs nothing.
+        CompanionSnapTick(c, now);
     }
-    if (g_trayBar.alpha != wantAlpha) {
-        DLog(L"fade: tray %d -> %d", g_trayBar.alpha, wantAlpha);   // TEMP: shared group fade
-        g_trayBar.alpha = wantAlpha;
-        const double tPresent = NowMs();
-        CompanionPresent(g_trayBar);
-        const double dPresent = NowMs() - tPresent;
-        if (dPresent >= 4.0) DLog(L"slow: companion fade present %.1f ms", dPresent);
-        // the window is hidden only once the fade has finished, see CompanionVisibilityTick
-        if (g_trayBar.alpha == 0 && g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
-            ShowWindow(g_trayBar.hwnd, SW_HIDE);
-    }
-
-    // 2b. task 3: the snap (贴边方角). One animation step per frame, like the strip's
-    // AnimateCorners; a hidden window snaps instantly and costs nothing.
-    CompanionSnapTick(g_trayBar, now);
 
     // 3. every group's frame fades with its members, in the same steps
     for (int i = 0; i < g_groupCount; i++) {
@@ -6641,7 +7248,11 @@ static void CompanionTick(DWORD now) {
 
 // ---------------------------------------------------------------- window proc
 static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    Companion& c = g_trayBar;
+    // One class, many windows: the instance is the window's own user data (see
+    // CompanionCreateWindow). Before it is set (early messages) there is nothing to do.
+    Companion* pc = (Companion*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (!pc) return DefWindowProcW(h, msg, wp, lp);
+    Companion& c = *pc;
     switch (msg) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
@@ -6720,23 +7331,35 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
 
-            RECT cells[kTrayCellCount];
-            TrayCells(c, cells);
-            int hover = -1;
-            for (int i = 0; i < kTrayCellCount; i++)
-                if (PtInRect(&cells[i], pt)) { hover = i; break; }
-            if (hover != c.hoverCell) {
-                const double tHover = NowMs();
-                c.hoverCell = hover;
-                TrayRepaint(c);
-                const double tPaint = NowMs();
-                CompanionPresent(c);
-                const double tPres = NowMs();
-                CompanionTooltipShow(c, hover);
-                const double tTip = NowMs();
-                if (tTip - tHover >= 3.0) {
-                    DLog(L"slow: companion hover cell=%d paint %.1f, present %.1f, tooltip %.1f ms",
-                         hover, tPaint - tHover, tPres - tPaint, tTip - tPres);
+            if (c.content == kContentTray) {
+                RECT cells[kTrayCellCount];
+                TrayCells(c, cells);
+                int hover = -1;
+                for (int i = 0; i < kTrayCellCount; i++)
+                    if (PtInRect(&cells[i], pt)) { hover = i; break; }
+                if (hover != c.hoverCell) {
+                    const double tHover = NowMs();
+                    c.hoverCell = hover;
+                    TrayRepaint(c);
+                    const double tPaint = NowMs();
+                    CompanionPresent(c);
+                    const double tPres = NowMs();
+                    CompanionTooltipShow(c, hover);
+                    const double tTip = NowMs();
+                    if (tTip - tHover >= 3.0) {
+                        DLog(L"slow: companion hover cell=%d paint %.1f, present %.1f, tooltip "
+                             L"%.1f ms",
+                             hover, tPaint - tHover, tPres - tPaint, tTip - tPres);
+                    }
+                }
+            } else {
+                // The item grid: hover highlights one cell and shows its full path.
+                const int hover = FloatItemAt(c, pt);
+                if (hover != c.itemHover) {
+                    c.itemHover = hover;
+                    TrayRepaint(c);
+                    CompanionPresent(c);
+                    FloatTipShow(c, hover);
                 }
             }
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
@@ -6745,13 +7368,41 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_MOUSELEAVE:
-            if (c.hoverCell != -1) {
-                c.hoverCell = -1;
+            if (c.content == kContentTray) {
+                if (c.hoverCell != -1) {
+                    c.hoverCell = -1;
+                    TrayRepaint(c);
+                    CompanionPresent(c);
+                    CompanionTooltipShow(c, -1);
+                }
+            } else if (c.itemHover != -1) {
+                c.itemHover = -1;
                 TrayRepaint(c);
                 CompanionPresent(c);
-                CompanionTooltipShow(c, -1);
+                FloatTipShow(c, -1);
             }
             return 0;
+
+        case WM_DROPFILES: {
+            // Drop files / folders / shortcuts onto the window: each one becomes an item
+            // (user 2026-11-23). A window that does not show the grid (the tray) ignores it.
+            HDROP drop = (HDROP)wp;
+            if (c.content != kContentItems) {
+                DragFinish(drop);
+                return 0;
+            }
+            const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; i++) {
+                wchar_t path[MAX_PATH * 2]{};
+                if (!DragQueryFileW(drop, i, path, (UINT)(sizeof(path) / sizeof(path[0])))) continue;
+                FloatItemAdd(c, path);
+            }
+            DragFinish(drop);
+            DLog(L"float: dropped %u path(s) on id=%d -> %d item(s)", n, c.id,
+                 (int)c.items.size());
+            SetForegroundWindow(h);      // the drop already gave us the foreground normally
+            return 0;
+        }
 
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
@@ -6797,13 +7448,20 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (c.pressActive) {
                 c.pressActive = false;
                 ReleaseCapture();
-                // Anywhere in the tray bar opens the same panel (user, 2026-11-15)
-                RECT r = c.rc;
-                AnchorPublish(kAnchorQuickSettings, &r, 8);
-                QuickSettingsBeginPlacement(r);       // remember the screen before it opens
-                const BYTE chord[] = {VK_LWIN, 'A'};
-                DLog(L"tray bar: click -> quick settings (win+a)");
-                SendChord(chord, 2);
+                if (c.content == kContentTray) {
+                    // Anywhere in the tray bar opens the same panel (user, 2026-11-15)
+                    RECT r = c.rc;
+                    AnchorPublish(kAnchorQuickSettings, &r, 8);
+                    QuickSettingsBeginPlacement(r);       // remember the screen before it opens
+                    const BYTE chord[] = {VK_LWIN, 'A'};
+                    DLog(L"tray bar: click -> quick settings (win+a)");
+                    SendChord(chord, 2);
+                } else {
+                    // A generic window: a click on an item opens it, a click on the background
+                    // does nothing (the drag path already handled moving the window).
+                    POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                    FloatItemActivate(c, FloatItemAt(c, pt));
+                }
                 return 0;
             }
             return 0;
@@ -6821,9 +7479,32 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // Careful: WM_MOUSEWHEEL's point is in *screen* coordinates, unlike the buttons.
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(h, &p);
+            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            if (delta == 0) return 0;
+            int notches = delta / WHEEL_DELTA;
+            if (notches == 0) notches = delta > 0 ? 1 : -1;
+            if (c.content != kContentTray) {
+                // Over the item grid the wheel pages through the items the window cannot show at
+                // once (same idea as the strip's wheel paging).
+                const int icon = FloatIconPx(c);
+                const int perPage = FloatGridCols(c, icon) * FloatGridRows(c, icon);
+                const int total = (int)c.items.size();
+                if (total > perPage) {
+                    int page = c.itemPage + notches * perPage;
+                    if (page < 0) page = 0;
+                    if (page > total - 1) page = ((total - 1) / perPage) * perPage;
+                    if (page != c.itemPage) {
+                        c.itemPage = page;
+                        c.itemHover = -1;
+                        TrayRepaint(c);
+                        CompanionPresent(c);
+                        DLog(L"float: wheel id=%d page=%d (%d items)", c.id, page, total);
+                    }
+                }
+                return 0;
+            }
             RECT cells[kTrayCellCount];
             TrayCells(c, cells);
-            int delta = GET_WHEEL_DELTA_WPARAM(wp);
             {
                 // First few wheels are logged: "the wheel never arrives" and "the point is
                 // outside the volume cell" look identical from the outside.
@@ -6834,9 +7515,7 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                          delta, (long)p.x, (long)p.y, (int)(PtInRect(&cells[1], p) != FALSE));
                 }
             }
-            if (delta == 0 || !PtInRect(&cells[1], p)) break;   // volume cell only
-            int notches = delta / WHEEL_DELTA;
-            if (notches == 0) notches = delta > 0 ? 1 : -1;
+            if (!PtInRect(&cells[1], p)) break;   // volume cell only
             int step = notches * kTrayVolumeStep;
             // Scrolling up while muted is a request to hear something: leave mute first,
             // otherwise the wheel looks broken.
@@ -6885,70 +7564,315 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+// Create the Win32 window for one float window (the tray's window lives in the same class, but
+// under its own class name so the existing probes keep finding it; a user window is
+// `DockFloatWindow` titled "dock float N").
+static void CompanionRegisterClasses() {
+    static bool registered = false;
+    if (registered) return;
+    registered = true;
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = CompanionProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"DockTrayBarWindow";
+    RegisterClassExW(&wc);
+    wc.lpszClassName = L"DockFloatWindow";
+    RegisterClassExW(&wc);
+}
+
+static void CompanionCreateWindow(Companion& c) {
+    CompanionRegisterClasses();
+    const int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
+    // A bottom-band window is created without WS_EX_TOPMOST (it must never be topmost).
+    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+    if (c.band != 1) exStyle |= WS_EX_TOPMOST;
+    wchar_t cls[24], title[32];
+    if (c.id == 0) {
+        wcscpy_s(cls, L"DockTrayBarWindow");
+        wcscpy_s(title, L"dock tray bar");
+    } else {
+        wcscpy_s(cls, L"DockFloatWindow");
+        swprintf_s(title, L"dock float %d", c.id);
+    }
+    c.hwnd = CreateWindowExW(exStyle, cls, title, WS_POPUP, c.rc.left, c.rc.top, w, h, nullptr,
+                             nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!c.hwnd) {
+        DLog(L"float: CreateWindowEx failed id=%d err=%lu", c.id, (unsigned long)GetLastError());
+        return;
+    }
+    // The window proc finds its Companion through the window's own user data (one class, many
+    // instances) - the group frame uses the same trick with the group id.
+    SetWindowLongPtrW(c.hwnd, GWLP_USERDATA, (LONG_PTR)&c);
+    c.alpha = 0;
+    c.alphaTarget = 0;
+    CompanionEnsureDib(c, w, h);
+    c.stateAt = 0;
+    if (c.content == kContentTray) {
+        NetQueryStart();                     // the WLAN query has to stay off the UI thread
+        NetQueryNudge();
+        TrayStateRefresh(GetTickCount());    // real state first, so the first paint is correct
+    }
+    TrayRepaint(c);
+    CompanionPresent(c);
+    CompanionTooltipEnsure(c);       // every window can show a tooltip (path / time / state)
+    // A desktop window is visible on the wallpaper, not only while the pointer is on the strip.
+    if (c.band == 1) {
+        c.alpha = c.alphaTarget = 255;
+        ShowWindow(c.hwnd, SW_SHOWNOACTIVATE);
+        CompanionPresent(c);
+        SetWindowPos(c.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    } else {
+        ShowWindow(c.hwnd, SW_HIDE);
+        if (c.id != 0) {                     // a topmost user window: make it visible right away
+            c.alpha = c.alphaTarget = 255;
+            ShowWindow(c.hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            CompanionPresent(c);
+        }
+    }
+    // Drag & drop: a user window takes files/folders/apps dropped onto it (user 2026-11-23).
+    if (c.id != 0) DragAcceptFiles(c.hwnd, TRUE);
+    DLog(L"float: created id=%d [%s] %ld,%ld %dx%d band=%d content=%d items=%d group=%d", c.id,
+         c.sec, (long)c.rc.left, (long)c.rc.top, w, h, c.band, c.content, (int)c.items.size(),
+         c.groupId);
+    DLog(L"float: style id=%d pad=%d gap=%d radius=%d%% -> corner %d px (overrides pad=%d gap=%d "
+         L"radius=%d)",
+         c.id, CompanionPad(c), CompanionGap(c), CompanionRadiusPercent(c),
+         RadiusForPercent(w, h, CompanionRadiusPercent(c)), c.padOv, c.gapOv, c.radiusOv);
+}
+
 static void CompanionCreate() {
     Companion& c = g_trayBar;
+    c.id = 0;
+    c.content = kContentTray;
+    wcscpy_s(c.sec, L"traybar");
     CompanionLoad(c);
     // task 3: start already snapped - the first paint must not show rounded corners on an edge
     // the window has been hugging since the last session.
     CompanionSnapUpdate(c);
     for (int i = 0; i < 4; i++) c.snapAnim[i] = c.snapTarget[i];
     if (!c.enabled) return;
-
-    static bool registered = false;
-    if (!registered) {
-        registered = true;
-        WNDCLASSEXW wc{sizeof(wc)};
-        wc.lpfnWndProc = CompanionProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpszClassName = L"DockTrayBarWindow";
-        RegisterClassExW(&wc);
-    }
-
-    int w = c.rc.right - c.rc.left, h = c.rc.bottom - c.rc.top;
-    // task 5: a bottom-band window is created without WS_EX_TOPMOST (it must never be topmost)
-    DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
-    if (c.band != 1) exStyle |= WS_EX_TOPMOST;
-    c.hwnd = CreateWindowExW(exStyle,
-                             L"DockTrayBarWindow", L"dock tray bar", WS_POPUP, c.rc.left,
-                             c.rc.top, w, h, nullptr, nullptr, GetModuleHandleW(nullptr),
-                             nullptr);
-    if (!c.hwnd) {
-        DLog(L"tray bar: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
-        return;
-    }
-    c.alpha = 0;
-    c.alphaTarget = 0;
-    CompanionEnsureDib(c, w, h);
-    c.stateAt = 0;
-    NetQueryStart();                     // the WLAN query has to stay off the UI thread
-    NetQueryNudge();
-    TrayStateRefresh(GetTickCount());    // real state first, so the first paint is correct
-    TrayRepaint(c);
-    CompanionPresent(c);
-    CompanionTooltipEnsure(c);
-    ShowWindow(c.hwnd, SW_HIDE);
-    // task 5: drop it to the bottom of the normal band right away (it was created without
-    // WS_EX_TOPMOST, but a new window starts near the top of its band)
-    if (c.band == 1)
-        SetWindowPos(c.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    DLog(L"tray bar: band=%d", c.band);
+    CompanionCreateWindow(c);
+    if (!c.hwnd) return;
     RECT r = c.rc;
     AnchorPublish(kAnchorQuickSettings, &r, 8);
-    DLog(L"tray bar: created %ld,%ld %dx%d follow=%d", (long)c.rc.left, (long)c.rc.top, w, h,
-         (int)c.follow);
-    // Which style actually applies (R4 overrides): one line, so "did my ini key take effect"
-    // never needs a screenshot.
-    DLog(L"tray bar: group=%d (enabled=%d follow=%d)", c.groupId, (int)c.enabled,
-         (int)c.follow);
-    DLog(L"tray bar: style pad=%d gap=%d radius=%d%% -> corner %d px (overrides pad=%d gap=%d "
-         L"radius=%d)",
-         CompanionPad(c), CompanionGap(c), CompanionRadiusPercent(c),
-         RadiusForPercent(w, h, CompanionRadiusPercent(c)), c.padOv, c.gapOv, c.radiusOv);
     // R2: the frame around "the strip + this companion". It needs the companion to exist (a
     // frame around the strip alone is not drawn), so it is created from here, not from WinMain.
     GroupCreateAll();
+}
+
+// ---- the user's float windows ([float.N]) ---------------------------------------------------
+static void FloatSectionFor(int id, wchar_t* buf, size_t cch) {
+    swprintf_s(buf, cch, L"float.%d", id);
+}
+
+static int FloatSectionId(const wchar_t* sec) {
+    if (wcsncmp(sec, L"float.", 6)) return 0;
+    int id = _wtoi(sec + 6);
+    return (id > 0 && id <= kMaxFloats) ? id : 0;
+}
+
+static Companion* CompanionById(int id) {
+    if (id <= 0) return nullptr;
+    for (int i = 1; i < g_compCount; i++)
+        if (g_comps[i].id == id) return &g_comps[i];
+    return nullptr;
+}
+
+// A free slot for one more window (ids never shift: a deleted window leaves a hole that the next
+// creation reuses, so `[float.N]` in the ini always means the same window).
+static Companion* CompanionFreeSlot() {
+    if (g_compCount >= kMaxComps) return nullptr;
+    for (int i = 1; i < kMaxComps; i++) {
+        if (g_comps[i].id == 0) {
+            if (i + 1 > g_compCount) g_compCount = i + 1;
+            return &g_comps[i];
+        }
+    }
+    return nullptr;
+}
+
+// Which [float.N] sections exist in the ini (a section that is there is a window that must exist).
+static void FloatSectionsInIni(std::vector<int>& out) {
+    out.clear();
+    if (g_iniPath.empty()) return;
+    std::vector<wchar_t> buf(65536, 0);
+    const DWORD n = GetPrivateProfileSectionNamesW(buf.data(), (DWORD)buf.size(),
+                                                   g_iniPath.c_str());
+    for (const wchar_t* s = buf.data(); s && *s && n; s += wcslen(s) + 1) {
+        int id = FloatSectionId(s);
+        if (id) out.push_back(id);
+    }
+    std::sort(out.begin(), out.end());
+}
+
+static void CompanionLoadOne(Companion& c, int id) {
+    c = Companion();
+    c.id = id;
+    c.content = kContentItems;
+    FloatSectionFor(id, c.sec, 24);
+    CompanionLoad(c);
+    CompanionSnapUpdate(c);
+    for (int i = 0; i < 4; i++) c.snapAnim[i] = c.snapTarget[i];
+}
+
+// Creation from the strip's menu: solid, opaque, a cascaded position, and an explicit "enabled".
+static void CompanionNew(int band) {
+    Companion* c = CompanionFreeSlot();
+    if (!c) {
+        DLog(L"float: refused - limit %d reached", kMaxFloats);
+        return;
+    }
+    const int id = CompanionIndexOf(c);              // slot index == id for user windows
+    c->id = id;
+    c->content = kContentItems;
+    c->enabled = true;
+    c->items.clear();
+    FloatSectionFor(id, c->sec, 24);
+    // Style seeds: absolute values copied from the strip's current look, so a new window matches
+    // the dock at first and is independent from then on (user 2026-11-23).
+    c->padOv = g_cfg.pad;
+    c->gapOv = g_cfg.gap;
+    c->radiusOv = g_cfg.radius;
+    c->snapOv = g_cfg.snap;
+    c->band = band ? 1 : 0;
+    c->hasHue = true;
+    c->hue = g_hueStrip;
+    c->glassCfg = g_glassStrip;
+    c->iconPxOv = 40;
+    c->captionOn = true;
+    c->groupId = 0;                                  // independent: on the desktop, no frame
+    c->follow = false;
+    // Geometry: 3 items wide, 2 rows tall, cascaded from the strip so it is easy to find.
+    const int icon = FloatIconPx(*c), gap = CompanionGap(*c);
+    const int w = 3 * (icon + gap) - gap + CompanionPad(*c) * 2;
+    const int h = 2 * (FloatCellH(*c, icon) + gap) - gap + CompanionPad(*c) * 2;
+    RECT sr{};
+    if (g_hwnd) GetWindowRect(g_hwnd, &sr);
+    static int cascade = 0;
+    int x = sr.left + 24 + cascade * 28;
+    int y = sr.top - h - 24 + cascade * 28;
+    cascade = (cascade + 1) % 6;
+    const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (x + w > sw) x = sw - w - 24;
+    if (x < 0) x = 0;
+    if (y < 0) y = 24;
+    if (y + h > sh) y = sh - h - 24;
+    c->rc = RECT{x, y, x + w, y + h};
+
+    // Persist everything up front: the window must come back on the next start even if it is
+    // created and the program is killed a second later.
+    wchar_t b[32]{};
+    auto wint = [&](const wchar_t* key, int v) {
+        swprintf_s(b, L"%d", v);
+        WritePrivateProfileStringW(c->sec, key, b, g_iniPath.c_str());
+    };
+    wint(L"enabled", 1);
+    wint(L"bgMode", 2);                    // solid + opaque: a fresh window must be findable
+    wint(L"solidOpacity", 235);
+    wint(L"glassLayer", 0);
+    wint(L"radius", c->radiusOv);
+    wint(L"pad", c->padOv);
+    wint(L"gap", c->gapOv);
+    wint(L"snap", c->snapOv);
+    wint(L"band", c->band);
+    wint(L"iconSize", c->iconPxOv);
+    wint(L"caption", 1);
+    wint(L"group", 0);
+    swprintf_s(b, L"#%06X", c->hue);
+    WritePrivateProfileStringW(c->sec, L"hue", b, g_iniPath.c_str());
+    WritePrivateProfileStringW(c->sec, L"image", L"", g_iniPath.c_str());
+    WritePrivateProfileStringW(c->sec, L"items", L"", g_iniPath.c_str());
+    wint(L"glassOpacity", c->glassCfg.glassOpacity);
+    wint(L"tintStrength", c->glassCfg.tintStrength);
+    wint(L"blurRadius", c->glassCfg.blurRadius);
+    CompanionSave(*c);
+    CompanionCreateWindow(*c);
+    for (int i = 0; i < g_groupCount; i++) GroupRecompute(g_groups[i]);
+    DLog(L"float: new id=%d -> [%s] %ld,%ld %dx%d band=%d", c->id, c->sec, (long)c->rc.left,
+         (long)c->rc.top, w, h, c->band);
+}
+
+// Delete one user window: destroy it, drop its ini section, free the slot (the id stays unused so
+// the other windows keep their `[float.N]`).
+static void CompanionDelete(Companion& c) {
+    if (c.id <= 0) return;
+    const int id = c.id;
+    wchar_t sec[24];
+    wcscpy_s(sec, c.sec);
+    DLog(L"float: deleting id=%d [%s]", id, sec);
+    if (c.tipWnd) DestroyWindow(c.tipWnd);
+    c.tipWnd = nullptr;
+    if (c.hwnd) {
+        DragAcceptFiles(c.hwnd, FALSE);
+        DestroyWindow(c.hwnd);
+    }
+    if (c.glass.bmp) DeleteObject(c.glass.bmp);      // the bake DIB belongs to the window
+    c.glass.bmp = nullptr;
+    c.glass.bits = nullptr;
+    if (c.bmp) DeleteObject(c.bmp);
+    if (c.dc) DeleteDC(c.dc);
+    const int groupId = c.groupId;
+    c = Companion();                     // reset the slot (id = 0 -> free)
+    if (g_iniPath.size()) WritePrivateProfileStringW(sec, nullptr, nullptr, g_iniPath.c_str());
+    while (g_compCount > 1 && g_comps[g_compCount - 1].id == 0) g_compCount--;
+    if (groupId > 0) {
+        for (int i = 0; i < g_groupCount; i++) GroupRecompute(g_groups[i]);
+    }
+}
+
+// Bring the windows in line with the ini: create what is missing, drop what disappeared, and
+// re-apply the style of every window that is already there (a hand edit + reload).
+static void FloatsReloadFromIni() {
+    std::vector<int> ids;
+    FloatSectionsInIni(ids);
+    // Removed sections: their window goes away.
+    for (int i = 1; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (c.id == 0 || !c.hwnd) continue;
+        bool still = false;
+        for (int id : ids)
+            if (id == c.id) still = true;
+        if (!still) CompanionDelete(c);
+    }
+    for (int id : ids) {
+        Companion* c = CompanionById(id);
+        if (c) {
+            CompanionLoad(*c);
+            CompanionSnapUpdate(*c);
+            TrayRepaint(*c);
+            CompanionPresent(*c);
+            if (Group* g = GroupById(c->groupId)) GroupRecompute(*g);
+            continue;
+        }
+        Companion* slot = CompanionFreeSlot();
+        if (!slot) {
+            DLog(L"float: [float.%d] ignored - limit %d reached", id, kMaxFloats);
+            continue;
+        }
+        CompanionLoadOne(*slot, id);
+        if (!slot->enabled) continue;
+        CompanionCreateWindow(*slot);
+    }
+}
+
+static void FloatsLoadFromIni() {
+    std::vector<int> ids;
+    FloatSectionsInIni(ids);
+    for (int id : ids) {
+        Companion* slot = CompanionFreeSlot();
+        if (!slot) {
+            DLog(L"float: [float.%d] ignored - limit %d reached", id, kMaxFloats);
+            continue;
+        }
+        CompanionLoadOne(*slot, id);
+        if (!slot->enabled) continue;
+        CompanionCreateWindow(*slot);
+    }
+    DLog(L"float: %d window(s) from the ini", CompanionLiveCount() - 1);
 }
 
 // ---------------------------------------------------------------- quick settings placement
@@ -8001,9 +8925,9 @@ static void BlendScaled(int x0, int y0, int dw, int dh, const uint32_t* src, int
             int a = ch(24);
             if (!a) continue;
             int dx = x0 + x, dy = y0 + y;
-            if (dx < 0 || dy < 0 || dx >= g_dibW || dy >= g_dibH) continue;
+            if (dx < 0 || dy < 0 || dx >= g_paintW || dy >= g_paintH) continue;
             if (dx < clipL || dx >= clipR) continue;      // horizontal clip for the drag icon
-            BYTE* dst = (BYTE*)g_bits + ((size_t)dy * g_dibW + dx) * 4;
+            BYTE* dst = (BYTE*)g_paintBits + ((size_t)dy * g_paintW + dx) * 4;
             dst[0] = (BYTE)(ch(0) + dst[0] * (255 - a) / 255);
             dst[1] = (BYTE)(ch(8) + dst[1] * (255 - a) / 255);
             dst[2] = (BYTE)(ch(16) + dst[2] * (255 - a) / 255);
@@ -9984,7 +10908,7 @@ static RECT IconBox() {
 }
 
 static bool FullyTransparent() {
-    return g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0;
+    return g_glassStrip.glassOpacity == 0 && g_glassStrip.tintStrength == 0;
 }
 
 static int EdgeAt(POINT p, const RECT& rcIn) {
@@ -10229,18 +11153,25 @@ static int NonBlackPct(const uint32_t* px, int w, int h) {
 // second glass window exists, the one would end up baked into the other's glass (H3).
 static bool IsOurWindow(HWND h) {
     if (!h) return false;
-    return h == g_hwnd || h == g_trayBar.hwnd || h == g_gridWnd || h == g_thumbWnd ||
-           h == g_setWnd || h == g_menuHwnd || h == g_bgWnd || h == g_decoHwnd;
+    if (h == g_hwnd || h == g_gridWnd || h == g_thumbWnd || h == g_setWnd || h == g_menuHwnd ||
+        h == g_bgWnd)
+        return true;
+    return CompanionByWindow(h) != nullptr;      // the tray + every [float.N] window
 }
 
 // The list a capture has to keep out of the picture, most important first.
 static int CollectOurWindows(HWND* out, int max) {
     int n = 0;
-    HWND list[] = {g_hwnd, g_trayBar.hwnd, g_gridWnd, g_thumbWnd, g_setWnd, g_menuHwnd, g_bgWnd,
-                   g_decoHwnd};
-    for (HWND h : list) {
+    auto add = [&](HWND h) {
         if (h && IsWindowVisible(h) && n < max) out[n++] = h;
-    }
+    };
+    add(g_hwnd);
+    for (int i = 0; i < g_compCount; i++) add(g_comps[i].hwnd);
+    add(g_gridWnd);
+    add(g_thumbWnd);
+    add(g_setWnd);
+    add(g_menuHwnd);
+    add(g_bgWnd);
     return n;
 }
 
@@ -10452,9 +11383,12 @@ static void ZAssertOurs(bool twice) {
                 SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
-        if (g_trayBar.hwnd && IsWindowVisible(g_trayBar.hwnd))
-            SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
+        for (int i = 0; i < g_compCount; i++) {
+            Companion& c = g_comps[i];
+            if (!c.hwnd || !IsWindowVisible(c.hwnd)) continue;
+            SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         if (g_hwnd && IsWindowVisible(g_hwnd))
             SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -10479,8 +11413,8 @@ static void ZAssertOurs(bool twice) {
 
 // Step *below* everything topmost (the capture tool), without hiding anything.
 static void ZDemoteOurs() {
-    HWND list[8]{};
-    int n = CollectOurWindows(list, 8);
+    HWND list[32]{};
+    int n = CollectOurWindows(list, 32);
     for (int i = 0; i < n; i++)
         SetWindowPos(list[i], HWND_NOTOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -10496,8 +11430,8 @@ static void ZDemoteOurs() {
 // Did anything of ours end up back in the topmost band while we are supposed to be below an
 // overlay? ~10 GetWindowLong calls, cheap enough for every tick.
 static bool ZAnyOursTopmost() {
-    HWND list[8]{};
-    int n = CollectOurWindows(list, 8);
+    HWND list[32]{};
+    int n = CollectOurWindows(list, 32);
     for (int i = 0; i < n; i++)
         if (GetWindowLongW(list[i], GWL_EXSTYLE) & WS_EX_TOPMOST) return true;
     for (int i = 0; i < g_groupCount; i++) {
@@ -10904,7 +11838,10 @@ static DWORD g_frozenTakenMs = 0;    // cost of the last one
 
 static bool AnyGlassWindowOnScreen() {
     if (g_cfg.material == 1 && g_alpha > 0) return true;
-    if (g_trayBar.hwnd && g_trayBar.alpha > 0 && CompanionUsesGlass(g_trayBar)) return true;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (c.hwnd && c.alpha > 0 && CompanionUsesGlass(c)) return true;
+    }
     return false;
 }
 
@@ -10943,8 +11880,8 @@ static void FrozenBegin() {
     RECT wa = WorkAreaFor(g_hwnd);
     const int w = wa.right - wa.left, h = wa.bottom - wa.top;
     if (w <= 0 || h <= 0) return;
-    HWND excl[8];
-    const int nExclude = CollectOurWindows(excl, 8);
+    HWND excl[32];
+    const int nExclude = CollectOurWindows(excl, 32);
     const DWORD t0 = GetTickCount();
     // Straight into the buffer that is already allocated: GrabScreenExcluding() assigns into it,
     // so the 8 MB copy that a fresh vector would cost (3-5 ms on the first drag) only happens once.
@@ -10970,8 +11907,10 @@ static void FrozenEnd() { g_frozen.valid = false; }
 // "A glass window is being moved right now" - one predicate, so the frozen picture starts and
 // ends with the gesture instead of every drag path having to remember it.
 static bool GlassDragActive() {
-    return g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling() ||
-           g_trayBar.dragging || g_trayBar.resizing;
+    if (g_dragging || g_resizeEdge || DefaultGroupBusy() || GroupScaling()) return true;
+    for (int i = 0; i < g_compCount; i++)
+        if (g_comps[i].dragging || g_comps[i].resizing) return true;
+    return false;
 }
 
 // Rising/falling edge of GlassDragActive(): freeze the work area on the way in, drop it on the
@@ -10987,7 +11926,7 @@ static void GlassDragTick() {
     } else {
         FrozenEnd();
         g_bakeDirty = true;
-        g_trayBar.glass.dirty = true;
+        for (int i = 0; i < g_compCount; i++) g_comps[i].glass.dirty = true;
     }
 }
 
@@ -11043,8 +11982,8 @@ static BakeResult BakeGlass(GlassTarget& t, const RECT& winRect, int margin, con
     t.origin.x = capR.left;
     t.origin.y = capR.top;
     // everything of ours that must not appear in the picture (see GrabScreenExcluding)
-    HWND excl[8];
-    const int nExclude = CollectOurWindows(excl, 8);
+    HWND excl[32];
+    const int nExclude = CollectOurWindows(excl, 32);
 
     // Grab our (padded) rect out of whatever we are covering.
     // Source order matters for cost: reading the composited screen is one BitBlt of the
@@ -11370,10 +12309,11 @@ static void CaptureBackdrop() {
         g_bakeDirty = false;
         return;
     }
-    const int M = moving ? g_bakeMargin : (g_glass[0].blurRadius > 0 ? 64 : 0);
+    const int M = moving ? g_bakeMargin : (g_glassStrip.blurRadius > 0 ? 64 : 0);
     RECT wr{};
     GetWindowRect(g_hwnd, &wr);
-    const BakeResult r = BakeGlass(g_stripGlass, wr, M, L"strip", g_hue[0], g_glass[0], moving);
+    const BakeResult r =
+        BakeGlass(g_stripGlass, wr, M, L"strip", g_hueStrip, g_glassStrip, moving);
     // ⛔ A *failed* capture clears the flag even though nothing was captured (the previous
     // bake is still good). Leaving it set would retry a 15 ms grab on every single frame.
     // One skipped for the frame budget keeps it set, so the next frame picks it up again.
@@ -11462,7 +12402,9 @@ struct SPage {
     const SRow* rows;
     int count;
     int kind;
-    int groupId;                // kPageGroupKind only
+    // Which object the page belongs to: the group id for kPageGroupKind, the float window's id for
+    // kPageFloatTray (0 = the tray companion, 1.. = [float.N]).
+    int objId = 0;
 };
 
 // forward declarations for the picture row / row state helpers (defined with SettingsPaint below)
@@ -11479,13 +12421,11 @@ static int g_setPickAction = 0;        // 1 = from the gallery, 2 = add a new pi
 static bool g_pickBusy = false;        // a dialog is up right now
 
 static void SettingsPaint();
-// task 5: the sticker's own style plumbing (defined with the Deco module further down)
-static void DecoApplyStyle();
-static void DecoInvalidateImage();
 static void SettingsPickFromGallery();
 static void SettingsPickNewImage();
 static void SetHueFor(int which, DWORD rgb);
 static void PickHue(int which);
+static int HueWhichForPage(const SPage* p);
 static bool SettingsRowVisible(const SPage* p, int i);
 static bool SettingsRowDisabled(const SPage* p, int i);
 static bool AnyScreenBackdrop();      // defined with the component helpers further down
@@ -11538,6 +12478,18 @@ static const SRow kRowsGlassTray[] = {
     {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
 };
 
+// 玻璃页 for a *generic* float window ([float.N]): absolute values like its 浮窗 page, plus the
+// machine-wide cadence rows (IsSharedGlassKey).
+static const SRow kRowsGlassWin[] = {
+    {L"glassOpacity", L"玻璃不透明度", 0, 255, 0, 0, nullptr, nullptr},
+    {L"tintStrength", L"色调浓度", 0, 255, 0, 0, nullptr, nullptr},
+    {L"blurRadius", L"背景模糊半径 (px)", 0, 64, 0, 0, nullptr, nullptr},
+    {L"refreshHz", L"背景刷新帧率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureHz", L"背景截取频率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
+    {L"captureBudgetMs", L"每帧截取预算 (ms)（共享）", 0, 100, 0, 0, nullptr, nullptr},
+    {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
+};
+
 // ---- 浮窗页 for the strip (component: kCompFloat; section [dock]) -------------------------
 static const SRow kRowsFloatDock[] = {
     {L"bgMode", L"背景", 0, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
@@ -11574,28 +12526,25 @@ static const SRow kRowsFloatTray[] = {
     {L"band", L"Z 序", 0, 1, 0, 0, nullptr, nullptr, kBandNames, 2},
 };
 
-// ---- 贴纸窗口页 (task 5): [deco] ---------------------------------------------------------
-// A decoration has a background, a glass layer and a corner radius - nothing else (no icons, no
-// cells). Values are written explicitly by DecoCreate(), so the rows never show "inherit".
-static const SRow kRowsDeco[] = {
+// ---- 浮窗页 for a *generic* float window (section [float.N]) ------------------------------
+// Absolute values, no "inherit": a desktop window must not change when the strip's style does
+// (user 2026-11-23). This is the same row set as the strip's float page plus the item-grid rows.
+static const SRow kRowsFloatWin[] = {
     {L"bgMode", L"背景", 0, 2, 0, 0, nullptr, nullptr, kBgNames, 3},
     {L"glassLayer", L"玻璃层", 0, 1, 0, 1, L"开", L"关"},
+    {L"hue", L"色调", 0, 0, 0, 0, nullptr, nullptr},
+    {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
     {L"image", L"背景图片", 0, 0, 0, 0, nullptr, nullptr},
     {L"radius", L"圆角 (0 直角 / 100 半圆)", 0, 100, 0, 0, nullptr, nullptr},
-    {L"solidOpacity", L"纯色不透明度", 0, 255, 0, 0, nullptr, nullptr},
-};
-
-// ---- 贴纸窗口的玻璃页 (task 5): [deco], -1 = inherit [dock] -------------------------------
-// Same shape as the float window's glass page (kRowsGlassTray): the window's own three values plus
-// the machine-wide cadence rows, which always read/write [dock] (IsSharedGlassKey).
-static const SRow kRowsGlassDeco[] = {
-    {L"glassOpacity", L"玻璃不透明度", -1, 255, 0, 0, nullptr, nullptr},
-    {L"tintStrength", L"色调浓度", -1, 255, 0, 0, nullptr, nullptr},
-    {L"blurRadius", L"背景模糊半径 (px)", -1, 64, 0, 0, nullptr, nullptr},
-    {L"refreshHz", L"背景刷新帧率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
-    {L"captureHz", L"背景截取频率 (Hz)（共享）", 0, 180, 0, 0, nullptr, nullptr},
-    {L"captureBudgetMs", L"每帧截取预算 (ms)（共享）", 0, 100, 0, 0, nullptr, nullptr},
-    {L"dragNoCapture", L"拖动时不更新背景（共享）", 0, 1, 0, 1, L"不更新", L"更新"},
+    {L"snap", L"贴边方角", 0, 1, 0, 1, L"开", L"关", nullptr, 0, 1},
+    {L"pad", L"内边距", 0, 40, 0, 0, nullptr, nullptr},
+    {L"gap", L"格子间距", 0, 40, 0, 0, nullptr, nullptr},
+    // The item grid: icon size + whether the name is drawn under each icon (desktop-like).
+    {L"iconSize", L"条目图标尺寸", 16, 128, 0, 0, nullptr, nullptr},
+    {L"caption", L"图标下显示名称", 0, 1, 0, 1, L"显示", L"隐藏", nullptr, 0, 1},
+    // This window's z band. 最下 = the desktop band (above the wallpaper, below every app window),
+    // 最上 = the topmost band, i.e. always in front.
+    {L"band", L"Z 序", 0, 1, 0, 0, nullptr, nullptr, kBandNames, 2},
 };
 
 // ---- 图标条页 (component: kCompBar; things a float window has no use for) ----------------
@@ -11678,18 +12627,29 @@ static int GroupKeyVal(Group& g, const wchar_t* key) {
     return 0;
 }
 
-static int TrayKeyVal(const wchar_t* key) {
-    if (!wcscmp(key, L"radius")) return g_trayBar.radiusOv;
-    if (!wcscmp(key, L"pad")) return g_trayBar.padOv;
-    if (!wcscmp(key, L"gap")) return g_trayBar.gapOv;
-    // H2 float-style rows: -1 = inherit [dock]
-    if (!wcscmp(key, L"bgMode")) return GetInt(L"traybar", L"bgMode", -1);
-    if (!wcscmp(key, L"glassLayer")) return GetInt(L"traybar", L"glassLayer", -1);
-    if (!wcscmp(key, L"color")) return GetInt(L"traybar", L"color", -1);
-    if (!wcscmp(key, L"solidOpacity")) return GetInt(L"traybar", L"solidOpacity", -1);
-    // task 3: the companion's own snap switch
-    if (!wcscmp(key, L"snap")) return GetInt(L"traybar", L"snap", -1);
-    if (!wcscmp(key, L"band")) return g_trayBar.band;      // task 5
+// The float window a page belongs to (kPageFloatTray pages carry its id in `objId`).
+static Companion* PageCompanion(const SPage* p) {
+    if (!p || p->kind != kPageFloatTray) return nullptr;
+    if (p->objId == 0) return &g_trayBar;
+    for (int i = 1; i < g_compCount; i++)
+        if (g_comps[i].id == p->objId) return &g_comps[i];
+    return nullptr;
+}
+
+// One float window's row values. The tray keeps "inherit the strip" (-1); a [float.N] window has
+// absolute values, so -1 never appears there.
+static int CompKeyVal(const Companion& c, const wchar_t* key) {
+    if (!wcscmp(key, L"radius")) return c.radiusOv;
+    if (!wcscmp(key, L"pad")) return c.padOv;
+    if (!wcscmp(key, L"gap")) return c.gapOv;
+    if (!wcscmp(key, L"bgMode")) return GetInt(c.sec, L"bgMode", c.id ? 2 : -1);
+    if (!wcscmp(key, L"glassLayer")) return GetInt(c.sec, L"glassLayer", c.id ? 0 : -1);
+    if (!wcscmp(key, L"color")) return GetInt(c.sec, L"color", -1);
+    if (!wcscmp(key, L"solidOpacity")) return GetInt(c.sec, L"solidOpacity", c.id ? 235 : -1);
+    if (!wcscmp(key, L"snap")) return c.snapOv;
+    if (!wcscmp(key, L"band")) return c.band;
+    if (!wcscmp(key, L"iconSize")) return c.iconPxOv >= 0 ? c.iconPxOv : 40;
+    if (!wcscmp(key, L"caption")) return c.captionOn ? 1 : 0;
     return -1;
 }
 
@@ -11707,11 +12667,12 @@ static int PageVal(int i) {
     const SRow& row = p->rows[i];
     if (row.colorAlpha) return TintAlpha();
     if (p->kind == kPageGroupKind) {
-        Group* g = GroupById(p->groupId);
+        Group* g = GroupById(p->objId);
         return g ? GroupKeyVal(*g, row.key) : 0;
     }
     if (p->kind == kPageFloatTray) {
-        int v = TrayKeyVal(row.key);
+        Companion* c = PageCompanion(p);
+        int v = c ? CompKeyVal(*c, row.key) : -1;
         // A two-pill toggle cannot express "inherit", so show the value actually in force
         // instead of the raw -1 - otherwise an inheriting row reads 关 while the strip's 开 is
         // what the window is doing (task 3; same trap as SRow::defv on the strip's pages).
@@ -11748,11 +12709,17 @@ static void ApplyStripStyle() {
     Present();
     ComputeButtons();
     PaintAndPresent();
-    if (g_trayBar.hwnd) {
-        TrayRepaint(g_trayBar);
-        CompanionPresent(g_trayBar);
-        GroupRecompute(DefaultGroup());
+    // The strip's style is the default for every float window that inherits (-1), so they all
+    // get a repaint / a new bake from it (a [float.N] window with absolute values is unaffected).
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd) continue;
+        c.glass.dirty = true;
+        TrayRepaint(c);
+        CompanionPresent(c);
+        CompanionSnapUpdate(c);
     }
+    GroupRecompute(DefaultGroup());
 }
 
 static void PageSet(int i, int v) {
@@ -11810,20 +12777,16 @@ static void PageSet(int i, int v) {
             GetClientRect(g_hwnd, &rc);
             Paint(rc.right, rc.bottom);
             Present();
-            // Per-window glass parameters: the picture composition bakes the blur in, and a
-            // companion keeps its own bake, so both invalidate and repaint here.
-            if (!wcscmp(p->section.c_str(), L"traybar")) {
-                g_imgTray.sig = 0;
-                g_trayBar.glass.dirty = true;
-                g_trayBar.glassSig = 0;
-                if (g_trayBar.hwnd) {
-                    TrayRepaint(g_trayBar);
-                    CompanionPresent(g_trayBar);
+            // Per-window glass parameters: the picture composition bakes the blur in, and every
+            // float window keeps its own bake, so the one whose page this is repaints here.
+            if (Companion* c = PageCompanion(p)) {
+                c->img.sig = 0;
+                c->glass.dirty = true;
+                c->glassSig = 0;
+                if (c->hwnd) {
+                    TrayRepaint(*c);
+                    CompanionPresent(*c);
                 }
-            } else if (!wcscmp(p->section.c_str(), L"deco")) {
-                // task 5: the sticker's own glass parameters (it bakes its own backdrop)
-                DecoInvalidateImage();
-                DecoApplyStyle();          // re-reads the style, repaints, marks the bake dirty
             } else {
                 g_imgStrip.sig = 0;
             }
@@ -11833,35 +12796,41 @@ static void PageSet(int i, int v) {
         case kPageBar:
             ApplyStripStyle();
             break;
-        case kPageDeco:
-            // task 5: re-read the sticker's style and repaint it in place
-            if (!wcscmp(row.key, L"bgMode") || !wcscmp(row.key, L"image")) DecoInvalidateImage();
-            DecoApplyStyle();
-            break;
         case kPageFloatTray: {
-            int v2 = v;
-            if (!wcscmp(row.key, L"radius")) g_trayBar.radiusOv = v2;
-            else if (!wcscmp(row.key, L"pad")) g_trayBar.padOv = v2;
-            else if (!wcscmp(row.key, L"gap")) g_trayBar.gapOv = v2;
+            Companion* c = PageCompanion(p);
+            if (!c) break;
+            if (!wcscmp(row.key, L"radius")) c->radiusOv = v;
+            else if (!wcscmp(row.key, L"pad")) c->padOv = v;
+            else if (!wcscmp(row.key, L"gap")) c->gapOv = v;
             // task 3: the snap override; the animation starts on the next tick (120 ms)
-            else if (!wcscmp(row.key, L"snap")) g_trayBar.snapOv = v2;
+            else if (!wcscmp(row.key, L"snap")) c->snapOv = v;
+            else if (!wcscmp(row.key, L"iconSize")) c->iconPxOv = v;
+            else if (!wcscmp(row.key, L"caption")) c->captionOn = v != 0;
             // task 5: move the window into the other band right away
             else if (!wcscmp(row.key, L"band")) {
-                g_trayBar.band = v2;
-                if (g_trayBar.hwnd)
-                    SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
+                c->band = v;
+                if (c->hwnd)
+                    SetWindowPos(c->hwnd, ZBandFor(c->hwnd), 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                DLog(L"tray bar: band -> %d (0 = topmost, 1 = just above the desktop)", v2);
+                DLog(L"float: band id=%d -> %d (0 = topmost, 1 = just above the desktop)", c->id, v);
             }
-            if (g_trayBar.hwnd) {
-                TrayRepaint(g_trayBar);
-                CompanionPresent(g_trayBar);
-                if (Group* g = GroupById(g_trayBar.groupId)) GroupRecompute(*g);
+            // A changed background / colour / glass layer invalidates the composed picture: it is
+            // a pure function of (picture, size, material), so the cache key has to drop it.
+            if (!wcscmp(row.key, L"bgMode") || !wcscmp(row.key, L"image") ||
+                !wcscmp(row.key, L"glassLayer") || !wcscmp(row.key, L"hue"))
+                c->img.sig = 0;
+            if (!wcscmp(row.key, L"bgMode") || !wcscmp(row.key, L"glassLayer"))
+                c->glass.dirty = true;
+            CompanionSnapUpdate(*c);
+            if (c->hwnd) {
+                TrayRepaint(*c);
+                CompanionPresent(*c);
+                if (Group* g = GroupById(c->groupId)) GroupRecompute(*g);
             }
             break;
         }
         case kPageGroupKind: {
-            Group* g = GroupById(p->groupId);
+            Group* g = GroupById(p->objId);
             if (!g) break;
             if (!wcscmp(row.key, L"enabled")) {
                 g->enabled = v != 0;
@@ -11949,8 +12918,9 @@ static void PageSet(int i, int v) {
 
 // GDI text into a 32bpp DIB leaves alpha at 0; render white text on black and
 // rebuild the alpha from luminance, then composite with premultiplied maths.
-static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px,
-                          DWORD rgb) {
+// `centered` is for the icon captions and the clock (the panel's own text is left-aligned).
+static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, int px, DWORD rgb,
+                          bool centered) {
     if (!g_paintBits || w <= 0 || h <= 0) return;
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -11972,7 +12942,8 @@ static void DrawTextAlpha(int x, int y, int w, int h, const std::wstring& text, 
                              DEFAULT_PITCH, L"Microsoft YaHei UI");
     HGDIOBJ oldFont = SelectObject(dc, font);
     RECT tr{0, 0, w, h};
-    DrawTextW(dc, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+    DrawTextW(dc, text.c_str(), -1, &tr,
+              DT_SINGLELINE | DT_VCENTER | (centered ? DT_CENTER : DT_LEFT) | DT_END_ELLIPSIS);
     SelectObject(dc, oldFont);
     DeleteObject(font);
 
@@ -12166,54 +13137,74 @@ static void SettingsPickFromGallery() {
     SettingsPaint();
 }
 
-// An ini edit (Reload) must reach the float window too: its picture composition is cached by
-// (picture, size, glass params) and its glass bake is a separate target, so nothing would repaint
-// it until it happened to appear again (found 2026-11-21 while testing per-window parameters).
+// An ini edit (Reload) must reach every float window: its picture composition is cached by
+// (picture, size, glass params), its glass bake is a separate target and its 色调 / 玻璃 / 圆角 are
+// read from the ini, so nothing would repaint it until it happened to appear again (found
+// 2026-11-21 while testing per-window parameters; extended to all windows on 2026-11-23).
 static void RefreshCompanionAfterReload() {
     g_glassCacheValid = false;
     g_imgStrip.sig = 0;      // force a re-compose with the new parameters
-    g_imgTray.sig = 0;
-    g_trayBar.glass.dirty = true;
-    // task 3: the snap override is read from the ini like the other style keys, and a hand edit
-    // followed by a reload (dev/t_dock_reload.ps1) should apply without a restart. The geometry
-    // itself is NOT re-read here - a reload must never yank the window somewhere else.
-    g_trayBar.snapOv = GetInt(g_trayBar.iniSection, L"snap", -1);
-    CompanionSnapUpdate(g_trayBar);
-    // task 5: the z band is an ini key too - apply it on reload (no restart needed)
-    g_trayBar.band = GetInt(g_trayBar.iniSection, L"band", 0) != 0 ? 1 : 0;
-    if (g_trayBar.hwnd)
-        SetWindowPos(g_trayBar.hwnd, ZBandFor(g_trayBar.hwnd), 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    if (!g_trayBar.hwnd) return;
-    TrayRepaint(g_trayBar);
-    CompanionPresent(g_trayBar);
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        c.img.sig = 0;
+        c.glass.dirty = true;
+        // The snap override, the z band, the 色调 and the glass parameters are ini keys too, and a
+        // hand edit followed by a reload (dev/t_dock_reload.ps1) should apply without a restart.
+        // The geometry itself is NOT re-read here - a reload must never yank a window elsewhere.
+        const int saveGroup = c.groupId;
+        CompanionLoad(c);
+        c.groupId = saveGroup;
+        CompanionSnapUpdate(c);
+        if (c.hwnd)
+            SetWindowPos(c.hwnd, ZBandFor(c.hwnd), 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (!c.hwnd) continue;
+        TrayRepaint(c);
+        CompanionPresent(c);
+    }
 }
 
-// Task 4: a group has no tone of its own, so it carries one for its 唤出区域. `which` is
-// 0 = strip, 1 = companion, 2 = the group whose page is open (g_hueGroup); an unset group falls
-// back to the strip's tone so the band never looks out of place.
-static int g_hueGroup = 1;
+// Task 4: a group has no tone of its own, so it carries one for its 唤出区域.
+//
+// `which` names the window a 色调 row belongs to, in one integer:
+//   0                      = the strip
+//   kHueComp + index       = that float window (index 0 = the tray companion)
+//   kHueGroup + groupId    = that group's 唤出区域 colour
+// An unset hue falls back to the strip's tone so nothing looks out of place.
+static const int kHueComp = 100;
+static const int kHueGroup = 200;
+
+static Companion* HueCompanion(int which) {
+    const int idx = which - kHueComp;
+    if (idx < 0 || idx >= kMaxComps) return nullptr;
+    return CompanionAt(idx);
+}
 
 static DWORD HueFor(int which) {
-    if (which == 2) {
-        Group* g = GroupById(g_hueGroup);
-        return (g && g->hasHue) ? g->hue : g_hue[0];
+    if (which >= kHueGroup) {
+        Group* g = GroupById(which - kHueGroup);
+        return (g && g->hasHue) ? g->hue : g_hueStrip;
     }
-    return g_hue[which & 1];
+    if (which >= kHueComp) {
+        Companion* c = HueCompanion(which);
+        return (c && c->hasHue) ? c->hue : g_hueStrip;
+    }
+    return g_hueStrip;
 }
 
-// Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue` / `[group.N] hue`).
+// Apply one window's 色调 and persist it (`[dock] hue` / `[traybar] hue` / `[float.N] hue` /
+// `[group.N] hue`).
 static void SetHueFor(int which, DWORD rgb) {
     rgb &= 0x00FFFFFFu;
-    if (which == 2) {
-        Group* g = GroupById(g_hueGroup);
+    wchar_t b[16]{};
+    swprintf_s(b, L"#%06X", rgb);
+    if (which >= kHueGroup) {
+        Group* g = GroupById(which - kHueGroup);
         if (!g) return;
         g->hue = rgb;
         g->hasHue = true;
         wchar_t sec[32];
         GroupSectionName(g->id, sec, 32);
-        wchar_t b[16]{};
-        swprintf_s(b, L"#%06X", rgb);
         WritePrivateProfileStringW(sec, L"hue", b, g_iniPath.c_str());
         DLog(L"hue: %s = #%06X (group wake band)", sec, rgb);
         // flash it so the new colour is actually visible - the band is not painted while the
@@ -12222,19 +13213,37 @@ static void SetHueFor(int which, DWORD rgb) {
         g->hideFlashUntil = g->hideFlashStart + kHideFlashMs;
         return;      // the band re-reads it on the next tick, see HideWakePresent
     }
-    g_hue[which & 1] = rgb;
-    wchar_t b[16]{};
-    swprintf_s(b, L"#%06X", rgb);
-    WritePrivateProfileStringW(which == 0 ? L"dock" : L"traybar", L"hue", b, g_iniPath.c_str());
-    // Both the glass tint and the solid colour come from this, so refresh that window now.
-    if (which == 0) {
-        ApplyStripStyle();                       // reloads the config and repaints the strip
-    } else if (g_trayBar.hwnd) {
-        g_trayBar.glass.dirty = true;            // the tint is baked -> needs one new bake
-        TrayRepaint(g_trayBar);
-        CompanionPresent(g_trayBar);
+    if (which >= kHueComp) {
+        Companion* c = HueCompanion(which);
+        if (!c) return;
+        c->hue = rgb;
+        c->hasHue = true;
+        WritePrivateProfileStringW(c->sec, L"hue", b, g_iniPath.c_str());
+        DLog(L"hue: [%s] = #%06X", c->sec, rgb);
+        // Both the glass tint and the solid colour come from this, so refresh that window now.
+        c->glass.dirty = true;             // the tint is baked -> needs one new bake
+        c->img.sig = 0;
+        if (c->hwnd) {
+            TrayRepaint(*c);
+            CompanionPresent(*c);
+        }
+        return;
     }
-    DLog(L"hue: %s = #%06X", which == 0 ? L"dock" : L"traybar", rgb);
+    g_hueStrip = rgb;
+    WritePrivateProfileStringW(L"dock", L"hue", b, g_iniPath.c_str());
+    ApplyStripStyle();                     // reloads the config and repaints the strip
+    DLog(L"hue: dock = #%06X", rgb);
+}
+
+// Which 色调 a settings page edits (see the encoding above).
+static int HueWhichForPage(const SPage* p) {
+    if (!p) return 0;
+    if (p->kind == kPageGroupKind) return kHueGroup + p->objId;
+    if (p->kind == kPageFloatTray) {
+        Companion* c = PageCompanion(p);
+        return c ? kHueComp + CompanionIndexOf(c) : 0;
+    }
+    return 0;
 }
 
 // The free colour picker (the palette chip). Modal, so it runs from the queued message.
@@ -12279,7 +13288,7 @@ static bool SettingsRowVisible(const SPage* p, int i) {
     //   贴边隐藏 -> only the wake-band rows (its colour included)
     //   从不     -> nothing else
     if (p->kind == kPageGroupKind) {
-        Group* g = GroupById(p->groupId);
+        Group* g = GroupById(p->objId);
         const int mode = g ? g->hideMode : 0;
         if (!wcscmp(key, L"fadeStart") || !wcscmp(key, L"fadeEnd")) return mode == 0;
         if (!wcscmp(key, L"wakeExt") || !wcscmp(key, L"wakeVisible") ||
@@ -12288,8 +13297,12 @@ static bool SettingsRowVisible(const SPage* p, int i) {
     }
     if (wcscmp(key, L"image")) return true;
     int bg = 0;
-    if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
-    else bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    if (p->kind == kPageFloatTray) {
+        Companion* c = PageCompanion(p);
+        bg = c ? CompanionBgMode(*c) : 0;
+    } else {
+        bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    }
     return bg == 1;
 }
 
@@ -12305,9 +13318,9 @@ static bool SettingsRowDisabled(const SPage* p, int i) {
         // the opacity is the whole background layer.
         if (IsSharedGlassKey(key)) {
             int bg = 0;
-            if (!wcscmp(p->section.c_str(), L"traybar")) {
-                bg = GetInt(L"traybar", L"bgMode", -1);      // -1 = inherit the strip's
-                if (bg < 0 || bg > 2) bg = g_cfg.bgMode;
+            if (p->kind == kPageFloatTray) {
+                Companion* c = PageCompanion(p);
+                bg = c ? CompanionBgMode(*c) : 0;
             } else {
                 bg = GetInt(p->section.c_str(), L"bgMode", 0);
             }
@@ -12316,8 +13329,12 @@ static bool SettingsRowDisabled(const SPage* p, int i) {
         return false;
     }
     int bg = 0;
-    if (p->kind == kPageFloatTray) bg = TrayKeyVal(L"bgMode");
-    else bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    if (p->kind == kPageFloatTray) {
+        Companion* c = PageCompanion(p);
+        bg = c ? CompanionBgMode(*c) : 0;
+    } else {
+        bg = GetInt(p->section.c_str(), L"bgMode", 0);
+    }
     if (!wcscmp(key, L"glassLayer")) return bg == 2;        // solid has no glass material
     if (!wcscmp(key, L"solidOpacity")) return bg != 2;
     if (!wcscmp(key, L"image")) return bg != 1;
@@ -12339,7 +13356,7 @@ static void SettingsPaint() {
         if (g_setH != kRowsTop + want * kRowH + 56) SettingsResizeForPage();
         // task 4: while a group's page is open its wake band is painted faintly, so the width and
         // colour rows have a visible effect at all (see HideEdgeTick).
-        g_previewGroupId = (pv && pv->kind == kPageGroupKind) ? pv->groupId : 0;
+        g_previewGroupId = (pv && pv->kind == kPageGroupKind) ? pv->objId : 0;
     }
     if (!g_setBits) {
         BITMAPINFO bi{};
@@ -12422,7 +13439,7 @@ static void SettingsPaint() {
         if (!wcscmp(row.key, L"hue")) {
             // 8 preset chips + a palette chip (opens the Windows colour picker).
             // 0 = the strip, 1 = the companion, 2 = the group whose page this is (task 4).
-            const int which = (p->kind == kPageFloatTray) ? 1 : (p->kind == kPageGroupKind ? 2 : 0);
+            const int which = HueWhichForPage(p);
             const DWORD cur = HueFor(which) & 0x00FFFFFFu;
             const int cs = 26, gap = 9;
             int hx = 370;
@@ -12604,7 +13621,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
             if (!g_pickBusy) {
                 if (action == 1) SettingsPickFromGallery();
                 else if (action == 2) SettingsPickNewImage();
-                else if (action == 20 || action == 21 || action == 22) PickHue(action - 20);
+                else if (action >= 20) PickHue(action - 20);
             }
             return 0;
         }
@@ -12688,19 +13705,34 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-// H2: a companion's background / glass-layer choice. -1 in [traybar] = inherit from [dock],
-// exactly like radius/pad/gap already do; the strip is always "its own".
+// H2: a float window's background / glass-layer choice. -1 in the section = inherit from [dock],
+// exactly like radius/pad/gap already do; the strip is always "its own". A [float.N] window stores
+// absolute values (it is independent by design - user 2026-11-23), so it never sees a -1.
 static int CompanionBgMode(const Companion& c) {
-    (void)c;
-    int v = GetInt(L"traybar", L"bgMode", -1);
+    int v = GetInt(c.sec, L"bgMode", c.id ? 2 : -1);      // a new float window is solid
     if (v < 0 || v > 2) v = g_cfg.bgMode;
     return v;
 }
 
-static bool CompanionUsesGlass(const Companion& c) {
-    int layer = GetInt(L"traybar", L"glassLayer", -1);
+static int CompanionGlassLayer(const Companion& c) {
+    int layer = GetInt(c.sec, L"glassLayer", c.id ? 0 : -1);
     if (layer != 0 && layer != 1) layer = g_cfg.glassLayer;
-    return CompanionBgMode(c) == 0 && layer == 1;      // H3 gives it a real backdrop
+    return layer;
+}
+
+static int CompanionSolidAlpha(const Companion& c) {
+    int a = GetInt(c.sec, L"solidOpacity", c.id ? 235 : -1);
+    if (a < 0) a = g_cfg.solidOpacity;
+    return a;
+}
+
+// The window's 色调: its own when the section has one, else the strip's (the tray's old rule).
+static DWORD CompanionHue(const Companion& c) {
+    return (c.hasHue ? c.hue : g_hueStrip) & 0x00FFFFFFu;
+}
+
+static bool CompanionUsesGlass(const Companion& c) {
+    return CompanionBgMode(c) == 0 && CompanionGlassLayer(c) == 1;   // H3 gives it a backdrop
 }
 
 // "Does this window *have* a glass layer?" - a different question from CompanionUsesGlass() above,
@@ -12708,27 +13740,27 @@ static bool CompanionUsesGlass(const Companion& c) {
 // it does take the glass layer's tint, so its 玻璃 page exists (bug report 2026-11-21: 图片 + 玻璃层开
 // 的窗口右键里没有玻璃页).
 static bool CompanionHasGlassLayer(const Companion& c) {
-    int layer = GetInt(L"traybar", L"glassLayer", -1);
-    if (layer != 0 && layer != 1) layer = g_cfg.glassLayer;
-    return layer == 1 && CompanionBgMode(c) != 2;      // solid has no glass material at all
+    return CompanionGlassLayer(c) == 1 && CompanionBgMode(c) != 2;   // solid: no glass at all
 }
 
 // Does *any* window still bake a screen backdrop? If not, the glass page's blur / capture rows do
 // nothing (a picture is tinted, a solid has no glass) and are greyed out.
 static bool AnyScreenBackdrop() {
     if (g_cfg.material == 1) return true;
-    if (g_trayBar.hwnd && CompanionUsesGlass(g_trayBar)) return true;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (c.hwnd && c.alpha > 0 && CompanionUsesGlass(c)) return true;
+    }
     return false;
 }
 
-// H3: the float window's backdrop refresh. Same rules as the strip (captureHz, a floor of 2x
-// the measured cost, never mid-drag), plus the three things the plan asks for:
+// H3: one float window's backdrop refresh. Same rules as the strip (captureHz, a floor of 2x the
+// measured cost, never mid-drag), plus the three things the plan asks for:
 //  * a fully faded-out window costs nothing (alpha 0 -> no capture at all, §3.3.3);
 //  * it draws the frame budget from the same pot as the strip (§3.3.2, see BakeGlass);
 //  * a window smaller than the strip pays proportionally less - its padded rect is ~1/10 of
 //    the strip's area, so the two together stay near the cost of one.
-static void CompanionGlassTick(DWORD now) {
-    Companion& c = g_trayBar;
+static void CompanionGlassBake(Companion& c, DWORD now) {
     if (!c.hwnd || c.alpha <= 0) return;
     if (!IsWindowVisible(c.hwnd)) return;
     if (!CompanionUsesGlass(c)) {
@@ -12738,14 +13770,15 @@ static void CompanionGlassTick(DWORD now) {
     // A settings change (reload, colour, blur ...) must not wait for the next natural capture:
     // the bake has the lift/tint/opacity burned in, so it is wrong until re-made. The signature
     // is cheap to compare and needs no notification plumbing from the panel.
-    const DWORD sig = g_hue[1] ^ ((DWORD)g_glass[1].tintStrength << 8) ^
-                      ((DWORD)g_glass[1].glassOpacity << 16) ^ ((DWORD)g_glass[1].blurRadius << 20);
+    const DWORD sig = CompanionHue(c) ^ ((DWORD)c.glassCfg.tintStrength << 8) ^
+                      ((DWORD)c.glassCfg.glassOpacity << 16) ^
+                      ((DWORD)c.glassCfg.blurRadius << 20);
     if (sig != c.glassSig) {
         c.glassSig = sig;
         c.glass.dirty = true;
     }
     // "no glass" setting (opacity and tint both 0): the composite would only be a frozen copy
-    if (g_glass[1].glassOpacity == 0 && g_glass[1].tintStrength == 0) return;
+    if (c.glassCfg.glassOpacity == 0 && c.glassCfg.tintStrength == 0) return;
     // A window that moved only needs the *crop* to follow: the bake is anchored to the screen,
     // so re-painting from the new offset keeps the backdrop still while the window slides over
     // it. Only leaving the padded bake needs a new capture. This is what makes following the
@@ -12776,22 +13809,20 @@ static void CompanionGlassTick(DWORD now) {
     }
     // Blur needs pixels around the window to look right. While the window is *moving* the bake
     // gets a margin, so the next hundred pixels of travel are already inside it and cost a
-    // re-crop instead of a capture; at rest the tight margin is enough (~45 % cheaper per
-    // capture, exactly as on the strip).
-    // 128 px, not the strip's 256: this window is 245x81, so a 128 px margin already makes the
-    // bake 2x2.5 times bigger than the window itself, and it re-bakes every captureHz anyway.
+    // re-crop instead of a capture; at rest the tight margin is enough.
     // The decision is sticky for a few seconds - flipping between two margins made every bake
     // resize (and thus re-create) the DIB.
     const bool movingSoon = justMoved || g_dragging || g_resizeEdge || DefaultGroupBusy() ||
                             GroupScaling() || (c.glassWideUntil && (LONG)(c.glassWideUntil - now) > 0);
-    const int M = movingSoon ? kCompanionMargin : (g_glass[1].blurRadius > 0 ? 64 : 0);
+    const int M = movingSoon ? kCompanionMargin : (c.glassCfg.blurRadius > 0 ? 64 : 0);
     if (movingSoon) c.glassWideUntil = now + 3000;
     // H3c: "拖动时不更新背景" - during somebody's drag this window keeps the picture it has.
     if (movingSoon && g_cfg.dragNoCapture) {
         c.glass.dirty = false;
         return;
     }
-    const BakeResult r = BakeGlass(c.glass, c.rc, M, L"companion", g_hue[1], g_glass[1], movingSoon);
+    const BakeResult r =
+        BakeGlass(c.glass, c.rc, M, c.sec, CompanionHue(c), c.glassCfg, movingSoon);
     if (r == kBakeNoBudget) return;              // another window took this frame's budget
     if (r == kBakeFailed) {
         // Nothing usable (or the exclusion flag is missing on this system): wait a normal
@@ -12808,479 +13839,18 @@ static void CompanionGlassTick(DWORD now) {
     }
 }
 
+static void CompanionGlassTick(DWORD now) {
+    for (int i = 0; i < g_compCount; i++) CompanionGlassBake(g_comps[i], now);
+}
+
+// H3: the float window's backdrop refresh lives in CompanionGlassBake() above.
+
 // The tab set of an object is the set of components it owns (PLAN_COMPONENTS.md §2.2):
 //   the strip          → 浮窗 + 图标条 + 玻璃(if the glass layer is on) + 组 1
-//   a glass companion  → 浮窗 + 玻璃 + 组 N
-//   a plain companion  → 浮窗 + 组 N
+//   a glass float win  → 浮窗 + 玻璃 + 组 N
+//   a plain float win  → 浮窗 + 组 N
 //   a group (menu)     → 组 N only (a group is not a window: no background, no glass)
 // `hintObj` is what the menu asked for, `hintId` the group id when it is a group.
-// ---------------------------------------------------------------- 贴纸窗口 (task 5)
-//
-// A decoration for the desktop: background (透过背后 / 图片 / 纯色) + the glass layer + rounded
-// corners, and nothing else - no icons, no tray cells. Everything it draws comes from the pipeline
-// the strip and the float window already use (BakeGlass, EnsureFloatMask, PaintImageBg,
-// FillRound/SetPixelPremul), so the only difference to a float window is its z band: it lives at
-// the bottom of the normal band, above the desktop and below every app window (see ZBandFor).
-// It never fades and never hides - it is part of the desktop picture, and it stays visible in
-// screenshots on purpose (user, 2026-11-23).
-struct Deco {
-    HWND hwnd = nullptr;
-    RECT rc{0, 0, 0, 0};
-    HDC dc = nullptr;
-    HBITMAP bmp = nullptr;
-    void* bits = nullptr;
-    int dibW = 0, dibH = 0;
-    GlassTarget glass;
-    DWORD glassSig = 0;
-    DWORD glassMovedAt = 0;
-    DWORD glassWideUntil = 0;
-    bool dragging = false;
-    POINT dragGrab{};
-    // task 5: edge resize (the sticker is a plain window, so it resizes like one)
-    bool resizing = false;
-    int resizeEdge = 0;          // 1 left, 2 right, 4 top, 8 bottom
-    RECT resizeRc0{};
-    POINT resizeOrigin{};
-    // style: -1 = inherit [dock], exactly like a float window's overrides
-    int bgMode = -1, glassLayer = -1, radiusOv = -1, solidOpacity = -1;
-    bool enabled = false;
-};
-static Deco g_deco;
-static ImageBg g_imgDeco;
-static LRESULT CALLBACK DecoProc(HWND h, UINT m, WPARAM w, LPARAM l);
-
-static int DecoBgMode() { return g_deco.bgMode >= 0 ? g_deco.bgMode : g_cfg.bgMode; }
-static int DecoGlassLayer() { return g_deco.glassLayer >= 0 ? g_deco.glassLayer : g_cfg.glassLayer; }
-static int DecoRadiusPx(int w, int h) {
-    return RadiusForPercent(w, h, g_deco.radiusOv >= 0 ? g_deco.radiusOv : g_cfg.radius);
-}
-static int DecoSolidAlpha() {
-    int a = g_deco.solidOpacity >= 0 ? g_deco.solidOpacity : g_cfg.solidOpacity;
-    if (a < 3) a = 3;
-    if (a > 255) a = 255;
-    return a;
-}
-// Same split the float window uses: "bakes a screen backdrop" is only true for 透过背后 + 玻璃层.
-// A picture background has no backdrop to bake - it is drawn from the picture and still takes the
-// glass tint (see DecoPaint's picture branch).
-static bool DecoUsesGlass() { return DecoBgMode() == 0 && DecoGlassLayer() == 1; }
-
-// "Does it *have* a glass layer?" - a picture background bakes no backdrop but still takes the
-// tint, so its 玻璃 page exists (same split as CompanionHasGlassLayer).
-static bool DecoHasGlassLayer() { return DecoGlassLayer() == 1 && DecoBgMode() != 2; }
-
-static void DecoEnsureDib(int w, int h) {
-    Deco& d = g_deco;
-    if (w <= 0 || h <= 0) return;
-    if (d.bits && d.dibW == w && d.dibH == h) return;
-    if (d.bmp) {
-        if (d.dc && DummyBitmap()) SelectObject(d.dc, g_dummyBmp);
-        DeleteObject(d.bmp);
-        d.bmp = nullptr;
-        d.bits = nullptr;
-    }
-    if (!d.dc) d.dc = CreateCompatibleDC(nullptr);
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    d.bmp = CreateDIBSection(d.dc, &bi, DIB_RGB_COLORS, &d.bits, nullptr, 0);
-    if (d.bmp) SelectObject(d.dc, d.bmp);
-    d.dibW = w;
-    d.dibH = h;
-}
-
-static void DecoPresent() {
-    Deco& d = g_deco;
-    if (!d.hwnd || !d.bits) return;
-    POINT src{0, 0};
-    SIZE size{d.dibW, d.dibH};
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    POINT dst{d.rc.left, d.rc.top};
-    UpdateLayeredWindow(d.hwnd, nullptr, &dst, &size, d.dc, &src, 0, &bf, ULW_ALPHA);
-}
-
-// No per-corner snap state: a sticker does not hug screen edges.
-static const float kDecoNoSnap[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-
-static void DecoPaint() {
-    Deco& d = g_deco;
-    if (!d.hwnd || !d.bits) return;
-    const int w = d.dibW, h = d.dibH;
-    void* savePaint = g_paintBits;
-    int savePW = g_paintW, savePH = g_paintH;
-    g_paintBits = d.bits;
-    g_paintW = w;
-    g_paintH = h;
-    memset(d.bits, 0, (size_t)w * h * 4);
-    RECT all{0, 0, w, h};
-    // 4 % white keeps the whole sticker opaque to the mouse without being visible (the same trick
-    // the float window uses); a solid background paints its own colour instead.
-    DWORD bgFill = 0x0AFFFFFF;
-    if (DecoBgMode() == 2) bgFill = ((DWORD)DecoSolidAlpha() << 24) | (g_hue[0] & 0x00FFFFFFu);
-    const int radius = DecoRadiusPx(w, h);
-    FillRound(d.dc, all, radius, bgFill);
-    if (DecoUsesGlass()) {
-        const GlassTarget& gt = d.glass;
-        if (gt.valid && gt.bits && gt.w >= w && gt.h >= h) {
-            int ox = d.rc.left - gt.origin.x, oy = d.rc.top - gt.origin.y;
-            if (ox < 0) ox = 0;
-            if (oy < 0) oy = 0;
-            if (ox > gt.w - w) ox = gt.w - w;
-            if (oy > gt.h - h) oy = gt.h - h;
-            EnsureFloatMask(w, h, radius, kDecoNoSnap);
-            for (int y = 0; y < h; y++) {
-                const uint32_t* src = (const uint32_t*)gt.bits + (size_t)(oy + y) * gt.w + ox;
-                const BYTE* cov = &g_fltCov[(size_t)y * w];
-                const BYTE* rim = &g_fltRim[(size_t)y * w];
-                for (int x = 0; x < w; x++) {
-                    DWORD a = cov[x];
-                    if (!a) continue;
-                    SetPixelPremul(x, y, (a << 24) | (src[x] & 0x00FFFFFF));
-                    DWORD ea = rim[x];
-                    if (ea) SetPixelPremul(x, y, (ea << 24) | 0x00FFFFFF);
-                }
-            }
-        }
-    } else if (DecoBgMode() == 1) {
-        if (EnsureImage(g_imgDeco, ImagePathFor(L"deco"), w, h, 0)) {
-            EnsureFloatMask(w, h, radius, kDecoNoSnap);
-            PaintImageBg(g_imgDeco, w, h, g_fltCov.data(), g_fltRim.data(), g_hue[0], g_glass[2]);
-        }
-    }
-    g_paintBits = savePaint;
-    g_paintW = savePW;
-    g_paintH = savePH;
-}
-
-static void DecoLoad();
-
-static void DecoInvalidateImage() { g_imgDeco.sig = 0; }
-
-// Re-read the sticker's style and repaint it where it stands (used by its settings page).
-static void DecoApplyStyle() {
-    DecoLoad();
-    Deco& d = g_deco;
-    if (!d.hwnd) return;
-    DecoEnsureDib(d.rc.right - d.rc.left, d.rc.bottom - d.rc.top);
-    DecoPaint();
-    DecoPresent();
-    d.glass.dirty = true;
-}
-
-static bool DecoEnabledIni() { return GetInt(L"deco", L"enabled", 0) != 0; }
-
-static void DecoLoad() {
-    Deco& d = g_deco;
-    d.enabled = GetInt(L"deco", L"enabled", 0) != 0;
-    d.bgMode = GetInt(L"deco", L"bgMode", -1);
-    d.glassLayer = GetInt(L"deco", L"glassLayer", -1);
-    d.radiusOv = GetInt(L"deco", L"radius", -1);
-    d.solidOpacity = GetInt(L"deco", L"solidOpacity", -1);
-    int w = GetInt(L"deco", L"w", 420), h = GetInt(L"deco", L"h", 260);
-    if (w < 40) w = 40;
-    if (h < 40) h = 40;
-    RECT mon = HideMonitorRect(nullptr);
-    int x = GetInt(L"deco", L"x", mon.left + (mon.right - mon.left - w) / 2);
-    int y = GetInt(L"deco", L"y", mon.top + (mon.bottom - mon.top - h) / 2);
-    d.rc = RECT{x, y, x + w, y + h};
-}
-
-static void DecoCreate() {
-    Deco& d = g_deco;
-    DecoLoad();
-    // Seed the section with the values actually in force, so the sticker's page shows the truth
-    // instead of three "inherit" rows (it has no parent window to inherit from in the panel).
-    if (g_iniPath.size()) {
-        wchar_t b[32];
-        struct Seed {
-            const wchar_t* key;
-            int value;
-        } seeds[] = {{L"bgMode", DecoBgMode()},
-                     {L"glassLayer", DecoGlassLayer()},
-                     {L"radius", d.radiusOv >= 0 ? d.radiusOv : g_cfg.radius},
-                     {L"solidOpacity", DecoSolidAlpha()}};
-        for (const Seed& s : seeds) {
-            if (GetInt(L"deco", s.key, -1) >= 0) continue;
-            swprintf_s(b, L"%d", s.value);
-            WritePrivateProfileStringW(L"deco", s.key, b, g_iniPath.c_str());
-        }
-    }
-    if (!d.enabled) {
-        if (d.hwnd) {
-            DestroyWindow(d.hwnd);
-            d.hwnd = nullptr;
-            g_decoHwnd = nullptr;
-        }
-        return;
-    }
-    if (!d.hwnd) {
-        static bool registered = false;
-        if (!registered) {
-            registered = true;
-            WNDCLASSEXW wc{sizeof(wc)};
-            wc.lpfnWndProc = DecoProc;
-            wc.hInstance = GetModuleHandleW(nullptr);
-            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-            wc.lpszClassName = L"DockDecoWindow";
-            RegisterClassExW(&wc);
-        }
-        // never WS_EX_TOPMOST: it belongs at the bottom, see ZBandFor()
-        d.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-                                 L"DockDecoWindow", L"dock deco", WS_POPUP, d.rc.left, d.rc.top,
-                                 d.rc.right - d.rc.left, d.rc.bottom - d.rc.top, nullptr, nullptr,
-                                 GetModuleHandleW(nullptr), nullptr);
-        if (!d.hwnd) {
-            DLog(L"deco: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
-            return;
-        }
-        g_decoHwnd = d.hwnd;
-    }
-    const int w = d.rc.right - d.rc.left, h = d.rc.bottom - d.rc.top;
-    DecoEnsureDib(w, h);
-    DecoPaint();
-    DecoPresent();
-    SetWindowPos(d.hwnd, ZBandFor(d.hwnd), d.rc.left, d.rc.top, w, h, SWP_NOACTIVATE);
-    ShowWindow(d.hwnd, SW_SHOWNOACTIVATE);
-    d.glass.dirty = true;
-    DLog(L"deco: created %ld,%ld %dx%d (bg=%d glass=%d)", (long)d.rc.left, (long)d.rc.top, w, h,
-         DecoBgMode(), (int)DecoUsesGlass());
-}
-
-// The glass backdrop: same cadence/budget logic as CompanionGlassTick, for one window.
-static void DecoTick(DWORD now) {
-    Deco& d = g_deco;
-    if (!d.enabled || !d.hwnd || !IsWindowVisible(d.hwnd)) return;
-    if (!DecoUsesGlass()) {
-        d.glass.dirty = false;
-        return;
-    }
-    const DWORD sig = g_hue[0] ^ ((DWORD)g_glass[2].tintStrength << 8) ^
-                      ((DWORD)g_glass[2].glassOpacity << 16) ^ ((DWORD)g_glass[2].blurRadius << 20);
-    if (sig != d.glassSig) {
-        d.glassSig = sig;
-        d.glass.dirty = true;
-    }
-    if (g_glass[2].glassOpacity == 0 && g_glass[2].tintStrength == 0) return;
-    const bool justMoved = d.glassMovedAt != 0;
-    if (justMoved && d.glass.valid && d.bits) {
-        const int w = d.rc.right - d.rc.left, h = d.rc.bottom - d.rc.top;
-        const int ox = d.rc.left - d.glass.origin.x, oy = d.rc.top - d.glass.origin.y;
-        if (ox < 0 || oy < 0 || ox + w > d.glass.w || oy + h > d.glass.h) {
-            d.glass.dirty = true;          // left the padded bake: one capture is required
-        } else {
-            DecoPaint();
-            DecoPresent();
-        }
-    }
-    d.glassMovedAt = 0;
-    if (g_cfg.captureHz <= 0) return;
-    UINT capMs = (UINT)(1000 / g_cfg.captureHz);
-    if (capMs < 1) capMs = 1;
-    DWORD floorMs = d.glass.lastMs * 2;
-    if (floorMs > capMs) capMs = floorMs;
-    if (!d.glass.dirty && now - d.glass.at < capMs) return;
-    if (d.dragging) {
-        d.glass.dirty = true;
-        return;
-    }
-    const bool movingSoon = justMoved || (d.glassWideUntil && (LONG)(d.glassWideUntil - now) > 0);
-    const int M = movingSoon ? kCompanionMargin : (g_glass[2].blurRadius > 0 ? 64 : 0);
-    if (movingSoon) d.glassWideUntil = now + 3000;
-    if (movingSoon && g_cfg.dragNoCapture) {
-        d.glass.dirty = false;
-        return;
-    }
-    const BakeResult r = BakeGlass(d.glass, d.rc, M, L"deco", g_hue[0], g_glass[2], movingSoon);
-    if (r == kBakeNoBudget) return;
-    if (r == kBakeFailed) {
-        d.glass.at = now;
-        d.glass.dirty = false;
-        return;
-    }
-    if (d.bits) {
-        DecoPaint();
-        DecoPresent();
-    }
-}
-
-static void DecoProcMenu(HWND h) {
-    HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 10, L"设置…");
-    AppendMenuW(menu, MF_STRING, 11, L"重载配置");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 12, L"隐藏贴纸");
-    POINT sp;
-    GetCursorPos(&sp);
-    g_popupOpen = true;
-    const int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, h,
-                                        nullptr);
-    g_popupOpen = false;
-    DestroyMenu(menu);
-    if (cmd == 10) {
-        ShowSettings(kObjDeco, 0);
-    } else if (cmd == 11) {
-        Reload();
-    } else if (cmd == 12) {
-        WritePrivateProfileStringW(L"deco", L"enabled", L"0", g_iniPath.c_str());
-        DecoCreate();
-    }
-}
-
-// Which edge/corner of the sticker the pointer is on (same bit order as the strip and the float
-// window: 1 left, 2 right, 4 top, 8 bottom; 0 = not on a border, i.e. a plain drag).
-static int DecoEdgeAt(POINT client) {
-    const int w = g_deco.rc.right - g_deco.rc.left, h = g_deco.rc.bottom - g_deco.rc.top;
-    if (w <= 0 || h <= 0) return 0;
-    const int band = 8, corner = 18;
-    if (client.x < 0 || client.y < 0 || client.x >= w || client.y >= h) return 0;
-    const bool lx = client.x < corner, rx = client.x >= w - corner;
-    const bool ty = client.y < corner, by = client.y >= h - corner;
-    if ((lx || rx) && (ty || by)) return (lx ? 1 : 2) | (ty ? 4 : 8);
-    int e = 0;
-    if (client.x < band) e |= 1;
-    else if (client.x >= w - band) e |= 2;
-    if (client.y < band) e |= 4;
-    else if (client.y >= h - band) e |= 8;
-    return e;
-}
-
-static void DecoSetCursorForEdge(int edge) {
-    LPCWSTR id = IDC_ARROW;
-    switch (edge) {
-        case 1: case 2: id = IDC_SIZEWE; break;
-        case 4: case 8: id = IDC_SIZENS; break;
-        case 1 | 4: case 2 | 8: id = IDC_SIZENWSE; break;
-        case 2 | 4: case 1 | 8: id = IDC_SIZENESW; break;
-        case 0: default: id = IDC_SIZEALL; break;    // inside: it is draggable
-    }
-    SetCursor(LoadCursorW(nullptr, id));
-}
-
-static LRESULT CALLBACK DecoProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    Deco& d = g_deco;
-    switch (m) {
-        case WM_LBUTTONDOWN: {
-            if (d.dragging || d.resizing) return 0;
-            POINT p{};
-            GetCursorPos(&p);
-            POINT cp = p;
-            ScreenToClient(h, &cp);
-            const int edge = DecoEdgeAt(cp);
-            if (edge) {
-                d.resizing = true;
-                d.resizeEdge = edge;
-                d.resizeRc0 = d.rc;
-                d.resizeOrigin = p;
-                SetCapture(h);
-                DLog(L"deco: resize start edge=%d", edge);
-                return 0;
-            }
-            d.dragging = true;
-            d.dragGrab.x = p.x - d.rc.left;
-            d.dragGrab.y = p.y - d.rc.top;
-            SetCapture(h);
-            return 0;
-        }
-        case WM_SETCURSOR: {
-            if (LOWORD(l) != HTCLIENT) break;
-            POINT p{};
-            GetCursorPos(&p);
-            ScreenToClient(h, &p);
-            DecoSetCursorForEdge(d.dragging ? 0 : DecoEdgeAt(p));
-            return TRUE;
-        }
-        case WM_MOUSEMOVE: {
-            if (d.dragging) {
-                POINT p{};
-                GetCursorPos(&p);
-                const int w2 = d.rc.right - d.rc.left, h2 = d.rc.bottom - d.rc.top;
-                const int x = p.x - d.dragGrab.x, y = p.y - d.dragGrab.y;
-                if (x == d.rc.left && y == d.rc.top) return 0;
-                d.rc = RECT{x, y, x + w2, y + h2};
-                d.glassMovedAt = GetTickCount();
-                SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                return 0;
-            }
-            if (!d.resizing) return 0;
-            POINT p{};
-            GetCursorPos(&p);
-            const int dx = p.x - d.resizeOrigin.x, dy = p.y - d.resizeOrigin.y;
-            RECT r = d.resizeRc0;
-            if (d.resizeEdge & 1) r.left += dx;
-            if (d.resizeEdge & 2) r.right += dx;
-            if (d.resizeEdge & 4) r.top += dy;
-            if (d.resizeEdge & 8) r.bottom += dy;
-            const int minW = 80, minH = 60;
-            if (r.right - r.left < minW) {
-                if (d.resizeEdge & 1) r.left = r.right - minW;
-                else r.right = r.left + minW;
-            }
-            if (r.bottom - r.top < minH) {
-                if (d.resizeEdge & 4) r.top = r.bottom - minH;
-                else r.bottom = r.top + minH;
-            }
-            // keep it on the monitor it lives on
-            RECT mon = HideMonitorRect(h);
-            if (r.left < mon.left) r.left = mon.left;
-            if (r.top < mon.top) r.top = mon.top;
-            if (r.right > mon.right) r.right = mon.right;
-            if (r.bottom > mon.bottom) r.bottom = mon.bottom;
-            if (r.right - r.left < minW) r.right = r.left + minW;
-            if (r.bottom - r.top < minH) r.bottom = r.top + minH;
-            if (r.left == d.rc.left && r.top == d.rc.top && r.right == d.rc.right &&
-                r.bottom == d.rc.bottom)
-                return 0;
-            d.rc = r;
-            const int w2 = r.right - r.left, h2 = r.bottom - r.top;
-            DecoEnsureDib(w2, h2);
-            DecoPaint();
-            DecoPresent();
-            d.glassMovedAt = GetTickCount();
-            d.glass.dirty = true;          // the bake has to cover the new size
-            SetWindowPos(h, nullptr, r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            return 0;
-        }
-        case WM_LBUTTONUP: {
-            if (d.dragging) {
-                d.dragging = false;
-                ReleaseCapture();
-                wchar_t b[32];
-                swprintf_s(b, L"%d", d.rc.left);
-                WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
-                swprintf_s(b, L"%d", d.rc.top);
-                WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
-                DLog(L"deco: moved to %ld,%ld", (long)d.rc.left, (long)d.rc.top);
-                return 0;
-            }
-            if (d.resizing) {
-                d.resizing = false;
-                ReleaseCapture();
-                wchar_t b[32];
-                swprintf_s(b, L"%d", d.rc.right - d.rc.left);
-                WritePrivateProfileStringW(L"deco", L"w", b, g_iniPath.c_str());
-                swprintf_s(b, L"%d", d.rc.bottom - d.rc.top);
-                WritePrivateProfileStringW(L"deco", L"h", b, g_iniPath.c_str());
-                swprintf_s(b, L"%d", d.rc.left);
-                WritePrivateProfileStringW(L"deco", L"x", b, g_iniPath.c_str());
-                swprintf_s(b, L"%d", d.rc.top);
-                WritePrivateProfileStringW(L"deco", L"y", b, g_iniPath.c_str());
-                DLog(L"deco: resized to %ldx%ld at %ld,%ld", (long)(d.rc.right - d.rc.left),
-                     (long)(d.rc.bottom - d.rc.top), (long)d.rc.left, (long)d.rc.top);
-                return 0;
-            }
-            return 0;
-        }
-        case WM_RBUTTONUP:
-            DecoProcMenu(h);
-            return 0;
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
 static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     g_pages.clear();
     *hintPage = -1;
@@ -13290,8 +13860,6 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     auto addGroupPage = [](int id) {
         wchar_t title[32];
         swprintf_s(title, L"组 %d", id);
-        // task 4: the 色调 row on a group page edits that group's wake-band colour
-        g_hueGroup = id;
         g_pages.push_back(SPage{title, L"", kRowsGroup,
                                 (int)(sizeof(kRowsGroup) / sizeof(kRowsGroup[0])),
                                 kPageGroupKind, id});
@@ -13301,31 +13869,36 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
         wantKind = kPageGroupKind;
         wantGroup = hintId;
         addGroupPage(hintId);
-    } else if (hintObj == kObjDeco) {
-        // task 5: the sticker gets the same two pages a glass float window has - 贴纸 (its
-        // background) and, when it really has a glass layer, 玻璃 (its own glass parameters).
-        wantKind = kPageDeco;
-        g_pages.push_back(SPage{L"贴纸", L"deco", kRowsDeco,
-                                (int)(sizeof(kRowsDeco) / sizeof(kRowsDeco[0])), kPageDeco, 0});
-        if (DecoHasGlassLayer())
-            g_pages.push_back(SPage{L"玻璃", L"deco", kRowsGlassDeco,
-                                    (int)(sizeof(kRowsGlassDeco) / sizeof(kRowsGlassDeco[0])),
-                                    kPageGlass, 0});
     } else if (hintObj == kObjCompanion) {
-        // A companion owns "float" always, "glass" only when its own background is the glass
+        // A float window owns "float" always, "glass" only when its own background is the glass
         // layer, and the 组 page of the group it belongs to (groupId 0 = in no group).
+        // id 0 = the tray companion (its rows inherit the strip's style, its section is [traybar]);
+        // id 1.. = a user window ([float.N], absolute rows, its own item grid).
+        Companion* c = (hintId == 0) ? &g_trayBar : nullptr;
+        for (int i = 1; !c && i < g_compCount; i++)
+            if (g_comps[i].id == hintId) c = &g_comps[i];
+        if (!c) c = &g_trayBar;
+        const int cid = CompanionIndexOf(c);
         wantKind = kPageFloatTray;
-        g_pages.push_back(SPage{L"浮窗", L"traybar", kRowsFloatTray,
-                                (int)(sizeof(kRowsFloatTray) / sizeof(kRowsFloatTray[0])),
-                                kPageFloatTray, 0});
-        const bool glass = CompanionHasGlassLayer(g_trayBar);
-        if (glass)
-            g_pages.push_back(SPage{L"玻璃", L"traybar", kRowsGlassTray,
-                                    (int)(sizeof(kRowsGlassTray) / sizeof(kRowsGlassTray[0])),
-                                    kPageGlass, 0});
-        if (g_trayBar.groupId > 0) {
-            wantGroup = g_trayBar.groupId;
-            addGroupPage(g_trayBar.groupId);
+        if (cid == 0) {
+            g_pages.push_back(SPage{L"浮窗", c->sec, kRowsFloatTray,
+                                    (int)(sizeof(kRowsFloatTray) / sizeof(kRowsFloatTray[0])),
+                                    kPageFloatTray, c->id});
+        } else {
+            g_pages.push_back(SPage{L"浮窗", c->sec, kRowsFloatWin,
+                                    (int)(sizeof(kRowsFloatWin) / sizeof(kRowsFloatWin[0])),
+                                    kPageFloatTray, c->id});
+        }
+        if (CompanionHasGlassLayer(*c)) {
+            const SRow* rows = (cid == 0) ? kRowsGlassTray : kRowsGlassWin;
+            const int n = (cid == 0)
+                              ? (int)(sizeof(kRowsGlassTray) / sizeof(kRowsGlassTray[0]))
+                              : (int)(sizeof(kRowsGlassWin) / sizeof(kRowsGlassWin[0]));
+            g_pages.push_back(SPage{L"玻璃", c->sec, rows, n, kPageGlass, c->id});
+        }
+        if (c->groupId > 0) {
+            wantGroup = c->groupId;
+            addGroupPage(c->groupId);
         }
     } else {
         // The strip: a float window that also happens to be an icon bar and uses the glass.
@@ -13346,7 +13919,8 @@ static void SettingsBuildPages(int hintObj, int hintId, int* hintPage) {
     g_page = 0;
     for (int i = 0; i < (int)g_pages.size(); i++) {
         if (g_pages[i].kind != wantKind) continue;
-        if (wantKind == kPageGroupKind && g_pages[i].groupId != wantGroup) continue;
+        if (wantKind == kPageGroupKind && g_pages[i].objId != wantGroup) continue;
+        if (wantKind == kPageFloatTray && g_pages[i].objId != hintId) continue;
         *hintPage = i;
         break;
     }
@@ -13985,7 +14559,7 @@ static void RenderTick() {
         static RECT lastRect{};
         // no glass at all (opacity 0 + tint 0): there is nothing to capture or blend, and
         // leaving g_bakeDirty set would repaint every single frame for nothing
-        const bool noGlassTick = (g_glass[0].glassOpacity == 0 && g_glass[0].tintStrength == 0);
+        const bool noGlassTick = (g_glassStrip.glassOpacity == 0 && g_glassStrip.tintStrength == 0);
         if (g_cfg.material == 1 && g_alpha > 0 && !g_flip.active && !noGlassTick) {
             RECT curR{};
             GetWindowRect(g_hwnd, &curR);
@@ -14063,7 +14637,20 @@ static void RenderTick() {
         // H3: every *other* glass window bakes here, after the strip has had its turn in this
         // tick (the strip is the interactive one, so it gets first claim on the budget).
         CompanionGlassTick(now);
-        DecoTick(now);           // task 5: the desktop sticker's own backdrop
+        // Contents that change on their own (the clock ticks once a second).
+        for (int i = 0; i < g_compCount; i++) {
+            Companion& c = g_comps[i];
+            if (!c.hwnd || !c.bits || c.alpha <= 0) continue;
+            if (!FloatContentTick(c, now)) continue;
+            // One line per window per session: proof that the clock really repaints itself.
+            static unsigned logged = 0;
+            if (c.id < 32 && !(logged & (1u << c.id))) {
+                logged |= 1u << c.id;
+                DLog(L"float: content tick id=%d (items=%d)", c.id, (int)c.items.size());
+            }
+            TrayRepaint(c);
+            CompanionPresent(c);
+        }
 
         // live evidence for tuning: how many ticks / repaints actually happened
         {
@@ -14082,7 +14669,7 @@ static void RenderTick() {
                 // H3: the second glass window is accounted for on its own line, so "glass got
                 // more expensive" can be told apart from "the strip got more expensive".
                 if (g_trayBar.glassCount)
-                    DLog(L"cadence: companion glass: %d bakes, last %lu ms, bake %dx%d",
+                    DLog(L"cadence: tray glass: %d bakes, last %lu ms, bake %dx%d",
                          g_trayBar.glassCount, (unsigned long)g_trayBar.glass.lastMs,
                          g_trayBar.glass.w, g_trayBar.glass.h);
                 // H3c: the drag-time frozen picture and how much of the glass it served.
@@ -14550,8 +15137,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuW(menu, MF_STRING, 7, L"重新扫描托盘");
             AppendMenuW(menu, MF_STRING, 4, L"打开日志");
             AppendMenuW(menu, MF_STRING, 5, L"设置…");
-            // task 5: create / drop the desktop sticker (own window, own [deco] section)
-            AppendMenuW(menu, MF_STRING | (DecoEnabledIni() ? MF_CHECKED : 0), 8, L"贴纸窗口");
+            // A new float window: the desktop band by default, i.e. it lands on the wallpaper.
+            // (Its own menu switches it to the topmost band, or deletes it again.)
+            AppendMenuW(menu, MF_STRING, 8, L"新建浮窗");
             AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), 6,
                         L"开机自启");
             AppendMenuW(menu, MF_STRING, 3, L"退出");
@@ -14574,13 +15162,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (cmd == 4) ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr,
                                             SW_SHOWNORMAL);
             else if (cmd == 5) ShowSettings(kObjStrip, 0);
-            else if (cmd == 8) {
-                // task 5: toggle the desktop sticker
-                const bool on = !DecoEnabledIni();
-                WritePrivateProfileStringW(L"deco", L"enabled", on ? L"1" : L"0", g_iniPath.c_str());
-                DecoCreate();
-                DLog(L"deco: enabled -> %d", (int)on);
-            }
+            else if (cmd == 8) CompanionNew(1);     // a new desktop float window
             else if (cmd == 6) {
                 bool on = SetAutoStart(!AutoStartEnabled());
                 DLog(L"autostart -> %d (ok=%d)", (int)AutoStartEnabled(), (int)on);
@@ -14810,12 +15392,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     Present();
     CompanionCreate();       // the tray bar sits next to the strip, hidden until hovered
-    DecoCreate();            // task 5: the desktop sticker (only when [deco] enabled=1)
+    FloatsLoadFromIni();     // every [float.N] section: the user's desktop float windows
     StartFrameClock();      // drive the frames from a high-resolution timer
     TrayBridgeEnsureExists();   // own the block so nobody can hand us a bad DACL
     StartTrayWarmup(1500);   // fill the tray bridge table once the shell is up
 
-    if (wcsstr(GetCommandLineW(), L"--settings")) ShowSettings();
+    // Probe hooks, same idea as the right-click menu items:
+    //   dock.exe --settings            the strip's pages
+    //   dock.exe --settings-float 2    one float window's pages (check its tab set without
+    //                                  driving the menu from a script)
+    if (const wchar_t* pf = wcsstr(GetCommandLineW(), L"--settings-float ")) {
+        ShowSettings(kObjCompanion, _wtoi(pf + 17));
+    } else if (wcsstr(GetCommandLineW(), L"--settings")) {
+        ShowSettings();
+    }
 
     if (!RegisterHotKey(g_hwnd, 100, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'D')) {
         // ignore: the right click menu can still quit

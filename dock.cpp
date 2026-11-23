@@ -4647,7 +4647,7 @@ static void CompanionDelete(Companion& c);
 // Item icon size: the window's own `iconSize`, else a desktop-widget default (a 91 px strip icon
 // would make a 3-item folder as big as the screen).
 static int FloatIconPx(const Companion& c) {
-    int v = c.iconPxOv >= 0 ? c.iconPxOv : 40;
+    int v = c.iconPxOv >= 0 ? c.iconPxOv : 48;
     if (v < 16) v = 16;
     if (v > 128) v = 128;
     return v;
@@ -7709,6 +7709,24 @@ static void FloatSectionsInIni(std::vector<int>& out) {
     std::sort(out.begin(), out.end());
 }
 
+// The id a new window gets: the smallest one that is neither live nor already a section in the
+// ini. ⛔ It must NOT be the slot index: a profile can hold [float.5] and [float.3] in any order,
+// and reusing a slot index would then hand out an id another window already owns (two windows
+// writing the same section).
+static int FloatNewId() {
+    std::vector<int> used;
+    FloatSectionsInIni(used);
+    for (int id = 1; id <= kMaxFloats; id++) {
+        bool taken = false;
+        for (int u : used)
+            if (u == id) taken = true;
+        for (int i = 1; i < g_compCount && !taken; i++)
+            if (g_comps[i].id == id) taken = true;
+        if (!taken) return id;
+    }
+    return 0;
+}
+
 static void CompanionLoadOne(Companion& c, int id) {
     c = Companion();
     c.id = id;
@@ -7726,7 +7744,11 @@ static void CompanionNew(int band) {
         DLog(L"float: refused - limit %d reached", kMaxFloats);
         return;
     }
-    const int id = CompanionIndexOf(c);              // slot index == id for user windows
+    const int id = FloatNewId();
+    if (!id) {
+        DLog(L"float: refused - no free id (limit %d)", kMaxFloats);
+        return;
+    }
     c->id = id;
     c->content = kContentItems;
     c->enabled = true;
@@ -7742,7 +7764,7 @@ static void CompanionNew(int band) {
     c->hasHue = true;
     c->hue = g_hueStrip;
     c->glassCfg = g_glassStrip;
-    c->iconPxOv = 40;
+    c->iconPxOv = 48;
     c->captionOn = true;
     c->groupId = 0;                                  // independent: on the desktop, no frame
     c->follow = false;
@@ -12648,7 +12670,7 @@ static int CompKeyVal(const Companion& c, const wchar_t* key) {
     if (!wcscmp(key, L"solidOpacity")) return GetInt(c.sec, L"solidOpacity", c.id ? 235 : -1);
     if (!wcscmp(key, L"snap")) return c.snapOv;
     if (!wcscmp(key, L"band")) return c.band;
-    if (!wcscmp(key, L"iconSize")) return c.iconPxOv >= 0 ? c.iconPxOv : 40;
+    if (!wcscmp(key, L"iconSize")) return c.iconPxOv >= 0 ? c.iconPxOv : 48;
     if (!wcscmp(key, L"caption")) return c.captionOn ? 1 : 0;
     return -1;
 }
@@ -15405,6 +15427,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         ShowSettings(kObjCompanion, _wtoi(pf + 17));
     } else if (wcsstr(GetCommandLineW(), L"--settings")) {
         ShowSettings();
+    }
+    // Probe hook: "dock.exe --new-float 3" creates 3 windows the way the strip's menu does, so the
+    // creation path (ids, ini section, limit) can be tested without driving a popup menu.
+    if (const wchar_t* pn = wcsstr(GetCommandLineW(), L"--new-float ")) {
+        const int n = _wtoi(pn + 12);
+        for (int i = 0; i < n; i++) CompanionNew(1);
     }
 
     if (!RegisterHotKey(g_hwnd, 100, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'D')) {

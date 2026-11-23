@@ -1949,6 +1949,10 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
    菜单一关就恢复。老代码的托盘菜单也是这样，暂时不管。
 7. 这台机器上 `FindWindowW` 从普通进程找不到我们的窗口（老坑，§3.23）。
    新脚本一律 `EnumWindows` + 类名（`dev/t_float.ps1` 里的 `FW::All()` 可抄）。
+8. **从 PowerShell 删 ini 段要传 `[NullString]::Value`**，不是 `$null`：`$null` 会被绑成**空字符串**，
+   于是 `WritePrivateProfileStringW(sec, $null, $null, ini)` 只写出一个空键（ini 里多一行 `=`）而
+   段还在。删 `[float.N]` 的一次性做法（我就是这么清掉测试窗口的）：python 按字节按行删，
+   注意这个 ini **混用 CRLF 和 LF**（按 `\r\n` 切会把 LF 行和下一行粘在一起）。
 
 **验收（都能复跑）**
 - `dev/t_float_accept.ps1` **13/13**：写 `[float.7]` → 重载 → 窗口存在/几何/可见/无 topmost/

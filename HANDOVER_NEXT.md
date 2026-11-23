@@ -1975,6 +1975,76 @@ vis=1，但不再把 dock 抬上去），Esc 后两者恢复到 tm=1。`dev/t_zf
 4. **图标尺寸/名称字号**没有自动适配（名称字号 = 图标 26%，11–18 px 夹紧）。
 5. 右键菜单/设置页的**观感**只做了截图，没让用户实际点过（拖放、点击启动、缩放、组内跟随都待用户验）。
 
+### 3.36 用户 20:00 报的四条（2026-11-23 20:0x–20:2x）
+
+用户原话（四条，逐条对应下面的修法）
+> 时间样式、字体很丑……那个字体看起来像是从白色背景里面抠出来的，还残留着一些白色边缘。至于时间，从 github 翻一翻有没有现成好看的样式
+> 玻璃层参数调节时不影响它背景变化（透过、图片均是这样），这个应该改坏了。
+> 软件名就不要显示 .exe 后缀了。
+> 开关玻璃层时不会动态出现玻璃标签，需要关闭再打开，这个是共有问题。
+
+**1. 字体"从白底抠出来" + 时间样式**
+- 真因有两层：`DrawTextAlpha()` 原来用 `CLEARTYPE_QUALITY`（次像素渲染在透明目标上会留彩色边），
+  又把覆盖率 **×2.5**（"细边会消失"），于是那些边变成一圈可见的白边；再加上旧 `FloatDrawCaption`
+  画了两遍（偏移 1 px 的"阴影"），整块字像抠图。
+- 现在：`ANTIALIASED_QUALITY`（灰阶）+ 无放大 + **2–3 倍超采样后盒式降采样**
+  （`SUPER = px>=60?3 : px>=20?2 : 1`）。这是不引入 DirectWrite 也能拿到接近矢量光栅器的边缘层次。
+- ⛔ 超采样有个坑：GDI 按字号对字宽取整，2 倍渲染再把同一字符串排进 2 倍宽的框，
+  小字会多出 1–2 px ⇒ 面板里「透过背后」变成「透过背...」（我当场抓到）。
+  所以**小字（<20 px）保持 1 倍**，字号到 20 才开 2 倍。
+- 字色不再"猜"：`FloatTextMode()` 直接**量刚画好的背景**（采样 `c.bits`，反预乘算亮度），
+  亮底给近黑 `#1A1C22`、暗底给近白 `#F7F8FA`；只有背景"基本透明"（透过背后没开玻璃，平均 alpha<60）
+  才用白字 + **1 px 描边环**（桌面图标那套）。用户那张"浅色图片上白字"的窗口就是这么坏的。
+- 时间样式做了两套，`[float.N] clockStyle` 0/1，面板一行「时钟样式」：
+  - **极简**：`Segoe UI Light`，字号 = 短边 0.62 em（实测数字墨迹只占 em 的 0.54，
+    所以想要"看起来占 1/3 高度"就得用 0.62），字距 `-px/18`，下面一行日期/星期，`0xB0` 透明度。
+  - **翻页卡片**：深色圆角卡 HH / MM + 中缝 + 冒号点，底部日期。**静态**，没有翻页动画。
+- 参考项目（用户让我去找的，都不是拿代码，只取样式）：
+  [FullWidget](https://github.com/hmgvibe/fullwidget)（38 个组件，主题里有"玻璃上的字"，
+  时钟分数字/指针/翻页/世界时钟，可 CSS 自定义）、
+  [CleanClocks](https://github.com/javigalan99/CleanClocks)（2025，10 种极简 Rainmeter 时钟，
+  带取色器和 12/24h）、
+  [Mond Enhanced Suite](https://github.com/danielcrumpler/Mond)（极简时钟+日历+天气）、
+  [winclock](https://github.com/osoulmate/winclock)（国产简洁桌面钟：时间/阳历/农历/星期/日程提醒）、
+  以及 GitHub `flipclock` 话题下的一堆 Fliqlo 复刻（翻页样式来源）。
+
+**2. 玻璃参数调了没反应（透过、图片都一样）**
+两处，都是我在 §3.35 拆分多实例时弄坏的：
+- `PageCompanion()` 只认 `kPageFloatTray`（浮窗页），而**玻璃页的 kind 是 `kPageGlass`** ⇒ 每次调
+  玻璃参数，`PageSet` 拿到 nullptr，只去失效 `g_imgStrip`，托盘和所有浮窗的合成图/烘焙**一点都没动**。
+  现在玻璃页按 `section` 名反查实例（`[dock]` = 条的自己的缓存）。
+- 就算找到了实例，`c.glassCfg` 还是**创建时读的那份**：`LoadConfig()` 只重读 `[dock]` 的。
+  新增 `CompanionLoadGlass(c)`，`PageSet` 写完 ini 立刻重读该实例。
+- 实测：面板里把「背景模糊半径」拖到 70%，日志立刻出 `image: composed ...`，窗口背景肉眼从清晰变糊
+  （`dev/glass_before.png` → `dev/glass_after.png`）。
+
+**3. `.exe` 后缀**：`FloatItemLabelFor()` 现在去掉 `.lnk` / `.exe` / `.url`（大小写不敏感）。
+
+**4. 开关玻璃层时页签不刷新**（共有问题，条/托盘/浮窗都一样）
+`SettingsBuildPages()` 只在 `ShowSettings()` 时跑一次。现在面板记住"我在给谁开设置"
+（`g_setHintObj` / `g_setHintId`，`ShowSettings` 里记），`PageSet` 写完 `bgMode`/`glassLayer`
+就调 `SettingsRefreshPages()`：重建页签、**尽量保持当前页**（当前页还在就不跳），重排高度再画。
+实测：浮窗页点「玻璃层：关」→ 日志 `settings: obj=1 group=0 -> 1 page(s): 浮窗`，玻璃页当场消失。
+
+**顺手修的**：条目网格按"实际有几个条目"居中（以前 2 个条目在一排 5 列的格子里会靠左）。
+
+**验收 / 证据**
+- `dev/t_float_accept.ps1` 仍然 **13/13**。
+- 截图：`dev/clock_minimal.png`（极简 20:21）、`dev/clock_flip.png`（翻页 20:21）、
+  `dev/settings_float_clock.png`（浮窗页多了「时钟样式」行）、
+  `dev/float1_now.png`（用户自己那块模糊图片背景的窗口：条目居中、名称为 "Windows"/"notepad"、
+  白色文字带细描边）、`dev/bg_row_new2.png`（「透过背后」不再被截断）。
+
+**自动化面板点击的坑（写脚本的人一定要看）**
+dock 进程是 **DPI-unaware**（没有 manifest），而探针按 §1.5 必须是 per-monitor aware，
+于是**跨上下文投递的鼠标坐标会被系统按 125% 重算**：我 post 的 (383,258) 到了程序里变成 (479,323)，
+点到了别的行（把「纯色不透明度」拉成了 55%，排查了一轮）。**投递前除以缩放比**（这台机器 /1.25），
+或者把探针改成 DPI-unaware。这次就是靠这个才把「玻璃参数」和「页签刷新」两条实测下来的。
+
+**行尾警告**：有一次 `edit` 之后整份 `dock.cpp` 变成了 CRLF，那一次提交是"15701 增 / 15457 删"的
+全文件噪声（已把文件改回 LF 并 amend）。现在有 `.gitattributes`（`*.cpp text eol=lf`）兜底，
+提交前后请看一眼 `git show --stat`。
+
 
 
 

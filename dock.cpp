@@ -13429,7 +13429,9 @@ static void SettingsPaint() {
         if (!wcscmp(row.key, L"image")) {
             // The picture row: current file name, then two square buttons - clock = pick from the
             // gallery, + = add a new picture (and copy it in).
-            std::wstring cur = ImagePathFor(p->section == L"traybar" ? L"traybar" : L"dock");
+            // Read the picture of *this* page's own section: ImagePathFor already falls back to
+            // [dock] for the tray's "inherit the strip" rule, and a [float.N] window has its own.
+            std::wstring cur = ImagePathFor(p->section.c_str());
             std::wstring name = cur;
             size_t slash = cur.find_last_of(L"\\/");
             if (slash != std::wstring::npos) name = cur.substr(slash + 1);

@@ -1,0 +1,6 @@
+# The sources are stored and checked out with LF, whatever core.autocrlf says: a CRLF conversion
+# once rewrote the whole file in a single commit (15k lines of noise) and made the history useless.
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.ps1   text eol=lf
+*.md    text eol=lf

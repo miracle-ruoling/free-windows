@@ -1,8 +1,0 @@
-01:44:00.249 hover -> 1
-01:44:00.659 thumb timer fired, hover=1
-01:44:00.660 thumb: register slot=1 item=1 hwnd=0000000000180E1E
-01:44:29.809 thumb timer fired, hover=1
-01:44:29.810 thumb: register slot=1 item=1 hwnd=0000000000180E1E
-01:45:00.342 hover -> 2
-01:45:00.746 thumb timer fired, hover=2
-01:45:00.747 thumb: register slot=2 item=2 hwnd=00000000004F0DA4

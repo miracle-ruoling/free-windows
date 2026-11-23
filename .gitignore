@@ -31,6 +31,10 @@ dev/*.out
 *.bak[0-9]*
 cur.txt
 out*.txt
+# one-off patch scripts and check dumps from earlier sessions: useful to the session that wrote
+# them, clutter in a repo (they stay in the history, just not at the tip)
+/patch*.py
+/*check.txt
 
 # ---- editor / os ----
 .vscode/

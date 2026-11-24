@@ -5690,6 +5690,24 @@ static bool GroupBlocksMove(Companion* c) {
     return g ? g->blockMove : false;
 }
 
+// Is any member of this group under the pointer right now? The edge glue must stand down while it
+// is (see HideEdgeTick): the glue moves the *whole* group, so a member being dragged and the glue
+// fight over it, and the members nobody is holding keep whatever the glue did.
+// ⛔ `pressActive` counts too, not just `dragging`: a click only becomes a drag after 4 px, and the
+// glue ran in that window and moved the strip 13 px away from the window the user was about to
+// drag (measured 2026-11-24 - that is the "两块窗口互相位移" he reported).
+static bool StripResizeBusy();     // defined with the strip's drag code (needs g_resizeEdge)
+static bool StripPressBusy();      // ditto (needs g_pressActive)
+static bool GroupMemberBusy(Group& g) {
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || c.groupId != g.id) continue;
+        if (c.dragging || c.resizing || c.pressActive) return true;
+    }
+    if (g.id == 1 && (g_dragging || StripResizeBusy() || StripPressBusy())) return true;
+    return false;
+}
+
 static void GroupLoad(Group& g) {
     wchar_t sec[32];
     GroupSectionName(g.id, sec, 32);
@@ -6350,6 +6368,58 @@ static void HidePlaceAtGap(Group& g, int side) {
     GroupMoveBy(g, dx, dy);
 }
 
+// A member being moved inside an edge-pinned, awake group must not push the group's *pinned* edge
+// past the pin. It cannot be allowed to: the glue would answer by moving the whole group (and with
+// it every other member), which is exactly what the user reported as "上移一块，另一块自己往下跑"
+// (2026-11-24). Clamping the moved member at the pinned boundary is his own suggestion and needs no
+// new state: the pin does not move, so the group does not move, so nothing else reacts.
+// `self` = the member being moved (nullptr = the strip). `r` is its proposed rect (in place).
+static void GroupPinClamp(Group& g, Companion* self, RECT* r) {
+    if (!g.hideEdge || g.hideSide < 0 || g.hideSlide < 0.99f) return;
+    RECT others{};
+    bool have = false;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (&c == self || !c.hwnd || !c.enabled || c.groupId != g.id) continue;
+        RECT mr = c.rc;
+        if (have) UnionRect(&others, &others, &mr);
+        else { others = mr; have = true; }
+    }
+    if (g.id == 1 && self && g_hwnd) {        // the strip is the other member of group 1
+        RECT sr{};
+        if (GetWindowRect(g_hwnd, &sr)) {
+            if (have) UnionRect(&others, &others, &sr);
+            else { others = sr; have = true; }
+        }
+    }
+    if (!have) return;                        // a group of one: the pin simply follows the window
+    RECT uni = others;
+    UnionRect(&uni, &uni, r);
+    const RECT mon = HideMonitorRect(g.hwnd ? g.hwnd : g_hwnd);
+    // ⛔ The 15 px gap is measured to the *frame*, and GroupBounds() inflates the members' union by
+    // the margin - so the members' own limit is kHideGap + margin. Clamping to kHideGap alone left
+    // the dragged member 13 px above the group's inner edge (margin = 13 on this profile), and the
+    // glue then pulled the whole group down by exactly that, moving the *other* member: the drift
+    // was still there after the first version of this clamp (measured 2026-11-24).
+    const int pin = kHideGap + g.margin;
+    int dx = 0, dy = 0;
+    switch (g.hideSide) {
+        case 0: if (uni.top < mon.top + pin) dy = (mon.top + pin) - uni.top; break;
+        case 1: if (uni.right > mon.right - pin) dx = (mon.right - pin) - uni.right; break;
+        case 2: if (uni.bottom > mon.bottom - pin) dy = (mon.bottom - pin) - uni.bottom; break;
+        default: if (uni.left < mon.left + pin) dx = (mon.left + pin) - uni.left; break;
+    }
+    if (!dx && !dy) return;
+    OffsetRect(r, dx, dy);
+    static DWORD lastLog = 0;
+    const DWORD now = GetTickCount();
+    if (!lastLog || now - lastLog >= 400) {
+        lastLog = now;
+        DLog(L"hide: group %d pinned edge held - moved member clamped by %d,%d (side=%d)", g.id, dx,
+             dy, g.hideSide);
+    }
+}
+
 static void HideEdgeAttach(Group& g) {
     RECT b{};
     if (!GroupBounds(g, &b)) {
@@ -6580,8 +6650,13 @@ static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
     }
 
     // ---- glue to the perimeter whenever it is awake and at rest ----
+    // ⛔ "at rest" has to mean *no member is being dragged or resized either*. The glue moves the
+    // whole group, so while the pointer owns one member it yanked that member back every tick
+    // (the next mouse move put it back under the cursor) and the OTHER members took the glue's move
+    // with nobody to undo it: that is how the strip and the tray ended up 149 px apart with
+    // 屏蔽位移 on and nothing being dragged (measured 2026-11-24, group frame 115 -> 264 px tall).
     if (g.hideSlide >= 1.0f && !g.drag.active && !g.scale.active && !g_dragging &&
-        !g_dragMovePending) {
+        !g_dragMovePending && !GroupMemberBusy(g)) {
         HidePlaceAtGap(g, HideNearestSide(awake, mon));
     }
 
@@ -7453,8 +7528,14 @@ static LRESULT CALLBACK CompanionProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (Group* g = GroupById(c.groupId)) GroupRecompute(*g);
                     return 0;
                 }
-                CompanionSetRect(c, p.x - c.dragStart.x, p.y - c.dragStart.y,
-                                 c.rc.right - c.rc.left, c.rc.bottom - c.rc.top, false);
+                RECT want{p.x - c.dragStart.x, p.y - c.dragStart.y,
+                          p.x - c.dragStart.x + (c.rc.right - c.rc.left),
+                          p.y - c.dragStart.y + (c.rc.bottom - c.rc.top)};
+                // A pinned group's edge does not move because a member is being dragged into it
+                // (see GroupPinClamp).
+                if (Group* g = GroupById(c.groupId)) GroupPinClamp(*g, &c, &want);
+                CompanionSetRect(c, want.left, want.top, want.right - want.left,
+                                 want.bottom - want.top, false);
                 if (Group* g = GroupById(c.groupId)) GroupRecompute(*g);   // live
                 return 0;
             }
@@ -11028,6 +11109,10 @@ static POINT g_pressScreen{};
 static int g_resizeEdge = 0;
 static RECT g_resizeRect{};
 static POINT g_resizeOrigin{};
+
+// The strip's own edge-resize is a gesture like a drag (see GroupMemberBusy).
+static bool StripResizeBusy() { return g_resizeEdge != 0; }
+static bool StripPressBusy() { return g_pressActive; }
 
 // Which edge/corner is under the point? Two zones, because one is not enough:
 //  * a generous square at each window corner - always easy to hit, and it is

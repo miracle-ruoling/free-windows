@@ -11725,13 +11725,21 @@ static bool ZAnyOursTopmost() {
     return false;
 }
 
-// A capture tool in its "pick a region" state: topmost, and owning (nearly) a whole monitor.
-// Every snipping UI looks like this; a recorder does not.
-// NOTE (measured 2026-11-22): the window that actually holds the foreground while the snip is up
-// is SnippingTool's `SnipOverlayRootWindow`, and DWM reports it *cloaked* (the visible part is its
-// child `XamlWindow`) - so do NOT test IsCloaked() on the foreground here, or the whole capture
-// branch never runs and the dock only "happens" to be behind, until some other code path
-// re-asserts it and it pops up over the selection box.
+// Topmost and (nearly) a whole monitor. Every snipping UI looks like this; so does a fullscreen
+// game or a fullscreen video; a small always-on-top chat window (QQ's 钉在桌面上) does not.
+static bool ZIsFullscreenTopmost(HWND h) {
+    if (!h || !IsWindow(h)) return false;
+    if (!(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return false;
+    RECT r{};
+    if (!GetWindowRect(h, &r)) return false;
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+    const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    return (r.right - r.left) * 10 >= mw * 9 && (r.bottom - r.top) * 10 >= mh * 9;
+}
+
 static bool ZIsCaptureWindow(HWND h) {
     if (!h || !IsWindow(h) || h == GetShellWindow()) return false;
     DWORD pid = 0;
@@ -11743,26 +11751,22 @@ static bool ZIsCaptureWindow(HWND h) {
     wchar_t cls[64]{};
     if (!GetClassNameW(h, cls, 64)) return false;
     if (ZExemptClass(cls)) return false;
-    if (!(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return false;
-    RECT r{};
-    if (!GetWindowRect(h, &r)) return false;
-    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{sizeof(mi)};
-    if (!GetMonitorInfoW(mon, &mi)) return false;
-    int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-    int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    return (r.right - r.left) * 10 >= mw * 9 && (r.bottom - r.top) * 10 >= mh * 9;
+    return ZIsFullscreenTopmost(h);
 }
 
 // Any window of `pid` still floating above everything? That is what a capture tool looks like
 // once the region is picked: the box disappears and a small topmost toolbar ("more settings")
 // stays. Cloaked windows do not count - the overlay host keeps a cloaked root window around
 // after the session, and that must not keep us demoted forever.
-static bool ZPidTopmostVisible(DWORD pid) {
+// ⛔ `needFullscreen` exists because "any topmost visible window" is far too weak to *hold* a
+// latch: QQ's pinned chat window is topmost, visible and 558x500, and it kept the dock demoted for
+// 18 minutes (2026-11-24 23:08). A long hold therefore requires a fullscreen window.
+static bool ZPidTopmostVisible(DWORD pid, bool needFullscreen) {
     struct Ctx {
         DWORD pid;
         bool found;
-    } c{pid, false};
+        bool needFullscreen;
+    } c{pid, false, needFullscreen};
     EnumWindows(
         [](HWND h, LPARAM lp) -> BOOL {
             auto* c = reinterpret_cast<Ctx*>(lp);
@@ -11771,6 +11775,7 @@ static bool ZPidTopmostVisible(DWORD pid) {
             if (p != c->pid) return TRUE;
             if (!IsWindowVisible(h) || IsCloaked(h)) return TRUE;
             if (!(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) return TRUE;
+            if (c->needFullscreen && !ZIsFullscreenTopmost(h)) return TRUE;
             c->found = true;
             return FALSE;
         },
@@ -11800,9 +11805,9 @@ static bool ZCaptureActive(DWORD now, bool overlayAboveUs, DWORD overlayPid) {
         return true;
     }
     HWND fg = GetForegroundWindow();
-    if (fg && ZIsCaptureWindow(fg)) {
-        DWORD fgPid = 0;
-        GetWindowThreadProcessId(fg, &fgPid);
+    DWORD fgPid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &fgPid);
+    if (fg && fgPid != GetCurrentProcessId() && ZIsCaptureWindow(fg)) {
         if (g_zCapturePid != fgPid) {
             wchar_t cls[64]{};
             GetClassNameW(fg, cls, 64);
@@ -11813,9 +11818,24 @@ static bool ZCaptureActive(DWORD now, bool overlayAboveUs, DWORD overlayPid) {
         return true;
     }
     if (g_zCapturePid) {
-        if (ZPidTopmostVisible(g_zCapturePid)) {
+        // Hold while the latched session is *still an overlay*:
+        //   * a fullscreen topmost window of that pid (a snip box, a game, a fullscreen video), or
+        //   * a small topmost one that is still the *foreground* - that is the snipping tool's
+        //     toolbar phase ("save / copy / annotate") - and only for the first minute. A capture
+        //     session is seconds long; a window that keeps a latch for longer is just somebody's
+        //     always-on-top window (QQ's 钉在桌面上 held it for 18 min on 2026-11-24).
+        const bool fullscreen = ZPidTopmostVisible(g_zCapturePid, true);
+        const bool youngFg = (fgPid == g_zCapturePid) && (now - g_zCaptureSeenAt < 60000);
+        if (fullscreen || youngFg) {
             g_zCaptureSeenAt = now;
             return true;
+        }
+        if (ZPidTopmostVisible(g_zCapturePid, false)) {
+            wchar_t cls[64]{};
+            if (fg) GetClassNameW(fg, cls, 64);
+            DLog(L"zwatch: pid=%u still has a topmost window but nothing fullscreen and fg=%s - "
+                 L"releasing the latch",
+                 g_zCapturePid, cls);
         }
         // Grace: a tool blinks its own windows while it switches phases, and flapping would cost
         // two z-order round trips for nothing.

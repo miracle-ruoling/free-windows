@@ -2166,6 +2166,57 @@ dock 进程是 **DPI-unaware**（没有 manifest），而探针按 §1.5 必须�
   topmost 窗口"这种判据，永远会有用户自己的置顶窗口来踩。以后给这类状态加条件时，先问一句
   "如果一个普通用户的置顶小窗正好满足它，会怎样"。
 
+### 3.40 ⚠️ 未解决：点图标"有时没反应"（2026-11-24 23:42 用户报，留给下一次会话）
+
+用户原话：**"刚刚两次点击图标成功了，但是再往前几次点击了但是没响应，为什么？日志能推断出不？"**
+
+**已有的日志证据**（这次运行的 `dock.log`，条上每次点击都会留一行 `LBUTTONDOWN` + 一行 `click slot=`）：
+```
+22:24:16.403 LBUTTONDOWN at 719,46 slot=-1 of 9 (alpha=255 through=0)
+22:24:16.533 drag start                       <- 空位点击被当成拖拽起手
+22:24:19.577 LBUTTONDOWN at 716,51 slot=-1 of 9 ...   drag start
+22:45:09.469 LBUTTONDOWN at 705,81 slot=-1 of 9        <- 之后没有任何 click 行
+22:36:08.008 click slot=4 hwnd=0000000000000000 lnk=...\EchoMusic.lnk    <- 启动（lnk 路径）
+23:41:43.942 click slot=8 hwnd=0000000000000000 lnk=     <- 8 = 箭头("^")，见下
+23:41:43.943 tray: native flyout toggle (wasOpen=0 flyout=...020950)     <- 它其实开出了托盘面板
+23:41:46.495 click slot=4 hwnd=0000000000010A26 lnk=     <- 用户说的"成功"两次是这种
+```
+`layout: cap=9 show=7 cells=9 scroll=0 items=8 win=45,10-112,77 chevron=629,10-696,77`
+⇒ 9 个格子 = Windows 键 + 7 个图标 + 箭头，**条宽 741 但格子只占 45..696**，所以右侧
+（约 696..741）和左侧（0..45）都是**空白尾巴**，点在 `slot=-1`。
+
+**从日志能确定的两类"没反应"**
+1. **点在空白处**：`slot=-1` ⇒ 走"空白双击闪避"分支，单次点击**什么都不做**，而且会把那次按下当成
+   拖拽起手（`drag start`），条可能被挪几个像素——用户体感就是"点了没反应"。目前**分不清**是用户
+   真的点在图标之间，还是**命中矩形和画出来的图标不一致**（例如 hover 放大后图标变宽、而
+   `g_slots[i].rc` 还是基准尺寸 ⇒ 视觉上压在图标上、命中却在缝里）。**这是第一要查的。**
+2. **点在图标上、`click slot=N hwnd=...` 有行但窗口没到前面**：`ActivateWindow()` **一行日志都不打**，
+   所以日志只能证明"我们收到了点击"，证明不了"把窗口拉起来了"。可能被
+   `g_friendPid`/`g_focusGraceUntil`、任务栏 deny/cloak、或前台锁挡掉。**第二要查的。**
+   （第 3 类：箭头那次其实成功开出了原生托盘面板，只是 1.5 s 后又被关掉，别误判成 bug。）
+
+**建议的下一次会话怎么做（先量，别猜）**
+1. 在 `ActivateWindow()` 里加日志：目标 hwnd / 调用前后 `GetForegroundWindow()` / 是否成功，
+   失败时打原因（`IsIconic`、`IsWindowVisible`、owner、UIPI 拒绝……）。
+2. 在 `WM_LBUTTONUP` 的 `slot=-1` 分支里加一行：**打印当时的全部 `g_slots[].rc` 和点击点**，
+   再顺带打印 `g_hover` 与 hover 放大的当前倍率——这样"视觉上在图标上、命中在缝里"立刻能看出来。
+   对照 `SlotAt()`/`ComputeButtons()` 与绘制里的 zoom 计算（`Paint()` 的 `clipL/clipR`、
+   `g_hover`、`g_iconPx` 那一段），确认命中用的是放大后的矩形还是基准矩形。
+3. 复现脚本：`SetCursorPos` 到某个图标的**左/右边缘 ±2 px** 各点一次，看 `click slot=` 是几号；
+   再用 `hoverat.ps1` 之类把光标停住再点（排除"移动中点击"的干扰）。
+4. 顺带看一眼那两条 `slow: companion visibility tick 13.7 ms` / `state+visibility 21.7 ms`
+   （每次淡入淡出/贴边动画期间都会出现）：20–40 ms 的 UI 线程停顿不会丢点击，但会让点击"迟到"，
+   如果它出现在点击路径上，用户也会觉得"点了没反应"。量一下 `CompanionVisibilityTick` 里
+   `GroupRecompute`/`TrayRepaint`/`SetWindowPos` 各自占多少（§3.37 的 `profMark` 手法可复用）。
+
+**相关代码位置**：`WndProc` 的 `WM_LBUTTONUP`（`click slot=` 那一大段分支）、`g_pressSlot`/`g_pressHwnd`/
+`g_pressLnk` 的赋值（`WM_LBUTTONDOWN`）、`SlotAt()`/`ComputeButtons()`、`ActivateWindow()`、
+`kSlotWin=-3` / `kSlotChevron=-1`（注意 `kSlotChevron` 与"空白"的 `-1` **同值**，日志里
+`click slot=-1` 是空白、`click slot=8` 才是箭头，别混）。
+
+**日志能否推断的结论**：能推断到"这次点击落在了哪个格子/是不是空白"，**推不出**"点在了图标上但窗口没起来"——
+后者需要先补 `ActivateWindow` 的日志，这也是下一次会话的第一件事。
+
 
 
 

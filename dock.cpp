@@ -10051,11 +10051,34 @@ static void PressWatchTick() {
         if (fromHook) { q = hookPt; have = true; }
         else have = GetCursorPos(&q) != FALSE;
         if (have) {
-            RECT zone{};
-            GetWindowRect(g_hwnd, &zone);
+            RECT box{};
+            GetWindowRect(g_hwnd, &box);
             Group& dg = DefaultGroup();
-            if (dg.hideEdge && dg.awakeValid && dg.hideSlide < 0.999f) zone = dg.awakeBox;
+            const bool parked = dg.hideEdge && dg.awakeValid && dg.hideSlide < 0.999f;
+            if (parked) box = dg.awakeBox;
+            RECT zone = box;
             InflateRect(&zone, 24, 24);
+            // ★ 条正藏着，而用户点在"条应该在的位置"：把它唤出来。
+            // 只认**落在某个图标格子上**的按下（不是整条框），因为这条带子在最上面一条，
+            // 把"整框"都当成唤出区会让"点浏览器标签栏"也把条弹出来；格子是用户真正瞄准的东西。
+            // 不替他点图标（点下去的可能是别的窗口，替他启动程序风险太大），但必须有反馈：
+            // 否则用户会觉得"点了图标什么都没发生"（2026-11-25 02:41 的两次
+            // `press: ... NOT ours (hidden=1)` 就是这个：条已经收了 37 s，他还在点它的位置）。
+            if (parked && PtInRect(&box, q) && !g_slots.empty()) {
+                POINT c{q.x - (box.left + dg.margin), q.y - (box.top + dg.margin)};
+                int miss = 0;
+                int cell = PickSlot(c, &miss);
+                if (cell >= 0 && miss == 0) {
+                    static DWORD lastWakeByPress = 0;
+                    const DWORD t0 = GetTickCount();
+                    if (!lastWakeByPress || t0 - lastWakeByPress >= 400) {
+                        lastWakeByPress = t0;
+                        DLog(L"press: %ld,%ld is on cell %d of the *hidden* bar - waking the group",
+                             (long)q.x, (long)q.y, cell);
+                    }
+                    HideBegin(dg, true, t0);
+                }
+            }
             if (PtInRect(&zone, q)) {
                 HWND hit = WindowFromPoint(q);
                 DWORD pid = 0;

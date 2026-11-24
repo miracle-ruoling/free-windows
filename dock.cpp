@@ -546,10 +546,17 @@ static void LoadConfig() {
     }
 }
 
+// 贴边隐藏 现在对"默认组"施加的平移（写 ini 时要抵消）。藏起来时条和它的成员是被整体平移过的，
+// 把这个位置持久化，下次启动两个窗口就会差一整个 shift（实测 143 px），组框也变成 266 高、
+// 条被 glue 推下去 143 px —— 用户看到的是"条不在原来的位置，点图标没反应"（2026-11-25 01:43）。
+static int g_hidePersistX = 0, g_hidePersistY = 0;
+
 static void SavePosition() {
     wchar_t b[32];
-    swprintf_s(b, L"%d", g_cfg.x); WritePrivateProfileStringW(L"dock", L"x", b, g_iniPath.c_str());
-    swprintf_s(b, L"%d", g_cfg.y); WritePrivateProfileStringW(L"dock", L"y", b, g_iniPath.c_str());
+    swprintf_s(b, L"%d", g_cfg.x + g_hidePersistX);
+    WritePrivateProfileStringW(L"dock", L"x", b, g_iniPath.c_str());
+    swprintf_s(b, L"%d", g_cfg.y + g_hidePersistY);
+    WritePrivateProfileStringW(L"dock", L"y", b, g_iniPath.c_str());
     WritePrivateProfileStringW(L"dock", L"hasPos", L"1", g_iniPath.c_str());
     CompanionSaveAllPositions();      // attached windows moved with us; keep the ini honest
 }
@@ -5172,9 +5179,17 @@ static bool FloatContentTick(Companion& c, DWORD now) {
 static void CompanionSave(Companion& c) {
     if (g_iniPath.empty()) return;
     wchar_t b[32];
-    swprintf_s(b, L"%d", c.rc.left);
+    // A member of the default group is translated while 贴边隐藏 has it parked. Persisting *that*
+    // position is what put the tray 143 px above the strip in the ini, which on the next start made
+    // the group 266 px tall and pushed the strip down by a whole shift (see g_hidePersistY).
+    int sx = c.rc.left, sy = c.rc.top;
+    if (c.follow && c.groupId == 1) {
+        sx += g_hidePersistX;
+        sy += g_hidePersistY;
+    }
+    swprintf_s(b, L"%d", sx);
     WritePrivateProfileStringW(c.sec, L"x", b, g_iniPath.c_str());
-    swprintf_s(b, L"%d", c.rc.top);
+    swprintf_s(b, L"%d", sy);
     WritePrivateProfileStringW(c.sec, L"y", b, g_iniPath.c_str());
     swprintf_s(b, L"%d", c.rc.right - c.rc.left);
     WritePrivateProfileStringW(c.sec, L"w", b, g_iniPath.c_str());
@@ -5184,8 +5199,8 @@ static void CompanionSave(Companion& c) {
     WritePrivateProfileStringW(c.sec, L"follow", c.follow ? L"1" : L"0", g_iniPath.c_str());
     swprintf_s(b, L"%d", c.groupId);
     WritePrivateProfileStringW(c.sec, L"group", b, g_iniPath.c_str());
-    DLog(L"float: saved id=%d [%s] %ld,%ld %ldx%ld (follow=%d group=%d)", c.id, c.sec,
-         (long)c.rc.left, (long)c.rc.top, (long)(c.rc.right - c.rc.left),
+    DLog(L"float: saved id=%d [%s] %d,%d (awake %d,%d) %ldx%ld (follow=%d group=%d)", c.id, c.sec,
+         (int)c.rc.left, (int)c.rc.top, sx, sy, (long)(c.rc.right - c.rc.left),
          (long)(c.rc.bottom - c.rc.top), (int)c.follow, c.groupId);
 }
 
@@ -6830,6 +6845,12 @@ static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
             case 2: GroupMoveBy(g, 0, d); break;
             default: GroupMoveBy(g, -d, 0); break;
         }
+    }
+    // ---- 写 ini 时要抵消的平移（见 g_hidePersist*）----
+    // 藏起来的组是被整体平移过的；把这个位置持久化，下次启动条和成员就会差一整个 shift。
+    if (g.id == 1) {
+        g_hidePersistX = (g.hideSide == 1) ? -g.hideShift : (g.hideSide == 3) ? g.hideShift : 0;
+        g_hidePersistY = (g.hideSide == 0) ? g.hideShift : (g.hideSide == 2) ? -g.hideShift : 0;
     }
     // ---- 藏起来的时候，组必须正好停在滑动轨道上 ----
     // 轨道 = 基准框平移 -hideShift，保证"唤醒"精确抵消"藏起"。以前只要有一个成员在藏起来期间
@@ -10013,6 +10034,44 @@ static void PressWatchTick() {
         }
     }
     if (!l && !r) return;
+    // §3.44 诊断： "点了条上的图标，但什么都没发生，日志里连一下按下都没有"。
+    // 这条按下如果我们没收到，就一定是落在了别人的窗口上 —— 记录下来：谁接走的、条当时在哪、
+    // 组是醒着还是藏着。只记"落在条（或它醒着时的位置）附近、且不是本进程"的按下，不刷屏。
+    if (l && g_hwnd) {
+        POINT q{};
+        bool have = false;
+        if (fromHook) { q = hookPt; have = true; }
+        else have = GetCursorPos(&q) != FALSE;
+        if (have) {
+            RECT zone{};
+            GetWindowRect(g_hwnd, &zone);
+            Group& dg = DefaultGroup();
+            if (dg.hideEdge && dg.awakeValid && dg.hideSlide < 0.999f) zone = dg.awakeBox;
+            InflateRect(&zone, 24, 24);
+            if (PtInRect(&zone, q)) {
+                HWND hit = WindowFromPoint(q);
+                DWORD pid = 0;
+                if (hit) GetWindowThreadProcessId(hit, &pid);
+                if (hit && pid != GetCurrentProcessId()) {
+                    static DWORD lastLanding = 0;
+                    const DWORD t = GetTickCount();
+                    if (!lastLanding || t - lastLanding >= 300) {
+                        lastLanding = t;
+                        wchar_t cls[64]{};
+                        GetClassNameW(hit, cls, 64);
+                        RECT sr{};
+                        GetWindowRect(g_hwnd, &sr);
+                        DLog(L"press: left %ld,%ld went to %p pid=%lu cls=%s - NOT ours "
+                             L"(strip %ld,%ld-%ld,%ld slide=%.2f hidden=%d)",
+                             (long)q.x, (long)q.y, (void*)hit, (unsigned long)pid, cls,
+                             (long)sr.left, (long)sr.top, (long)sr.right, (long)sr.bottom,
+                             dg.hideEdge ? dg.hideSlide : 1.0f,
+                             (int)(dg.hideEdge && dg.hideSlide < 0.5f));
+                    }
+                }
+            }
+        }
+    }
     if (!g_gridVisible && !g_menuOpen) return;      // nothing to dismiss
     POINT p{};
     if (fromHook) p = hookPt;

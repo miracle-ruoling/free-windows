@@ -3018,20 +3018,21 @@ static bool IsInFront(HWND h) {
     return false;
 }
 
-// "This is the window the user is looking at" - the test for the click toggle, and stricter
-// than IsInFront on purpose. IsInFront also says yes to a window that merely owns its thread's
-// active state after the foreground moved to another process, and minimising a window that is
-// already covered is invisible: the click then reads as "it did nothing". That is exactly the
-// 23:41:46 line `click slot=4` -> `minimize` while another app had just been raised (§3.40).
+// "This is the window the user is looking at" - the test for the click toggle. Two inputs,
+// and neither is enough alone:
+//  * the *focus*: if some other window has the keyboard focus, h is not what the user is
+//    reading, so raise it instead of hiding it;
+//  * "nothing of anyone's is painted over its middle" (`IsTopAtCenter`), which is the only
+//    reliable signal on a machine where GetForegroundWindow() is NULL most of the time.
+// ⛔ Do NOT require `FrontmostAppWindow() == h` as the no-focus fallback (first attempt,
+// 2026-11-25 00:18): the front of the z-order here is the QQ "钉在桌面上" always-on-top mini
+// window, so *every* ordinary app failed the test and the toggle stopped working completely -
+// "点图标能弹出，但再点一次 100% 不收回" (§3.42).
 static bool IsFrontAndVisible(HWND h) {
     if (!h || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
     HWND fg = GetForegroundWindow();
-    if (fg) {
-        if (fg != h) return false;
-    } else if (FrontmostAppWindow() != h) {
-        return false;      // no foreground at all on this machine: use the z-order instead
-    }
-    return IsTopAtCenter(h);   // and nothing of anyone's is painted over its middle
+    if (fg && fg != h) return false;    // somebody else owns the focus: raise, never hide
+    return IsTopAtCenter(h);            // and nothing of anyone's is painted over its middle
 }
 
 // ShowWindow across processes is unreliable (it just posts), so ask the window
@@ -15679,12 +15680,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     GetWindowThreadProcessId(g_pressHwnd, &opid);
                     g_friendPid = opid;
                     g_focusGraceUntil = GetTickCount() + 300;
-                    // What the raise/minimise decision will see. "clicked and nothing happened"
-                    // used to be unattributable because this was never written down (§3.40).
-                    DLog(L"click: slot=%d -> %p iconic=%d inFront=%d onTop=%d fg=%p", g_pressSlot,
-                         (void*)g_pressHwnd, (int)IsIconic(g_pressHwnd),
+                    // What the raise/minimise decision will see, plus the decision itself
+                    // (`toggle=1` = this click hides the window). "clicked and nothing
+                    // happened" used to be unattributable because this was never written
+                    // down (§3.40/§3.42).
+                    DLog(L"click: slot=%d -> %p iconic=%d inFront=%d onTop=%d fg=%p toggle=%d",
+                         g_pressSlot, (void*)g_pressHwnd, (int)IsIconic(g_pressHwnd),
                          (int)IsInFront(g_pressHwnd), (int)IsTopAtCenter(g_pressHwnd),
-                         (void*)GetForegroundWindow());
+                         (void*)GetForegroundWindow(),
+                         (int)(g_cfg.clickActiveMinimizes && IsFrontAndVisible(g_pressHwnd)));
                     ActivateWindow(g_pressHwnd);
                 } else if (!g_pressLnk.empty()) {
                     g_focusGraceUntil = GetTickCount() + 2000;   // the app is starting

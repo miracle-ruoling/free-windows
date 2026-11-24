@@ -2329,6 +2329,55 @@ activate: plain ok / alt tap ok / SwitchToThisWindow ok / gave up ...           
 - 右键（`WM_RBUTTONUP`）仍是严格命中，没加容差：右键空白弹的是条自己的菜单，属于有意行为。
 - 5 秒内的两次"空白单击"仍会触发 `dodgeOnDoubleClick`（躲闪），这是用户要的功能，别当成 bug。
 
+### 3.42 ✅ 已修（§3.41 第 4 条的过度修正）：再点图标不收回（2026-11-25 00:20，用户复测）
+
+用户原话：**"现在点图标能正常弹出，但是 100% 出现再点图标不收回（我确认我点的图标正中央、没有手抖变成拖动）"**。
+
+**证据（§3.41 加的日志正好抓住了它）**
+```
+00:18:14.796 click: slot=4 -> 3F0AE0 iconic=0 inFront=1 onTop=1 fg=0000000000000000
+00:18:15.236 click: slot=4 -> 3F0AE0 iconic=0 inFront=1 onTop=1 fg=0000000000000000
+            → 两次都是 activate: plain ok，从不 minimize
+00:17:59.683 click: slot=3 -> 2AF0D96 iconic=0 inFront=1 onTop=1 fg=0000000000000000
+            → minimize: iconicAfter=1        （只有这一个窗口能收回）
+```
+
+**根因**：`IsFrontAndVisible()` 在"没有前台窗口"时的回退判据用了
+`FrontmostAppWindow() == h`。这台机器 `GetForegroundWindow()` **几乎恒为 NULL**（§3.19 就记过），
+而 z 序第一名是 **QQ「钉在桌面上」那个 always-on-top 小窗** —— 于是除了它自己，
+**任何窗口都不满足**，`clickActiveMinimizes` 等于被关掉：`inFront=1 onTop=1` 也只是"再抬起一次"。
+
+**修法**（只改判据，不动"被盖住就别隐藏"那条）：
+```cpp
+static bool IsFrontAndVisible(HWND h) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != h) return false;    // 有别人拿着焦点：抬起，不隐藏
+    return IsTopAtCenter(h);            // 且中心点没被任何东西盖住
+}
+```
+- **不能**再用 `FrontmostAppWindow()` 当"前台"的替身（见上面的根因）；
+- **也不能**只看 `IsInFront()`：它对"本线程活动窗口"也会给真，被盖住的窗口就会被
+  **看不见地最小化**（§3.40 第 4 条的原故障）；
+- 于是判据拆成两半：**焦点**（有别人拿着焦点就别隐藏）+ **中心点可见性**（盖住了就别隐藏）。
+- 顺手给 `click: slot=...` 加了 `toggle=0/1`：这一行现在**直接说明这次点击会不会收回窗口**。
+
+**验证（`SendMessage` 合成按下，真窗口操作；三种状态都过）**
+```
+最小化中 → 点：click: slot=4 -> 3F0AE0 iconic=1 ... toggle=0 → activate: plain ok   （还原）
+在后台但可见 → 点：click: slot=4 -> 3F0AE0 iconic=0 inFront=0 onTop=0 fg=160892 toggle=0 → alt tap ok（抬起）
+已在前台   → 点：click: slot=4 -> 3F0AE0 iconic=0 inFront=1 onTop=1 fg=3F0AE0 toggle=1 → minimize: iconicAfter=1（收回）
+再点一次   → click: slot=4 -> 3F0AE0 iconic=1 ... toggle=0 → activate: plain ok        （又还原）
+```
+文件资源管理器（`3F0AE0`）按"抬起 → 收回 → 还原"循环，和用户的预期一致；
+被别的窗口盖住中心点时仍然只会抬起（不会"看不见地最小化"）。
+
+**教训**：**这台机器必须假设 `GetForegroundWindow()` 是 NULL**（§3.19、§3.40 都踩过），
+任何"是不是前台"的判断都不能拿 `FrontmostAppWindow()` 顶替 —— z 序第一名经常是
+用户自己的置顶小窗，而不是用户正在看的窗口。判断"用户在看的窗口"只有两个可靠信号：
+**焦点是谁**、**它的中心点有没有被遮挡**。
+
+
 
 
 

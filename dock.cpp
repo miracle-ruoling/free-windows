@@ -6368,6 +6368,10 @@ static void GroupDragEnd(Group& g) {
 #define kHideExtra 5         // slide out until the group is this far outside the screen
 #define kHideLeavePad 20     // extra margin on the "the pointer left" test
 #define kHideAnimMs 160      // one slide, either direction ("动画要迅速")
+// 刚被唤出来的组在这段时间里不收起。日志证据（2026-11-25 01:54:04）：`hover -> -1` 之后 **3 ms**
+// 就 `hide`，条在用户把指针从唤出区移到图标上的那几百毫秒里滑走了，他接着的那一下点击落到了桌面上
+// （"点了一下 deepseek harness 没打开"）。滑动本身只占 160 ms，所以这段时间是给"瞄准+按下"的。
+#define kHideWakeDwell 1200
 #define kHideFlashMs 2000    // two flashes of one second
 #define kHideFlashOnMs 550   // lit part of each 1 s cycle
 
@@ -6646,6 +6650,10 @@ static LRESULT CALLBACK HideWakeProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void HideBegin(Group& g, bool waking, DWORD now) {
     g.hideSlideTarget = waking ? 1.0f : 0.0f;
+    if (waking) {
+        // 唤出之后先别急着收：用户还要把指针从顶部那条唤出区挪到图标上再按下（见 kHideWakeDwell）。
+        g.hideArmAt = now + kHideWakeDwell;
+    }
     DLog(L"hide: group %d %s (side=%d slide=%.2f)", g.id, waking ? L"wake" : L"hide", g.hideSide,
          g.hideSlide);
     if (!waking && !g.wakeVisible) {

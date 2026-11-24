@@ -2491,3 +2491,40 @@ press: left 800,60 went to 0000000000010A3E pid=18300 cls=Chrome_RenderWidgetHos
 
 
 
+
+### 3.45 ✅ 唤出之后立刻收起：点击落在"条刚滑走"的那一瞬间（2026-11-25 01:54 用户第五次报）
+
+用户原话：**"我刚刚进行了四次点击，是正常的，但是四次点击前有一次发生了错误，点击 deepseek harness 没有打开"**。
+
+**日志说了什么（这一段是逐行读出来的）**
+```
+四次正常点击（全部有按下+激活）：
+01:54:12.772 LBUTTONDOWN slot=1 → 010A26（DSH）→ minimize
+01:54:13.400 LBUTTONDOWN slot=1 → 010A26（DSH）→ activate: plain ok
+01:54:16.352 LBUTTONDOWN slot=2 → 160892（Echo）→ activate: plain ok
+01:54:16.877 LBUTTONDOWN slot=2 → 160892（Echo）→ minimize
+失败那一下之前：条在**反复收起/唤出**，而且每次"收起"都发生在指针离开条之后 **3 ms**：
+01:54:03.511 wake
+01:54:04.097/04.134/04.180/04.430  hover -> -1 / 5 / 4 / 3        （指针快速掠过图标）
+01:54:04.810 hover -> -1
+01:54:04.813 hide                       ← 离开条 3 ms 就收起，没有任何缓冲
+01:54:05.490 wake → 01:54:08.711 hide → 01:54:11.835 wake
+```
+⇒ 那一下点击**根本没有到达 dock**（没有 `LBUTTONDOWN`，也没有 `press: ... NOT ours`）：
+条在用户把指针从顶部唤出区移到 DSH 图标的那几百毫秒里已经滑走了，点击落到桌面上。
+
+**根因**：`HideBegin(g, true)`（唤出）**不刷新 `g.hideArmAt`**，所以"刚被唤出来的组"没有任何缓冲——
+指针一离开（哪怕是为了够到图标而短暂出界 20 px），下一 tick 就收。唤出的滑动本身要 160 ms，
+用户还得瞄一下再按下，这个窗口根本不够。
+
+**修法**：新增 `kHideWakeDwell = 1200`，`HideBegin(waking=true)` 里 `g.hideArmAt = now + kHideWakeDwell`。
+实测：唤出 01:56:53.124 → 立刻把指针移走 → 收起 01:56:54.333（**1.209 s**，之前是 3 ms）。
+正常收起不受影响（离开后仍然会收，只是晚 1.2 s）。
+
+**验证**：`t_click_hit` T1/T2/T4/T5 照旧；`t_hide_soak.ps1 3`：3/3（过程中还能看到
+`hide: companion 0 was 0,143 off its parked slot - put back` / `hide: group 1 was off the slide track
+by 0,-143 - put back`——§3.43 的不变量在"隐形托盘上按边框"时确实救了场）；`t_float_accept.ps1`：13/13。
+
+**教训**：**"出现"和"可用"之间要留缓冲。** 任何"会自动消失"的界面，出现的瞬间用户还没到位；
+收起计时必须在"出现"之后重新武装，而且时长要覆盖"滑动 + 瞄准 + 按下"，不是覆盖"滑动"。
+（§3.44 管的是"条压根不在该在的位置"，这条管的是"条在该在的位置，但只在了 3 ms"。）

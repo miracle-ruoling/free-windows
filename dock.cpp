@@ -3870,6 +3870,10 @@ struct Companion {
     DWORD hue = 0;
     bool hasHue = false;
     GlassCfg glassCfg;
+    // The background keys *as written in the ini* (-1 = inherit the strip's). Cached, because these
+    // used to be read through GetPrivateProfileInt from the paint path and from every tick:
+    // measured 2026-11-24, an idle dock burned 10-11 % of a core and most of it was ini reads.
+    int bgModeRaw = -1, glassLayerRaw = -1, solidAlphaRaw = -1;
     // H3: this window's own padded backdrop bake (same pipeline as the strip, own pixels).
     // It is only filled when the window actually draws the glass layer - see CompanionGlassTick.
     GlassTarget glass;
@@ -5158,6 +5162,10 @@ static void CompanionLoad(Companion& c) {
     }
     // The window's own glass parameters (-1 = inherit the strip's, see CompanionLoadGlass).
     CompanionLoadGlass(c);
+    // ... and the three background keys, cached for the paint path (see bgModeRaw).
+    c.bgModeRaw = GetInt(sec, L"bgMode", c.id ? 2 : -1);
+    c.glassLayerRaw = GetInt(sec, L"glassLayer", c.id ? 0 : -1);
+    c.solidAlphaRaw = GetInt(sec, L"solidOpacity", c.id ? 235 : -1);
     // The item grid (only for a generic window; the tray draws its three cells itself).
     c.iconPxOv = GetInt(sec, L"iconSize", -1);
     c.clockStyle = GetInt(sec, L"clockStyle", 0) != 0 ? 1 : 0;
@@ -6280,13 +6288,30 @@ static RECT HideShiftRect(const RECT& r, int side, int s) {
 }
 
 // Move every member of the group (and therefore the frame) by (dx,dy).
+// Defined next to CompanionFollowTo(): keeps that function's delta bookkeeping in step when a move
+// is applied by hand (see GroupMoveBy).
+static void CompanionFollowResync(int stripX, int stripY);
+
 static void GroupMoveBy(Group& g, int dx, int dy) {
     if (!dx && !dy) return;
     if (g.id == 1 && g_hwnd) {
         // the strip is the anchor: MoveStripNow carries the followers and re-derives the frame
         g_cfg.x += dx;
         g_cfg.y += dy;
+        // ⛔ Do not let the follow path carry the followers here. CompanionFollowTo() deliberately
+        // *swallows* the delta on its first call after a jump ("do not yank the window somewhere
+        // else at startup"), and the group's attach at boot is exactly such a jump: the tray stayed
+        // 100 px below the strip and the group frame measured 214 px around an 88 px row
+        // (2026-11-24). Resync first (so MoveStripNow's follow sees no delta), then move them here.
+        CompanionFollowResync(g_cfg.x, g_cfg.y);
         MoveStripNow(g_cfg.x, g_cfg.y);
+        for (int i = 0; i < g_compCount; i++) {
+            Companion& c = g_comps[i];
+            if (!c.hwnd || !c.enabled || c.groupId != 1) continue;
+            CompanionSetRect(c, c.rc.left + dx, c.rc.top + dy, c.rc.right - c.rc.left,
+                             c.rc.bottom - c.rc.top, false);
+        }
+        GroupRecompute(DefaultGroup());
         return;
     }
     GroupMember m[kGroupMaxMembers];
@@ -7239,6 +7264,14 @@ static int g_companionLastStripX = INT_MIN;
 static int g_companionLastStripY = INT_MIN;
 static int g_companionFollowMoves = 0;      // diagnostics: see the 10 s cadence line
 
+// A move that was applied to the strip *and* the followers by hand (GroupMoveBy's group 1 branch):
+// tell the delta bookkeeping that everyone is already there, so the next CompanionFollowTo() sees
+// no delta instead of moving the companions a second time.
+static void CompanionFollowResync(int stripX, int stripY) {
+    g_companionLastStripX = stripX;
+    g_companionLastStripY = stripY;
+}
+
 // The strip moved to (stripX, stripY): shift every following companion by the same delta.
 // Two callers, same bookkeeping:
 //   * Present() - the drag/dodge path, i.e. ~139 Hz, in the same composition as the strip;
@@ -7879,6 +7912,11 @@ static void CompanionNew(int band) {
     c->radiusOv = g_cfg.radius;
     c->snapOv = g_cfg.snap;
     c->band = band ? 1 : 0;
+    // A fresh window is solid and nearly opaque, so it is findable on any wallpaper (user
+    // 2026-11-23). These are ALSO the values written to the ini below - keep the cache in step.
+    c->bgModeRaw = 2;
+    c->glassLayerRaw = 0;
+    c->solidAlphaRaw = 235;
     c->hasHue = true;
     c->hue = g_hueStrip;
     c->glassCfg = g_glassStrip;
@@ -10100,6 +10138,18 @@ static void GridShow() {
 // leaves it where we put it.
 
 static HWND FindOverflowFlyout() {
+    // ⛔ This walks every top-level window. It used to be called twice per 90 Hz tick (once by
+    // OverflowFlyoutOnScreen from the retry block, once from the cloak block), and profiling on
+    // 2026-11-24 measured ~550 us per tick - i.e. 5 % of a core for a completely idle dock.
+    // The handle only changes when the shell creates or destroys the flyout, so it is cached;
+    // a destroyed handle invalidates the cache immediately.
+    static HWND cached = nullptr;
+    static DWORD cachedAt = 0;
+    const DWORD nowTick = GetTickCount();
+    if (cached) {
+        if (IsWindow(cached) && nowTick - cachedAt < 400) return cached;
+        cached = nullptr;
+    }
     HWND found = nullptr;
     EnumWindows(
         [](HWND h, LPARAM lp) -> BOOL {
@@ -10110,6 +10160,8 @@ static HWND FindOverflowFlyout() {
             return FALSE;
         },
         (LPARAM)&found);
+    cached = found;
+    cachedAt = nowTick;
     return found;
 }
 
@@ -11363,6 +11415,12 @@ static bool ZExemptClass(const wchar_t* cls) {
         L"#32768", L"#32769", L"tooltips_class32", L"DockTooltip",
         // WinUI/XAML popups (flyouts, combo drops, the shell's own menus on Win11)
         L"Xaml_WindowedPopupClass", L"Windows.UI.Composition.DesktopWindowContentBridge",
+        // the lock screen / logon UI: a topmost full-screen window that *stays* for as long as the
+        // session exists. It matched the "capture overlay" test on 2026-11-24 (latching the yield
+        // forever: the dock stayed non-topmost for 2 h 20 min after the user unlocked), so it is
+        // exempt by class *and* the whole z watch stands down while the session is locked.
+        L"LockScreenBackstopFrame", L"LockScreenControllerProxyWindow", L"LogonUI",
+        L"Windows.Internal.Shell.LockScreen",
         // the desktop itself
         L"Progman", L"WorkerW", L"SysListView32",
     };
@@ -11682,6 +11740,22 @@ static bool ZCaptureActive(DWORD now, bool overlayAboveUs, DWORD overlayPid) {
     return false;
 }
 
+// Is the workstation locked? The input desktop is not ours while the lock screen (or a UAC prompt,
+// or the secure desktop) is up. While that is the case nothing about z-order is worth managing -
+// and the lock screen's own windows are exactly the ones that look like a capture overlay
+// (2026-11-24: `LockScreenBackstopFrame` latched the yield and never let go).
+static bool SessionLocked() {
+    HDESK d = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!d) return true;              // cannot even look: treat it as "not the user's desktop"
+    wchar_t name[64]{};
+    DWORD need = 0;
+    bool isDefault = false;
+    if (GetUserObjectInformationW(d, UOI_NAME, name, sizeof(name), &need))
+        isDefault = !_wcsicmp(name, L"Default");
+    CloseDesktop(d);
+    return !isDefault;
+}
+
 // Runs on the 16 ms housekeeping gate, itself gated to ~450 ms: an EnumWindows of the top level
 // costs a few hundred microseconds, and z-order does not move that fast.
 static void ZWatchTick(DWORD now) {
@@ -11710,6 +11784,21 @@ static void ZWatchTick(DWORD now) {
     static DWORD lastPoll = 0;
     if (lastPoll && now - lastPoll < 450) return;
     lastPoll = now;
+
+    // Locked / secure desktop: stand down completely and, above all, do not carry a capture latch
+    // across it. The first poll after the unlock re-asserts through the normal "demoted" path.
+    // ⛔ On the 450 ms poll, not per tick: OpenInputDesktop is a syscall plus a desktop handle, and
+    // at 90 Hz it cost more than everything else in this function added together (2026-11-24).
+    if (SessionLocked()) {
+        if (g_zMode == 1 || g_zCapturePid) {
+            DLog(L"zwatch: session locked - dropping the capture latch (mode=%d pid=%u)", g_zMode,
+                 g_zCapturePid);
+        }
+        g_zMode = 0;
+        g_zCapturePid = 0;
+        g_zCaptureSeenAt = 0;
+        return;
+    }
 
     ZScanOut out;
     LARGE_INTEGER q0{}, q1{};
@@ -12974,6 +13063,11 @@ static void PageSet(int i, int v) {
             else if (!wcscmp(row.key, L"iconSize")) c->iconPxOv = v;
             else if (!wcscmp(row.key, L"clockStyle")) c->clockStyle = v;
             else if (!wcscmp(row.key, L"caption")) c->captionOn = v != 0;
+            // keep the cached background keys in step with the ini (they are read from the paint
+            // path, so they must not wait for the next CompanionLoad)
+            else if (!wcscmp(row.key, L"bgMode")) c->bgModeRaw = v;
+            else if (!wcscmp(row.key, L"glassLayer")) c->glassLayerRaw = v;
+            else if (!wcscmp(row.key, L"solidOpacity")) c->solidAlphaRaw = v;
             // task 5: move the window into the other band right away
             else if (!wcscmp(row.key, L"band")) {
                 c->band = v;
@@ -13950,22 +14044,21 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
 // H2: a float window's background / glass-layer choice. -1 in the section = inherit from [dock],
 // exactly like radius/pad/gap already do; the strip is always "its own". A [float.N] window stores
 // absolute values (it is independent by design - user 2026-11-23), so it never sees a -1.
+// The raw value is cached in the Companion (see bgModeRaw): these are called from the paint path
+// and from every 16 ms tick.
 static int CompanionBgMode(const Companion& c) {
-    int v = GetInt(c.sec, L"bgMode", c.id ? 2 : -1);      // a new float window is solid
+    int v = c.bgModeRaw;
     if (v < 0 || v > 2) v = g_cfg.bgMode;
     return v;
 }
 
 static int CompanionGlassLayer(const Companion& c) {
-    int layer = GetInt(c.sec, L"glassLayer", c.id ? 0 : -1);
-    if (layer != 0 && layer != 1) layer = g_cfg.glassLayer;
-    return layer;
+    const int v = c.glassLayerRaw;
+    return (v == 0 || v == 1) ? v : g_cfg.glassLayer;
 }
 
 static int CompanionSolidAlpha(const Companion& c) {
-    int a = GetInt(c.sec, L"solidOpacity", c.id ? 235 : -1);
-    if (a < 0) a = g_cfg.solidOpacity;
-    return a;
+    return c.solidAlphaRaw >= 0 ? c.solidAlphaRaw : g_cfg.solidOpacity;
 }
 
 // The window's 色调: its own when the section has one, else the strip's (the tray's old rule).
@@ -14040,6 +14133,12 @@ static void CompanionGlassBake(Companion& c, DWORD now) {
     if (g_cfg.captureHz <= 0) return;
     UINT capMs = (UINT)(1000 / g_cfg.captureHz);
     if (capMs < 1) capMs = 1;
+    // A window in the *desktop* band sits on the wallpaper: whatever is behind it does not change,
+    // so re-capturing it at the strip's captureHz is pure waste. Measured 2026-11-24 on one idle
+    // 318x183 desktop window: 10.7 captures/s at 16 ms each = ~17 % of a core, for a picture that
+    // was identical every time. Moves are still free (the crop follows the existing bake) and a
+    // settings change still forces a bake through glass.dirty.
+    if (c.band == 1 && capMs < 2000) capMs = 2000;
     DWORD floorMs = c.glass.lastMs * 2;
     if (floorMs > capMs) capMs = floorMs;
     if (!c.glass.dirty && now - c.glass.at < capMs) return;

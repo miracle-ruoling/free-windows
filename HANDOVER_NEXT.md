@@ -2045,6 +2045,67 @@ dock 进程是 **DPI-unaware**（没有 manifest），而探针按 §1.5 必须�
 全文件噪声（已把文件改回 LF 并 amend）。现在有 `.gitattributes`（`*.cpp text eol=lf`）兜底，
 提交前后请看一眼 `git show --stat`。
 
+### 3.37 开机后"点哪都没反应"（2026-11-24 18:0x）
+
+用户原话：**"电脑刚刚开机，我们的项目处处bug，你去点击试试，点哪都没有响应，topmost 的窗口也只有在桌面才会出来"**。
+三个独立的问题，前两个是"看起来像 click 坏了"的真因，第三个是"处处卡"。
+
+**1. 让位状态卡死（用户报的那条）**
+- 现象取证：`DockStripWindow`/`DockTrayBarWindow`/组框全是 `topmost=False`，z#87/88，而 Progman 在 z#283
+  ⇒ 它们被夹在"所有应用窗口之下、桌面之上"，所以只有显示桌面时看得见；点击自然落到前台应用上。
+- 日志指认元凶：
+  ```
+  15:41:33 zwatch: capture overlay in front (cls=LockScreenBackstopFrame pid=15008) - stepping below it
+  15:41:33 zwatch: yielding to a capture/fullscreen overlay (pid=15008) ...
+  ```
+  15:41 = 开机 27 分钟（用户锁了一次屏）。`LockScreenBackstopFrame` 是**锁屏背板窗口**：topmost、全屏、
+  一直存在 ⇒ 命中 task 1 的"截图覆盖层"判据。而让位的**解除条件**是"该进程不再有 topmost 窗口"
+  （`ZPidTopmostVisible`），锁屏窗口永远不消失 ⇒ `g_zMode` 卡在 1 两小时二十分钟，期间任何重新断言
+  topmost 的路径都被"demoted again"打回去。
+- 修法（三层）：
+  1. `ZExemptClass` 加 `LockScreenBackstopFrame` / `LockScreenControllerProxyWindow` / `LogonUI` /
+     `Windows.Internal.Shell.LockScreen`；
+  2. 新增 `SessionLocked()`（`OpenInputDesktop` 拿到的桌面名不是 `Default`），**锁屏/安全桌面期间
+     zwatch 整个停摆**并且把 latch 清掉——解锁后第一次轮询照常走"被降级→重新断言"的恢复路径；
+  3. ⛔ 这个检查放在 **450 ms 的轮询里**，不要放每 tick：`OpenInputDesktop` 是系统调用 + 桌面句柄，
+     90 Hz 下它自己就吃掉好几个百分点。
+- 断言（可复跑）：手动 `SetWindowPos(strip, HWND_NOTOPMOST)` → 1.3 s 内看门狗把它提回 topmost。
+  命中判据：`WindowFromPoint` 在条/托盘上必须返回 `DockStripWindow`/`DockTrayBarWindow`。
+- 仍存在的**既有设计**（不是 bug，别再"修"）：`band=1` 的浮窗就是桌面挂件，被应用窗口盖住时点不到；
+  要它常在最前就把设置里「Z 序」改成"最上"。
+
+**2. 托盘比条低 100 px（组框 214 高套着一行 88 的成员）**
+- `GroupMoveBy()` 对组 1 只做 `g_cfg += d; MoveStripNow()`，成员靠 `CompanionFollowTo()` 的差量带过去；
+  而 `CompanionFollowTo()` **第一次调用会故意吞掉差量**（"启动时不要把窗口拽到别处"）。
+  **开机 attach 正是这样一次跳变**（`hide: group 1 glue ... move=0,-100`）⇒ 条移了 -100，托盘没动。
+- 修法：组 1 的分支里**自己移动成员**（遍历 `g_comps`，`group==1`），先用
+  `CompanionFollowResync(g_cfg.x, g_cfg.y)` 把跟随差量的基准对齐（否则下一帧 `CompanionFollowTo`
+  会再移一次），最后 `GroupRecompute(DefaultGroup())`。
+- 断言：`hide`/`wake` 各走一轮，条 y=28、托盘 y=30（两者的固有 2 px 偏移来自用户自己的摆放），
+  隐藏时 -106 / -104，组框 1058x114。
+
+**3. 空转 11 % 一个核 → 2 %**（"处处卡"的底层原因；顺带把发热也压下去）
+用 `profMark()` 插桩量出来的三段（临时代码已删，需要时照抄：每 10 s 打印 `us/tick`）：
+| 段 | 之前 | 之后 | 原因 |
+|---|---|---|---|
+| `tray`（面板/托盘/悬停动画那一段） | ~550 µs/tick | ~30 µs | `FindOverflowFlyout()` **每 tick 两次 EnumWindows** |
+| 总计（实测 CPU） | 11 % | 2 % | 加上下面两条 |
+- `FindOverflowFlyout()` 加了 400 ms 缓存（句柄失效立即重扫）。它被 `OverflowFlyoutOnScreen()` 从
+  两个地方每 tick 调用，是全程序最贵的一行。
+- `bgMode`/`glassLayer`/`solidOpacity` 原来在**绘制路径和每 tick 路径**里 `GetPrivateProfileInt`
+  （每窗口每帧三次）⇒ 改成 `Companion` 里的 `bgModeRaw/glassLayerRaw/solidAlphaRaw` 缓存，
+  `-1` 仍然表示"继承条"（在访问器里回落到 `g_cfg`，所以条改风格时继承的窗口照样跟着变）。
+  `PageSet` 写完 ini 会同步这三个缓存。
+- 桌面带的窗口（`band==1`）玻璃背景重新抓图的下限抬到 **2 s**：它背后就是壁纸，不会变。
+  实测那一个 318x183 的挂件原本 10.7 次/秒 × 16 ms ≈ 17 % 一个核，现在 0.5 次/秒。
+
+**验证清单（这次用的，都能复跑）**
+- `dev/t_float.ps1`：z 序 + topmost + 矩形（看 z# 是否回到 10 上下、`topmost=True`）。
+- `dev/t_float_accept.ps1`：13/13 仍通过。
+- CPU：`(Get-Process dock).CPU` 前后差 10 s。
+- 日志关键字：`zwatch: yielding`（不该再出现）、`zwatch: session locked`（锁屏时出现一次）、
+  `hide: group 1 glue`（attach 时的位移）、`bake[`（桌面窗口应从 ~11 次/10 s 降到 ~5 次/10 s 以内）。
+
 
 
 

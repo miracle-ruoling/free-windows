@@ -2150,6 +2150,59 @@ static void ComputeButtons() {
     }
 }
 
+// How far a press may land outside a cell and still count as that cell. The pad is the part
+// of the bar that has no cell in it, and it is *painted* (background picture / glass), so it
+// reads as "the bar" and people aim at it. Before this, a press there was a dead click:
+// nothing logged, nothing launched, nothing else happened (§3.40, 2026-11-24).
+static int SlotReach() {
+    int reach = g_cfg.pad;
+    if (reach < 4) reach = 4;
+    if (reach > 12) reach = 12;
+    return reach;
+}
+
+// The cell under/next to `pt`: exact hit wins, otherwise the nearest cell by Chebyshev
+// distance, with the distance reported so the caller can apply (and log) its own tolerance.
+static int PickSlot(POINT pt, int* distOut) {
+    int best = -1, bestD = 0;
+    for (size_t i = 0; i < g_slots.size(); i++) {
+        const RECT& r = g_slots[i].rc;
+        if (PtInRect(&r, pt)) {
+            if (distOut) *distOut = 0;
+            return (int)i;
+        }
+        int dx = 0, dy = 0;
+        if (pt.x < r.left) dx = r.left - pt.x;
+        else if (pt.x >= r.right) dx = pt.x - r.right + 1;
+        if (pt.y < r.top) dy = r.top - pt.y;
+        else if (pt.y >= r.bottom) dy = pt.y - r.bottom + 1;
+        int d = dx > dy ? dx : dy;
+        if (best < 0 || d < bestD) {
+            best = (int)i;
+            bestD = d;
+        }
+    }
+    if (distOut) *distOut = bestD;
+    return best;
+}
+
+// Every cell rect plus the live hover zoom. Printed when a press really is blank: the only
+// way to tell "the user missed between two icons" from "we hit-tested something other than
+// what we painted" (§3.40 asked for exactly this line; keep it cheap, it is one press).
+static std::wstring SlotDump() {
+    std::wstring s;
+    wchar_t buf[96];
+    for (size_t i = 0; i < g_slots.size(); i++) {
+        const Slot& sl = g_slots[i];
+        float k = (i < g_slotHover.size()) ? g_slotHover[i].v : 0.0f;
+        _snwprintf_s(buf, 96, _TRUNCATE, L" %d:item=%d %d,%d-%d,%d sz=%d zoom=%.2f", (int)i,
+                     sl.item, (int)sl.rc.left, (int)sl.rc.top, (int)sl.rc.right,
+                     (int)sl.rc.bottom, sl.size, k);
+        s += buf;
+    }
+    return s;
+}
+
 // The Windows logo for the fixed first button: four rounded squares, drawn by hand.
 // Windows 11 paints its Start glyph with XAML inside the taskbar, so there is no icon
 // resource to load; rasterising it here keeps it crisp at any hover zoom and needs no
@@ -2965,6 +3018,22 @@ static bool IsInFront(HWND h) {
     return false;
 }
 
+// "This is the window the user is looking at" - the test for the click toggle, and stricter
+// than IsInFront on purpose. IsInFront also says yes to a window that merely owns its thread's
+// active state after the foreground moved to another process, and minimising a window that is
+// already covered is invisible: the click then reads as "it did nothing". That is exactly the
+// 23:41:46 line `click slot=4` -> `minimize` while another app had just been raised (§3.40).
+static bool IsFrontAndVisible(HWND h) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+    HWND fg = GetForegroundWindow();
+    if (fg) {
+        if (fg != h) return false;
+    } else if (FrontmostAppWindow() != h) {
+        return false;      // no foreground at all on this machine: use the z-order instead
+    }
+    return IsTopAtCenter(h);   // and nothing of anyone's is painted over its middle
+}
+
 // ShowWindow across processes is unreliable (it just posts), so ask the window
 // to minimize/restore itself the way the taskbar does.
 static void MinimizeWindow(HWND h) {
@@ -2989,7 +3058,10 @@ static void ActivateWindow(HWND h) {
     }
     if (IsIconic(h)) {
         RestoreWindow(h);
-    } else if (IsInFront(h) && g_cfg.clickActiveMinimizes) {
+    } else if (g_cfg.clickActiveMinimizes && IsFrontAndVisible(h)) {
+        // Only the window the user is really looking at toggles to minimised. A covered
+        // window must be raised instead: "minimised something I could not see" is
+        // indistinguishable from "the click did nothing" (§3.40).
         MinimizeWindow(h);
         return;
     }
@@ -11107,12 +11179,14 @@ static std::wstring g_pressLnk;
 static POINT g_pressPos{};
 static POINT g_pressScreen{};
 static int g_resizeEdge = 0;
+static bool g_resizeArmed = false;   // the pointer travelled: this press really is a resize
 static RECT g_resizeRect{};
 static POINT g_resizeOrigin{};
 
 // The strip's own edge-resize is a gesture like a drag (see GroupMemberBusy).
 static bool StripResizeBusy() { return g_resizeEdge != 0; }
-static bool StripPressBusy() { return g_pressActive; }
+// A pending resize is not "a press on the bar": the hide-edge snap may still run around it.
+static bool StripPressBusy() { return g_pressActive && !g_resizeEdge; }
 
 // Which edge/corner is under the point? Two zones, because one is not enough:
 //  * a generous square at each window corner - always easy to hit, and it is
@@ -15223,6 +15297,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;   // never steal focus from the target app
 
+        // Diagnostic: `SendMessage(hwnd, WM_APP+9, 0, 0)` writes the live cell rects, the
+        // hover zoom and the press/gesture state to the log. A probe script uses it to know
+        // exactly where the dock thinks its cells are (§3.40: "is the hit test the same as
+        // what we painted?"), instead of re-deriving the centred row from a stale layout line.
+        case WM_APP + 9:
+            DLog(L"slots:press=%d slot=%d drag=%d reorder=%d resize=%d armed=%d hover=%d "
+                 L"alpha=%d through=%d%s",
+                 (int)g_pressActive, g_pressSlot, (int)g_dragging, (int)g_reordering,
+                 g_resizeEdge, (int)g_resizeArmed, g_hover, g_alpha, (int)g_clickThrough,
+                 SlotDump().c_str());
+            return 0;
+
         case WM_NCHITTEST:
             return HTCLIENT;
 
@@ -15294,9 +15380,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_resizeEdge) {
                 POINT p{};
                 GetCursorPos(&p);
+                int dx0 = p.x - g_resizeOrigin.x;
+                int dy0 = p.y - g_resizeOrigin.y;
+                if (!g_resizeArmed) {
+                    // Nothing has happened yet on purpose: the band sits on the pad (and, with
+                    // no glass, on the cells' outer edge), so a click that is a few pixels low
+                    // must not silently resize the dock instead of launching (§3.40).
+                    if (dx0 > -3 && dx0 < 3 && dy0 > -3 && dy0 < 3) return 0;
+                    g_resizeArmed = true;
+                    DLog(L"resize: armed after %d,%d travel", dx0, dy0);
+                }
                 RECT r = g_resizeRect;
-                int dx = p.x - g_resizeOrigin.x;
-                int dy = p.y - g_resizeOrigin.y;
+                int dx = dx0, dy = dy0;
                 if (g_resizeEdge & 1) r.left += dx;
                 if (g_resizeEdge & 2) r.right += dx;
                 if (g_resizeEdge & 4) r.top += dy;
@@ -15345,9 +15440,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else MoveStripNow(g_cfg.x, g_cfg.y);
                 return 0;
             }
-            if (g_pressActive && !g_dragging && !g_reordering) {
+            // a pending resize press is neither a drag nor a reorder: it has its own branch above
+            if (g_pressActive && !g_dragging && !g_reordering && !g_resizeEdge) {
                 if (!(GetKeyState(VK_LBUTTON) & 0x8000)) {
-                    g_pressActive = false;      // stale press: drop it
+                    // The button went up without WM_LBUTTONUP reaching us (another window took
+                    // the capture, or the up was eaten). Dropping the press here is how a click
+                    // disappears with no trace: run the release path instead, it is the same
+                    // decision the user's finger already made (§3.40).
+                    DLog(L"press: button already up in a mouse move (slot=%d) - completing the "
+                         L"click", g_pressSlot);
+                    // keep the press state: the posted up runs the normal release path, and a
+                    // late real WM_LBUTTONUP that finds pressActive cleared does nothing
+                    PostMessageW(h, WM_LBUTTONUP, 0, 0);
                 } else {
                     POINT cp{};
                     GetCursorPos(&cp);
@@ -15440,25 +15544,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_flip.active) FlipEnd(L"grabbed mid-flight", false);   // stop where it is
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             POINT pt{x, y};
-            int hit = -1;
-            for (size_t i = 0; i < g_slots.size(); i++)
-                if (PtInRect(&g_slots[i].rc, pt)) { hit = (int)i; break; }
-            DLog(L"LBUTTONDOWN at %d,%d slot=%d of %d (alpha=%d through=%d)", x, y, hit,
-                 (int)g_slots.size(), g_alpha, (int)g_clickThrough);
-            {
-                RECT crc{};
-                GetClientRect(h, &crc);
-                // `屏蔽缩放`: pressing an edge of the strip must not start a resize
-                int edge = GroupBlocksResize(nullptr) ? 0 : EdgeAt(pt, crc);
-                if (edge) {
-                    GetWindowRect(h, &g_resizeRect);
-                    GetCursorPos(&g_resizeOrigin);
-                    g_resizeEdge = edge;
-                    SetCapture(h);
-                    DLog(L"resize start edge=%d", edge);
-                    return 0;
-                }
+            int miss = 0;
+            int hit = PickSlot(pt, &miss);
+            int reach = SlotReach();
+            bool snapped = false;
+            if (hit >= 0 && miss > 0) {
+                // a near miss: inside the pad next to a cell. Take it, so a slightly-off aim
+                // still launches instead of falling into the dead band (§3.40).
+                if (miss <= reach) snapped = true;
+                else hit = -1;
             }
+            DLog(L"LBUTTONDOWN at %d,%d slot=%d of %d (alpha=%d through=%d) miss=%d", x, y, hit,
+                 (int)g_slots.size(), g_alpha, (int)g_clickThrough, miss);
+            if (snapped) DLog(L"press: slot=%d was %d px outside its cell - taken as that cell",
+                              hit, miss);
+            // The press state comes before the edge test: a press on the border band that is
+            // released without moving is a click, not a resize (see WM_LBUTTONUP), and that
+            // needs the same state every other press has.
             // remember the press: it becomes a click on release, or a drag once
             // the pointer moves a few pixels (works from an icon too)
             g_pressSlot = hit;
@@ -15484,6 +15586,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_dragging = false;
             g_pressActive = true;
             SetCapture(h);
+            {
+                RECT crc{};
+                GetClientRect(h, &crc);
+                // `屏蔽缩放`: pressing an edge of the strip must not start a resize.
+                // The band is deliberately on the pad and, without glass, on the cells' outer
+                // edge - which is where people click. So the resize is armed, not started:
+                // WM_MOUSEMOVE only moves the window once the pointer really travels, and a
+                // press+release that stays still falls through to the click path (§3.40).
+                int edge = GroupBlocksResize(nullptr) ? 0 : EdgeAt(pt, crc);
+                // a new press always starts a new gesture: never inherit a resize whose
+                // WM_LBUTTONUP was lost (capture stolen) and never armed
+                g_resizeEdge = edge;
+                g_resizeArmed = false;
+                if (edge) {
+                    GetWindowRect(h, &g_resizeRect);
+                    GetCursorPos(&g_resizeOrigin);
+                    DLog(L"resize start edge=%d (armed once the pointer travels)", edge);
+                }
+            }
             return 0;
         }
 
@@ -15501,11 +15622,28 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_LBUTTONUP:
+            if (g_pressActive && g_resizeEdge && !g_resizeArmed) {
+                // Pressed the border band, released without travelling: that was a click, not a
+                // resize. The band sits on the pad (and, without glass, on the cells' own outer
+                // edge), so it is an ordinary way to aim at an icon - it must not resize the
+                // dock in silence and swallow the launch (§3.40).
+                DLog(L"resize: press at the edge never moved - treated as a click");
+                g_resizeEdge = 0;
+            }
             if (g_pressActive && !g_dragging && !g_resizeEdge && !g_reordering) {
                 g_pressActive = false;
                 ReleaseCapture();
                 DLog(L"click slot=%d hwnd=%p lnk=%s", g_pressSlot, (void*)g_pressHwnd,
                      g_pressLnk.c_str());
+                if (g_pressSlot < 0) {
+                    // Nothing under the press, even with the pad tolerance: record where the
+                    // pointer was and where every cell was. That is the only way to tell "the
+                    // user aimed between two icons" from "we hit-tested something else than we
+                    // painted" (§3.40 asked for this dump).
+                    DLog(L"click: blank at %d,%d (screen %d,%d) hover=%d slots=%s", g_pressPos.x,
+                         g_pressPos.y, g_pressScreen.x, g_pressScreen.y, g_hover,
+                         SlotDump().c_str());
+                }
                 // empty strip (neither an icon nor "^"): the second quick click dodges.
                 // [dock] dodgeOnDoubleClick=0 removes just this branch - the click tracking is
                 // not even started, so nothing else can inherit a stale "last blank click".
@@ -15541,10 +15679,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     GetWindowThreadProcessId(g_pressHwnd, &opid);
                     g_friendPid = opid;
                     g_focusGraceUntil = GetTickCount() + 300;
+                    // What the raise/minimise decision will see. "clicked and nothing happened"
+                    // used to be unattributable because this was never written down (§3.40).
+                    DLog(L"click: slot=%d -> %p iconic=%d inFront=%d onTop=%d fg=%p", g_pressSlot,
+                         (void*)g_pressHwnd, (int)IsIconic(g_pressHwnd),
+                         (int)IsInFront(g_pressHwnd), (int)IsTopAtCenter(g_pressHwnd),
+                         (void*)GetForegroundWindow());
                     ActivateWindow(g_pressHwnd);
                 } else if (!g_pressLnk.empty()) {
                     g_focusGraceUntil = GetTickCount() + 2000;   // the app is starting
                     LaunchShortcut(g_pressLnk, g_pressSlot);
+                } else if (g_pressSlot >= 0) {
+                    // An icon whose item has neither a window nor a shortcut: say so instead of
+                    // ending the click in a branch that logs nothing.
+                    DLog(L"click: slot=%d has neither a live window nor a shortcut - nothing "
+                         L"to open", g_pressSlot);
                 }
                 return 0;
             }
@@ -15558,6 +15707,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (g_resizeEdge) {
                 g_resizeEdge = 0;
+                g_resizeArmed = false;
                 ReleaseCapture();
                 SavePosition();
                 SaveSize();

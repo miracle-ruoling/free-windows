@@ -2217,6 +2217,118 @@ dock 进程是 **DPI-unaware**（没有 manifest），而探针按 §1.5 必须�
 **日志能否推断的结论**：能推断到"这次点击落在了哪个格子/是不是空白"，**推不出**"点在了图标上但窗口没起来"——
 后者需要先补 `ActivateWindow` 的日志，这也是下一次会话的第一件事。
 
+### 3.41 ✅ 已解决：点图标"有时没反应"（2026-11-24 23:5x – 2026-11-25 00:15）
+
+先把 §3.40 的结论收紧：**日志其实已经能定性那三次"没反应"**，只要把每条按下的落点算清楚。
+把 `dock.log` + `dock.old.log` 里全部 190 次按下逐条配对（按下 → 之后是 `click` / `drag start` /
+`resize start` / 什么都没有），失败的那几次**没有一次是落在格子上**的：
+
+| 时间 | 落点(客户区) | 变成了什么 | 为什么会"没反应" |
+|---|---|---|---|
+| 22:24:16.403 | 719,46 slot=-1 | 130 ms 后 `drag start` | 空白尾巴按下 + 手抖 4 px ⇒ 变成**拖动条**，点击被丢掉 |
+| 22:24:19.577 | 716,51 slot=-1 | 同上 | 同上 |
+| 22:45:09.469 | 705,81 slot=-1 | `resize start edge=8` | 落点在下边 10 px **缩放带**里 ⇒ 变成**改高度**（741x88 → 97），点击被丢掉 |
+
+（`19:35:37 / 00:36:04` 另有两次 `slot=-1`，也都是尾巴/条外。第三次 `23:41:46 minimize`
+是另一回事，见下面第 4 条。）
+
+所以"点了图标没反应"在日志里其实是**"点了图标旁边几像素"**——而 4 px 的拖拽阈值、
+10 px 的缩放带、以及"空白处单次点击什么都不做"三条叠在一起，正好把这种 5–10 px 的偏差
+全部变成静默操作。另外三条**真的会丢点击**的路径也一并挖出来了：
+
+**1. 边框 10 px 缩放带会"吃掉"点击（22:45:09 的现场）**
+`EdgeAt()` 的带子是画在**内边距上**的（无玻璃时还会特意压在格子的外沿，见 `IconBox()` 上面那段注释）。
+按在带子上立刻进 `g_resizeEdge`，松手时走"保存尺寸"分支——**一行点击日志都没有**，用户看到的是
+"条好像动了一下，图标没反应"。
+修法：**armed, not started**。按下只记 `g_resizeEdge` + `g_resizeArmed=false`，
+`WM_MOUSEMOVE` 里指针真移动 ≥3 px 才 `armed` 并开始改尺寸（日志 `resize: armed after dx,dy`）；
+`WM_LBUTTONUP` 时若从未 armed，就打一行
+`resize: press at the edge never moved - treated as a click`，把 `g_resizeEdge` 清掉、
+**继续走点击分支**（所以按在自家图标下沿松手仍然是启动）。真拉伸的手感不变
+（`dev/t_click_resize.ps1`：97 → 121 → 97）。
+
+**2. 内边距/尾巴上的按下没有格子（22:24:16 的现场）**
+整条 741 宽、格子只占 22..718，两侧各有 22 px 空白；上下各有 12/13 px 内边距。
+这些区域**是画了背景图的**，看起来就是"条的一部分"，人当然会往那儿点。
+修法：`PickSlot()` 返回"最近的格子 + 距离（切比雪夫）"，按下时**距离 ≤ `SlotReach()`（= pad，夹在 4..12）就认那个格子**，
+并打一行 `press: slot=N was D px outside its cell - taken as that cell`。
+`LBUTTONDOWN` 那行也多了 `miss=D`。命令：3 px 的缝、6 px 的尾巴外、9 px 的下内边距，现在都会启动那个格子。
+
+**3. 按下被静默丢弃（`GetKeyState` 说"已经松了"）**
+`WM_MOUSEMOVE` 里原来的 `stale press: drop it` 分支会**直接清掉按下状态、什么都不做**——
+如果 `WM_LBUTTONUP` 被别的窗口抢了 capture 或迟到，这次点击就在这里蒸发。
+修法：改成补完这次点击——打 `press: button already up in a mouse move (slot=N) - completing the click`
+并 `PostMessageW(h, WM_LBUTTONUP, 0, 0)`；晚到的那条真 UP 看到 `g_pressActive` 已经清了就什么都不做，
+不会重复触发。（这条在会话里被合成消息**真的踩到了**，见"验证"第 2 条。）
+
+**4. `clickActiveMinimizes` 会把"抬起窗口"变成"看不见的最小化"（23:41:46 的现场）**
+`ActivateWindow()` 原来用 `IsInFront()` 判断"再点一次就最小化"。`IsInFront()` 对
+"本线程活动窗口"这类状态也会返回真——于是一个被别的窗口盖住的窗口被判成"在前台"，
+点它的图标 = **最小化一个你看不见的窗口**，屏幕上什么都没发生（下一次点它才是还原，所以"两次里成功一次"）。
+修法：新增 `IsFrontAndVisible()` = 真前台（`GetForegroundWindow()==h`，本机常为 NULL 时退回
+`FrontmostAppWindow()`）**且** `IsTopAtCenter()`（中心点没有被任何东西盖住）。
+只有这种窗口才会被"点一下就最小化"，被盖住的一律老老实实抬起来。
+
+**日志契约（这一轮加的，以后"没反应"必须能一眼定性）**
+一次按下到最后一定落在下面某一行里，不会再有静默分支：
+```
+LBUTTONDOWN at x,y slot=N of M (alpha=.. through=..) miss=D
+press: slot=N was D px outside its cell - taken as that cell   （近失吸附）
+press: button already up in a mouse move (slot=N) - completing the click
+resize start edge=E (armed once the pointer travels)
+resize: armed after dx,dy
+resize: press at the edge never moved - treated as a click
+click slot=N hwnd=.. lnk=..
+click: blank at x,y (screen X,Y) hover=H slots= 0:item=.. l,t-r,b sz=.. zoom=.. 1:...   （真空白，附全部格子+当前放大倍数）
+click: slot=N -> hwnd iconic=.. inFront=.. onTop=.. fg=..                                  （抬/最小化 之前的状态）
+click: slot=N has neither a live window nor a shortcut - nothing to open
+activate: plain ok / alt tap ok / SwitchToThisWindow ok / gave up ...                      （原有）
+```
+外加一条**按需转储**：`SendMessage(strip, WM_APP+9, 0, 0)` 会写一行
+`slots:press=.. slot=.. drag=.. reorder=.. resize=.. armed=.. hover=.. alpha=.. through=..`
+后面跟着每个格子的实时矩形和 zoom。探针脚本用它取几何，**不要**再从 `layout:` 那行去推——
+那行只是"静止几何"，悬停放大时整排会横移 ±12 px（这也解释了为什么手写坐标的脚本时灵时不灵）。
+
+**验证（都能复跑，脚本留在 `dev/`）**
+1. `dev/t_click_hit.ps1` —— 全部走 `SendMessage(WM_LBUTTONDOWN/UP)`（不动真实光标，悬停放大不能干扰），
+   每个用例先 `WM_APP+9` 取实时格子再算点。实测（741x97，格子 22..718）：
+   ```
+   T1 exact centre      at 292,48  down=3/0   click=3  open
+   T2 3 px into gap     at 331,48  down=4/3   snap=4/3px  click=4  open
+   T3 6 px past chevron at 724,48  down=8/7   snap=8/7px  click=8
+   T4 bottom band       at 292,93  down=3/10  edge=click  click=3  open     ← 以前这里是 resize
+   T5 corner 2,2        at   2,2   down=-1/20 edge=click  click=-1 blank    ← 转储全部格子
+   ```
+2. `dev/t_click_real.ps1` —— 真 `mouse_event` 的按下/抬起（带 capture、悬停、动画）：
+   R1 格子中心 / R2 缝里 6 px / R3 下内边距 / R4 上内边距，**四次都** `click 3 | plain ok`。
+3. `dev/t_click_resize.ps1` —— 真拉伸还在：`resize: armed after 0,24 travel`，97 → 121，反向回到 97
+   （顺带证明"未 armed 的按下"不会改尺寸）。
+4. `dev/t_float_accept.ps1`：**13/13**。
+
+**这一轮学到的事（下次别再踩）**
+- **静默分支就是 bug。** 点击决策的每个出口都必须写日志；"什么都不做"这个出口尤其。
+  §3.40 之所以"推不出"，就是因为有三条路一行都不打。
+- **边框带永远会压在能点的东西上**（这里是内边距、无玻璃时是格子外沿）。所以：**不要用"按下"触发手势，
+  用"移动"触发**，按下只记状态。
+- **"画出来的"就是"能点的"。** 内边距和尾巴被背景图涂满了，用户眼里它和格子一样是条的一部分。
+  想让它不可点，就别画它；画了就得给一个最近的格子（`SlotReach()`）。
+- **`IsInFront()` 不足以支撑"再点一次就最小化"。** 任何"切换"类操作都要先确认
+  "用户真的在看这个窗口"（前台 + 中心点无遮挡）。
+- 测试脚本的两个坑：①`dock.log` 每条目是 `文本\r\n` 而文件是文本模式，实际落盘 `\r\n\r\n`，
+  **按行号偏移读会漂**，从尾部找；②贴边隐藏时条是完全透明的，`SendMessage` 还能进去、
+  **真鼠标/`mouse_event` 会穿透**，自动化点击前必须先唤醒（本会话还遇到过一次
+  `SetCursorPos` 直接失败——桌面输入被冻住约 10 分钟，与 dock 无关，别误判成 bug）。
+- 一次真实点击从按下到 `ActivateWindow` 之间有 3 次 `DLog`（各约 10 ms 的 open/write/close），
+  §3.40 提的"20–40 ms 的 visibility tick 让点击迟到"这一轮**没有**复现到点击路径上，
+  失败全部发生在更早的环节，所以没动 `CompanionVisibilityTick`。
+
+**还没做的（如果用户再报"没反应"）**
+- 尾巴深处（离最后一个格子 >10 px，比如 741 宽的条上 x>728）按下**仍然是空操作**——这是设计
+  （那是背景），但现在会留下 `click: blank at ... slots=...`。真要修，旋钮是 `SlotReach()` 或条的宽度
+  （用户手动拉宽到 741，内容只有 696，两侧各 22 px 空白）。
+- 右键（`WM_RBUTTONUP`）仍是严格命中，没加容差：右键空白弹的是条自己的菜单，属于有意行为。
+- 5 秒内的两次"空白单击"仍会触发 `dodgeOnDoubleClick`（躲闪），这是用户要的功能，别当成 bug。
+
 
 
 

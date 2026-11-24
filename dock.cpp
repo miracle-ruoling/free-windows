@@ -3894,6 +3894,11 @@ struct Companion {
     bool enabled = true;
     bool follow = true;
     RECT rc{0, 0, 0, 0};              // screen px
+    // Offset from the strip while the group is *awake*. 贴边隐藏 的滑动是整个组的平移，所以只要
+    // 有个成员在"藏起来"期间滑走了，把整组搬回去是修不好的（组框左上角可能还对，成员却已经低了
+    // 143 px —— 2026-11-25 00:37 实测）。藏起来时按这个偏移把每个成员单独放回去。
+    int awakeOffX = 0, awakeOffY = 0;
+    bool awakeOffValid = false;
     // own 32bpp premultiplied buffer (the strip's pixel helpers are pointed at it while
     // painting, see TrayPaint)
     HDC dc = nullptr;
@@ -5703,6 +5708,12 @@ struct Group {
     float hideSlide = 1.0f;       // 1 = awake (at the inset), 0 = fully out of the screen
     float hideSlideTarget = 1.0f;
     int hideShift = 0;            // px currently applied outwards along the perpendicular axis
+    // 组的"醒着"外框 —— 贴边滑动就是把它整体平移，所以它是滑动的基准。以前每个 tick 都从"当前
+    // 成员"重算它，于是滑动不可逆：只要有一个成员偏了一个 shift（别人的一次移动、隐形状态下的
+    // 缩放、漏掉一次跟随），bounds 就变大 → outDist 变大 → 唤醒时整组被推回去的距离比藏起来时多，
+    // 两个窗口就永久错位了（2026-11-25 00:31：条回到 171，托盘回到 28）。只在醒着时更新。
+    RECT awakeBox{};
+    bool awakeValid = false;
     bool hideWakeClick = false;   // the wake window received a click (click mode)
     DWORD hideArmAt = 0;          // no hiding before this (seen turning the switch on)
     DWORD hideFlashStart = 0;     // the 2 s flash (2 x 1 s) after an auto-hide / a wakeExt change
@@ -6506,6 +6517,7 @@ static void HideEdgeAttach(Group& g) {
     // tick (measured 2026-11-22 02:13: attach -> hide 95 ms later). Same for a restart with the
     // feature already on: the pointer is wherever it was, which is not "the user left the group".
     if (!g.hideArmAt) g.hideArmAt = GetTickCount() + 1500;
+    g.awakeValid = false;   // 下一个"醒着"的 tick 重新取基准框
     HidePlaceAtGap(g, g.hideSide);
     DLog(L"hide: group %d attached to side %d (bounds %ld,%ld %ldx%ld)", g.id, g.hideSide,
          (long)b.left, (long)b.top, (long)(b.right - b.left), (long)(b.bottom - b.top));
@@ -6678,13 +6690,61 @@ static void ReloadGroupsFromIni() {
 }
 
 // Runs on the 16 ms housekeeping tick for every group.
+// 组 1 的每个成员相对条的位置，只在"醒着"时采样（用户拖动成员也算新的真相），藏起来时冻结。
+static void RecordAwakeOffsets(const Group& g) {
+    if (g.id != 1 || !g_hwnd) return;
+    RECT sr{};
+    if (!GetWindowRect(g_hwnd, &sr)) return;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.enabled || !c.hwnd) continue;
+        if (c.groupId != 1) {
+            c.awakeOffValid = false;
+            continue;
+        }
+        c.awakeOffX = (int)(c.rc.left - sr.left);
+        c.awakeOffY = (int)(c.rc.top - sr.top);
+        c.awakeOffValid = true;
+    }
+}
+
+// 藏起来 / 正在滑动时，把每个成员按冻结的偏移放回它该在的位置。
+// 这条是"两个窗口相对位移"的最后一道保险：整组平移修不了"只有一个成员滑走"的情况，
+// 因为组框的左上角可能仍然正确（成员只是往下挂出去了）。
+static void AlignParkedMembers(Group& g) {
+    if (g.id != 1 || !g_hwnd) return;
+    RECT sr{};
+    if (!GetWindowRect(g_hwnd, &sr)) return;
+    for (int i = 0; i < g_compCount; i++) {
+        Companion& c = g_comps[i];
+        if (!c.hwnd || !c.enabled || c.groupId != 1 || !c.awakeOffValid) continue;
+        int wx = (int)(sr.left + c.awakeOffX), wy = (int)(sr.top + c.awakeOffY);
+        if (c.rc.left == wx && c.rc.top == wy) continue;
+        static DWORD lastLog = 0;
+        const DWORD t = GetTickCount();
+        if (!lastLog || t - lastLog >= 500) {
+            lastLog = t;
+            DLog(L"hide: companion %d was %d,%d off its parked slot - put back", c.id,
+                 (int)(c.rc.left - wx), (int)(c.rc.top - wy));
+        }
+        CompanionSetRect(c, wx, wy, c.rc.right - c.rc.left, c.rc.bottom - c.rc.top, true);
+    }
+}
+
 static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
     RECT b{};
     if (!GroupBounds(g, &b)) return;
     if (g.hideSide < 0) HideEdgeAttach(g);
 
+    // 只有"醒着"的组才有资格重新定义基准框：藏起来的时候 bounds 正是会被杂散移动污染的东西，
+    // 拿它来算 outDist 就是那次 143 px 一次性偏差变成永久错位的原因（见 Group::awakeBox）。
+    if (g.hideSlide >= 0.999f) {
+        g.awakeBox = b;
+        g.awakeValid = true;
+        RecordAwakeOffsets(g);
+    }
     RECT mon = HideMonitorRect(g.hwnd ? g.hwnd : g_hwnd);
-    RECT awake = HideShiftRect(b, g.hideSide, -g.hideShift);
+    RECT awake = g.awakeValid ? g.awakeBox : b;
     RECT wakeRc{};
     bool hasWake = HideWakeRectFor(g, awake, mon, &wakeRc);
     g.wakeRc = wakeRc;
@@ -6770,6 +6830,36 @@ static void HideEdgeTick(Group& g, DWORD now) {    if (!g.hideEdge) return;
             case 2: GroupMoveBy(g, 0, d); break;
             default: GroupMoveBy(g, -d, 0); break;
         }
+    }
+    // ---- 藏起来的时候，组必须正好停在滑动轨道上 ----
+    // 轨道 = 基准框平移 -hideShift，保证"唤醒"精确抵消"藏起"。以前只要有一个成员在藏起来期间
+    // 被移动（隐形条上的一次缩放、设置面板应用后重读 ini、某个成员漏了一次跟随），这个偏差就会
+    // 保留下来，醒来后两个窗口永久错位（用户 2026-11-25 00:31）。这里把整组放回轨道并记一行日志；
+    // 指针没占有任何成员（下面的守卫），所以不会和用户的拖动/缩放抢。
+    if (g.awakeValid && g.hideSlide < 0.999f && !g.drag.active && !g.scale.active && !g_dragging &&
+        !g_dragMovePending && !GroupMemberBusy(g)) {
+        RECT cur{};
+        if (GroupBounds(g, &cur)) {
+            RECT target = g.awakeBox;
+            switch (g.hideSide) {
+                case 0: OffsetRect(&target, 0, -wantShift); break;
+                case 1: OffsetRect(&target, wantShift, 0); break;
+                case 2: OffsetRect(&target, 0, wantShift); break;
+                default: OffsetRect(&target, -wantShift, 0); break;
+            }
+            int ex = target.left - cur.left, ey = target.top - cur.top;
+            if (ex || ey) {
+                static DWORD lastOffLog = 0;
+                const DWORD t = GetTickCount();
+                if (!lastOffLog || t - lastOffLog >= 500) {
+                    lastOffLog = t;
+                    DLog(L"hide: group %d was off the slide track by %d,%d - put back", g.id, ex,
+                         ey);
+                }
+                GroupMoveBy(g, ex, ey);
+            }
+        }
+        AlignParkedMembers(g);
     }
 
     // ---- the band ----

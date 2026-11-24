@@ -2377,6 +2377,61 @@ static bool IsFrontAndVisible(HWND h) {
 用户自己的置顶小窗，而不是用户正在看的窗口。判断"用户在看的窗口"只有两个可靠信号：
 **焦点是谁**、**它的中心点有没有被遮挡**。
 
+### 3.43 ✅ 贴边隐藏把成员拆开：把"停放位置"变成不变量（2026-11-25 00:31 用户第三次报）
+
+用户原话：**"组收起一会之后弹出发现组内两个窗口相对移动了，而他们是屏蔽位移的，可能之前就没修好，也有可能之前修好了但是刚刚修坏了"**。
+（§3.38 修的是"拖成员时的相对位移"，这次是**另一条路径**。）
+
+**取证（实测坐标，`dev/t_drift.ps1`）**
+```
+隐藏静止： strip=452,-115   tray=1218,-258   box=439,-271 1074x266
+           条 = 醒位 28 - 143，托盘 = 28 - 286 = 两倍 → 两者相差 143 px
+唤醒后：   strip=452,171    tray=1218,28      ← 条被多推了 143，托盘回到正确位置
+```
+143 = `outDist`（`awake.bottom - mon.top + kHideExtra` = 138+5）。也就是说：**一个成员被单独移动了
+一整个 hide shift**，然后整组的"昏迷几何"把这个错误"当成真的"吃下去了。
+
+**为什么以前会自我固化（两个设计缺陷）**
+1. `HideEdgeTick()` 每个 tick 用**当前成员**算 `outDist`：
+   `awake = HideShiftRect(b, side, -hideShift)`、`outDist = awake.bottom - mon.top`。
+   一个成员偏了 143 → `GroupBounds` 高 143 → `outDist` 变 286 → 唤醒时整组多推 143。
+   更阴的是**它自洽**：组框 266 高、`outDist` 286，看着都"正常"，重启也照样错（因为 ini 只记条的
+   x/y，两窗口的相对位置由这条公式现场推）。
+2. 藏起来时只把**组框左上角**放回轨道，修不了"只有一个成员往下挂出去"——左上角仍然是对的（实测：
+   条 -115、托盘 -258 时组框左上角就是 (439,-271)，与"正确"状态一致）。
+
+**修法（两条不变量，都不依赖"猜测触发者"）**
+- **基准框**：新增 `Group::awakeBox` / `awakeValid`。**只有醒着（`hideSlide >= 0.999`）的组**才更新它；
+  藏起来时 `awake`、`outDist`、唤出区域全部用这份存下来的框。滑动因此可逆：唤醒精确抵消藏起。
+- **停放对齐**：新增 `Companion::awakeOffX/awakeOffY`（醒着时相对条的偏移，只在醒着时采样）+
+  `AlignParkedMembers()`。**藏起来/正在滑动时**每个成员按这份偏移单独放回原位；同时保留
+  "组框左上角放回轨道"的检查。两处修复都会记日志：
+  `hide: group N was off the slide track by dx,dy - put back` /
+  `hide: companion N was dx,dy off its parked slot - put back`（500 ms 节流）。
+- 守卫：只在 `hideSlide < 0.999` 且 `!g.drag.active && !g.scale.active && !g_dragging &&
+  !g_dragMovePending && !GroupMemberBusy(g)` 时动手——指针占着任何成员时绝不抢。
+
+**验证（`dev/t_hide_soak.ps1`，都可复跑）**
+```
+round 1..6: hidden strip=-115,tray=-115 (off 0)   awake strip=28,tray=28 (off 0)  PASS   ×6
+```
+其中第 3/6 轮在**藏起来时**发了一次配置重载（设置面板应用走的路，`WM_TIMER 2`），
+第 2/4/6 轮在**隐形托盘**上按了一次边框（用户会话里出现过 4 次 `tray bar: resize start edge=9`）。
+另外：人为把条或托盘搬 143 px（`dev/t_track.ps1`）→ 立刻打出上面那两行并复位，醒来两边仍是 28。
+`t_float_accept.ps1` 13/13；空转 CPU 0.16 s / 10 s（1.6 %，与 §3.37 之后一致）。
+
+**没查清的部分（下次如果还出现，日志会点名）**
+这一轮**没能复现出确切的触发动作**：用户那段时间的日志里有 4 次设置面板开合
+（`settings: obj=1 -> 1/2 page(s)`）、5 次改色调（`hue: dock = #BBDDE8`）、拖/缩 `float.3` 好几次、
+以及 4 次隐形托盘边框按下。可能性最大的是"某个成员在藏起来期间被单独移动了一整个 shift"
+（`CompanionFollowTo` 只跳过 `dragging/resizing` 的成员，其他单独移动成员的路径都会和整组移动叠加一次）。
+现在**不管谁干的，停放位置每个 tick 都被重新推导**，所以症状不会再留下来；如果还能看到
+`was off the slide track` 那行，**它的 dx/dy 和时刻就指向触发者**（±143 就是"一整个 shift"）。
+
+**顺带记住的操作坑**：用 `Set-Content` / `-replace` 批量改 `dock.cpp` 会把这台机器（Windows
+PowerShell 5.1）的源码从 UTF-8 写成 GBK，`cl /utf-8` 会报一串 `C4828` 并且中文注释全坏。
+改源码只用 edit 工具；坏了就 `git checkout -- dock.cpp` 回滚。
+
 
 
 

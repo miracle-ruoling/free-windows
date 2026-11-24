@@ -2143,6 +2143,29 @@ dock 进程是 **DPI-unaware**（没有 manifest），而探针按 §1.5 必须�
 - `屏蔽位移` 开时拖成员：整组一起动，松手吸附均匀回位，偏移不变。
 - `dev/t_float_accept.ps1` 13/13；空转 CPU 3.4 %（§3.37 之后）。
 
+### 3.39 让位状态第二次卡死：这次是"钉在桌面上"的聊天窗（2026-11-24 23:26）
+
+用户原话：**"鼠标放到顶上没有弹出组，应该是出来了，但是窗口优先级在下面"**。
+
+- 取证：`DockStripWindow`/`DockTrayBarWindow` 又是 `topmost=False`（z#34/35），日志里
+  `zwatch: something of ours re-asserted topmost during a capture - demoted again`，
+  而"让位"开始于 **23:08:03**，一直没释放。
+- 元凶：`Chrome_WidgetWin_1` pid 16340 = **QQ 的「钉在桌面上」小窗**（558x500、topmost、当时是前台）。
+  §3.38 之前的**保持条件**只要求"该 pid 还有任意 topmost 可见窗口"（`ZPidTopmostVisible`）——
+  那是为了覆盖"截完选区后剩下的那条小工具栏"，但一个**永远置顶的小聊天窗**完全满足，于是无限期卡住。
+- 修法（只动"保持/释放"，不动"触发"）：
+  - 抽出 `ZIsFullscreenTopmost(h)`（topmost + ≥90% 显示器），`ZIsCaptureWindow()` 和保持判定共用；
+  - 保持条件改成：**该 pid 还有全屏 topmost 窗口**（选区框/全屏游戏/全屏视频），
+    **或者**它还有个小 topmost 窗口且**仍是前台且 latch 不足 60 s**（截屏工具的工具栏阶段）；
+  - 其余情况 900 ms 宽限后释放，并打一行
+    `zwatch: pid=N still has a topmost window but nothing fullscreen and fg=... - releasing the latch`；
+  - 前台是**我们自己的窗口**时不再当作 overlay（`fgPid != GetCurrentProcessId()`）。
+- 断言：重启后 `dev/t_float.ps1` 里全是 `topmost=True`，条 z#15 **高于** QQ 置顶窗（z#32）；
+  重启至今没有新的 zwatch 让位行；`dev/t_float_accept.ps1` 13/13。
+- **教训（写在这儿免得第三次踩）**：这个 latch 的"触发"很便宜，"保持"必须苛刻。凡是"某进程还有
+  topmost 窗口"这种判据，永远会有用户自己的置顶窗口来踩。以后给这类状态加条件时，先问一句
+  "如果一个普通用户的置顶小窗正好满足它，会怎样"。
+
 
 
 

@@ -2575,3 +2575,56 @@ by 0,-143 - put back`——§3.43 的不变量在"隐形托盘上按边框"时�
 **还剩一个可选项（等用户决定）**：让隐藏时的那一下点击**直接作用到那个图标**
 （"一下就把 Edge 打开"）。代价是：条藏起来时，在它原来的那条带状区域里点任何别的东西
 （PPT 功能区、浏览器标签栏）都可能顺带启动一个程序。默认没开。
+
+### 3.47 ✅ 真因（终于）：组框压在条上面，吃掉了所有点击和滚轮（2026-11-25 21:46）
+
+用户原话：**"在我通过任务栏点击了一次+点击输入了一次之前我对条点击了二三十次 deepseek harness，没有响应，缩略图、图标动画均对，新发现滚轮滚动也不响应"**。
+
+**日志（这次是全量按下日志 + 新审计直接指出的）**
+```
+21:46:17.881 press: hook left 1207,70 under=00000000000508DA cls=DockGroupBoxWindow ours=1
+               strip=525,28-1266,125 slide=1.00 ex=0x00080080 alpha=255
+...（21:46:17 – 21:46:36，30 多次，每一下 under=DockGroupBoxWindow）...
+21:46:37.851 press audit: 636,90 was NOT delivered to the strip. under=...0300998 ours=0 ...
+21:45:55.758 zwatch: capture overlay in front (cls=QQScreenCapture Window Class pid=10540) - stepping below it
+21:46:00/05/12/19/26  zwatch: something of ours re-asserted topmost during a capture - demoted again
+21:46:37.465 zwatch: overlay gone - topmost restored (7 asserts total)
+```
+
+**因果链**
+1. QQ 的截图工具（`QQScreenCapture`）在最前面，`zwatch` 按设计**让位**：我们的窗口全部降为非置顶
+   （这是 §3.39 的功能，为了让截图里没有条）。
+2. `ZDemoteOurs()` 的降序是"先条、最后组框"——而 `SetWindowPos(HWND_NOTOPMOST)` 会把窗口放到
+   **非置顶带的最上面**，所以最后降的**组框落在了条上面**。条自己的 `ex=0x00080080` 少了
+   `WS_EX_TOPMOST`，组框却还在最上面。
+3. 组框（`DockGroupBoxWindow`）是"拖动整组"的板面，**内部本来是"不可见但可点"的**；而这个 profile
+   里 `blockMove=1`（屏蔽位移），板面连拖动都不做 ⇒ 按在它上面**完全无事发生**。
+4. **悬停、图标放大、缩略图全都正常**，因为它们由 `UpdateHoverFromCursor()` **轮询**算出，
+   根本不依赖鼠标消息；滚轮（`WM_MOUSEWHEEL`）和按下一样，全被组框接走了。
+   ⛔ 这个假象让我们前面几轮一直以为"点击判定有问题"，实际上一开始就是**窗口层次**问题。
+
+**修法（两处）**
+- `ZDemoteOurs()`：**先降组框，最后降条**（同一带里最后降的在最上面）。
+- 新增 `EnsureBoardsBelowStrip()`（16 ms housekeeping，内部 120 ms 节流）：断言
+  "**组框必须在条下面，且和条同带**"，不满足就纠正并记一行：
+  `zorder: group N board was topmost while the strip was not - demoted` /
+  `zorder: group N board was above the strip - placed below it`。
+
+**验证**
+- 模拟复现（把条降为非置顶、把组框设为置顶）：点击落点 = 组框（故障现象）→ 500 ms 后落点回到条，
+  日志正好两行上面那两句。
+- `t_click_hit` T1–T5 正常；`t_hide_soak.ps1 2` 2/2；`t_float_accept.ps1` 13/13。
+
+**这一轮加的诊断（就是靠它们定位的，留着）**
+- `press: hook left x,y under=<hwnd> cls=... ours=? strip=... slide=? ex=? alpha=?`
+  —— **每一次**左键按下都记（250 ms 节流），不筛区域。之前只记"条附近"，所以那 30 多下
+  在日志里一行都没有。
+- `press audit: ... was NOT delivered to the strip` —— 落在条上的按下如果 200 ms 内没进
+  `WM_LBUTTONDOWN`，就把当时的窗口/样式/alpha/capture 全写出来。
+
+**教训**
+- **"悬停正常"不能证明"输入到了"。** 悬停/缩略图是轮询算的，这个假象会把人带偏整轮。
+  以后遇到"看得见、会动、就是点不动"，第一步查 **`WindowFromPoint` 在图标中心返回谁**。
+- **挡住输入的自家窗口，z 序必须被断言，而不是依赖创建顺序。** 组框和条必须永远"同带、框在下"。
+- **降/升必须同向成对。** `ZDemoteOurs()` 与 `ZAssertOurs()` 的遍历顺序现在是"框、条最后"，
+  中间状态也不会出现"框在条上"。

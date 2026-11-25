@@ -12026,17 +12026,22 @@ static void ZAssertOurs(bool twice) {
 
 // Step *below* everything topmost (the capture tool), without hiding anything.
 static void ZDemoteOurs() {
-    HWND list[32]{};
-    int n = CollectOurWindows(list, 32);
-    for (int i = 0; i < n; i++)
-        SetWindowPos(list[i], HWND_NOTOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    // ⛔ 先降**组框**，再降其余窗口（条在 CollectOurWindows 里是第一个）。
+    // SetWindowPos(HWND_NOTOPMOST) 会把窗口放到"非置顶带"的最上方，所以最后降的那个落在最上面。
+    // 原来的顺序（先条、最后组框）正好把组框放到条上面 —— 组框是一块"拖动整组"的板面，它一在
+    // 条上面，条上的点击/滚轮就全被它吃掉，而条本身看起来、悬停起来完全正常（2026-11-25 21:46
+    // 贴边让位期间 30 多次按下全部落在 DockGroupBoxWindow 上）。
     for (int i = 0; i < g_groupCount; i++) {
         HWND h = g_groups[i].hwnd;
         if (h && IsWindowVisible(h))
             SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+    HWND list[32]{};
+    int n = CollectOurWindows(list, 32);
+    for (int i = 0; i < n; i++)
+        SetWindowPos(list[i], HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     g_zYields++;
 }
 
@@ -12193,6 +12198,44 @@ static bool SessionLocked() {
 
 // Runs on the 16 ms housekeeping gate, itself gated to ~450 ms: an EnumWindows of the top level
 // costs a few hundred microseconds, and z-order does not move that fast.
+// Is `a` above `b` in the z-order?
+static bool ZIsAbove(HWND a, HWND b) {
+    if (!a || !b) return false;
+    for (HWND h = GetWindow(b, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV))
+        if (h == a) return true;
+    return false;
+}
+
+// 组框（"拖动整组"的板面）必须永远在条下面，而且和条待在同一个 z 带里。
+// 一旦它跑到条上面，条上的点击/滚轮就全被它吃掉，而条看起来完全正常、悬停和缩略图也照常
+// （悬停是轮询算的，不靠消息）——2026-11-25 21:46 用户点了 30 多次 deepseek harness 全无响应，
+// 日志里每一下都是 `under=DockGroupBoxWindow ours=1`。这条每 ~120 ms 断言一次，代价是几十次
+// GetWindow（只在顺序不对时才真的动窗口）。
+static void EnsureBoardsBelowStrip() {
+    if (!g_hwnd) return;
+    static DWORD lastCheck = 0;
+    const DWORD now = GetTickCount();
+    if (lastCheck && now - lastCheck < 120) return;
+    lastCheck = now;
+    const bool stripTop = (GetWindowLongW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    for (int i = 0; i < g_groupCount; i++) {
+        HWND b = g_groups[i].hwnd;
+        if (!b || !IsWindowVisible(b) || b == g_hwnd) continue;
+        const bool boardTop = (GetWindowLongW(b, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        if (boardTop && !stripTop) {
+            SetWindowPos(b, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            DLog(L"zorder: group %d board was topmost while the strip was not - demoted",
+                 g_groups[i].id);
+            continue;
+        }
+        if (ZIsAbove(b, g_hwnd)) {
+            SetWindowPos(b, g_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            DLog(L"zorder: group %d board was above the strip - placed below it", g_groups[i].id);
+        }
+    }
+}
+
 static void ZWatchTick(DWORD now) {
     if (!g_cfg.zWatch) return;
 
@@ -15318,6 +15361,8 @@ static void RenderTick() {
             if (g_alpha != DefaultGroupFadeAlpha()) UpdateAlpha();
             QuickSettingsTick(now);  // put the quick settings panel next to the tray bar
             PressWatchTick();
+            // 组框绝不能压在条上面（否则条上的点击/滚轮会被"整组拖板"吃掉，看起来却一切正常）。
+            EnsureBoardsBelowStrip();
             FocusWatchTick();
             ZWatchTick(now);         // task 1: keep the topmost band honest (and yield to snips)
             // task 4: 贴边隐藏 for every group - it has to run even for a group that holds no

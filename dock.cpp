@@ -9916,6 +9916,10 @@ static bool ForwardTrayClick(const TrayEntry& e, UINT downMsg, UINT upMsg, const
 
 static int g_menuCloseTries = 0;
 
+// §3.47 按下审计（见 PressWatchTick）：上一次"落在条上的左键按下"和它是否真的传到了 strip。
+static DWORD g_auditAt = 0;
+static POINT g_auditPt{};
+
 static void MenuWatchClear() {
     g_menuWatch = nullptr;
     g_menuCloseTries = 0;
@@ -10042,6 +10046,52 @@ static void PressWatchTick() {
         }
     }
     if (!l && !r) return;
+    // §3.47 按下审计： "悬停、放大、缩略图全都正常，就是点不动" —— 说明移动/悬停还在（那条路径
+    // 有轮询兜底），但**按下被谁吞了**。这里给每一次落在条上的左键按下留一条证据：200 ms 后如果
+    // 条的 WndProc 没收到对应的 WM_LBUTTONDOWN（收到会清掉 g_auditAt），就把"那一下落在哪个窗口、
+    // 是不是我们的、条的样式/alpha/capture/缩略图窗口"全部写进日志。
+    if (l && g_hwnd) {
+        POINT q{};
+        bool have = false;
+        if (fromHook) { q = hookPt; have = true; }
+        else have = GetCursorPos(&q) != FALSE;
+        if (have) {
+            RECT sr{};
+            if (GetWindowRect(g_hwnd, &sr)) {
+                RECT z = sr;
+                InflateRect(&z, 8, 8);
+                Group& dg0 = DefaultGroup();
+                const bool parked0 = dg0.hideEdge && dg0.awakeValid && dg0.hideSlide < 0.999f;
+                if (!parked0 && PtInRect(&z, q)) {
+                    g_auditAt = GetTickCount();
+                    g_auditPt = q;
+                }
+            }
+        }
+    }
+    if (g_auditAt && (DWORD)(GetTickCount() - g_auditAt) > 200) {
+        g_auditAt = 0;
+        HWND hit = WindowFromPoint(g_auditPt);
+        DWORD pid = 0;
+        if (hit) GetWindowThreadProcessId(hit, &pid);
+        wchar_t cls[64]{};
+        GetClassNameW(hit, cls, 64);
+        RECT sr{}, tr{}, gr{};
+        GetWindowRect(g_hwnd, &sr);
+        const bool thumbOn = g_thumbWnd && IsWindowVisible(g_thumbWnd);
+        if (thumbOn) GetWindowRect(g_thumbWnd, &tr);
+        const bool boxOn = DefaultGroup().hwnd && IsWindowVisible(DefaultGroup().hwnd);
+        if (boxOn) GetWindowRect(DefaultGroup().hwnd, &gr);
+        DLog(L"press audit: %ld,%ld was NOT delivered to the strip. under=%p cls=%s ours=%d "
+             L"capture=%p stripEx=0x%08lX alpha=%d through=%d strip=%ld,%ld-%ld,%ld "
+             L"thumb=%d(%ld,%ld-%ld,%ld) box=%d(%ld,%ld-%ld,%ld) alpha2=%d",
+             (long)g_auditPt.x, (long)g_auditPt.y, (void*)hit, cls,
+             (int)(hit && pid == GetCurrentProcessId()), (void*)GetCapture(),
+             (unsigned long)GetWindowLongW(g_hwnd, GWL_EXSTYLE), g_alpha, (int)g_clickThrough,
+             (long)sr.left, (long)sr.top, (long)sr.right, (long)sr.bottom, (int)thumbOn,
+             (long)tr.left, (long)tr.top, (long)tr.right, (long)tr.bottom, (int)boxOn,
+             (long)gr.left, (long)gr.top, (long)gr.right, (long)gr.bottom, g_alpha);
+    }
     // §3.44 诊断： "点了条上的图标，但什么都没发生，日志里连一下按下都没有"。
     // 这条按下如果我们没收到，就一定是落在了别人的窗口上 —— 记录下来：谁接走的、条当时在哪、
     // 组是醒着还是藏着。只记"落在条（或它醒着时的位置）附近、且不是本进程"的按下，不刷屏。
@@ -10051,6 +10101,31 @@ static void PressWatchTick() {
         if (fromHook) { q = hookPt; have = true; }
         else have = GetCursorPos(&q) != FALSE;
         if (have) {
+            // §3.48 全量按下日志： "悬停/放大/缩略图都正常，就是点不动" —— 必须知道那十几下
+            // 到底落在哪个窗口上（哪怕离条很远、哪怕是我们自己的缩略图窗口）。只记左键按下，
+            // 250 ms 节流，一次点击一行。
+            if (fromHook) {
+                static DWORD lastAny = 0;
+                const DWORD t = GetTickCount();
+                if (!lastAny || t - lastAny >= 250) {
+                    lastAny = t;
+                    HWND hitA = WindowFromPoint(q);
+                    DWORD pidA = 0;
+                    if (hitA) GetWindowThreadProcessId(hitA, &pidA);
+                    wchar_t clsA[64]{};
+                    GetClassNameW(hitA, clsA, 64);
+                    RECT srA{};
+                    GetWindowRect(g_hwnd, &srA);
+                    const Group& dgA = DefaultGroup();
+                    DLog(L"press: hook left %ld,%ld under=%p cls=%s pid=%lu ours=%d "
+                         L"strip=%ld,%ld-%ld,%ld slide=%.2f ex=0x%08lX alpha=%d",
+                         (long)q.x, (long)q.y, (void*)hitA, clsA, (unsigned long)pidA,
+                         (int)(hitA && pidA == GetCurrentProcessId()), (long)srA.left,
+                         (long)srA.top, (long)srA.right, (long)srA.bottom,
+                         dgA.hideEdge ? dgA.hideSlide : 1.0f,
+                         (unsigned long)GetWindowLongW(g_hwnd, GWL_EXSTYLE), g_alpha);
+                }
+            }
             RECT box{};
             GetWindowRect(g_hwnd, &box);
             Group& dg = DefaultGroup();
@@ -15720,6 +15795,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_LBUTTONDOWN: {
+            g_auditAt = 0;      // §3.47: the press did arrive - nothing to report
             KillTimer(h, 3);
             ThumbHide();
             if (g_flip.active) FlipEnd(L"grabbed mid-flight", false);   // stop where it is
